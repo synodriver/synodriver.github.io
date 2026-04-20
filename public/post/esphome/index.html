@@ -1,0 +1,677 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><script src="/livereload.js?mindelay=10&amp;v=2&amp;port=1313&amp;path=livereload" data-no-instant defer></script>
+  <meta charset="utf-8">
+  <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1">
+  <title>Esphome - syno blog</title>
+  <meta name="renderer" content="webkit" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1"/>
+
+<meta http-equiv="Cache-Control" content="no-transform" />
+<meta http-equiv="Cache-Control" content="no-siteapp" />
+
+<meta name="theme-color" content="#f8f5ec" />
+<meta name="msapplication-navbutton-color" content="#f8f5ec">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="#f8f5ec">
+
+
+<meta name="author" content="" /><meta name="description" content="ESPHOME自定义组件崩溃调试方法 LD2460组件过程中遇到运行的崩溃问题，记录调试方法
+看日志 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71 72 73 74 75 76 77 78 79 80 81 82 83 84 [21:29:59]ESP-ROM:esp32c6-20220919 [21:29:59]Build:Sep 19 2022 [21:29:59]rst:0x15 (USB_UART_HPSYS),boot:0xc (SPI_FAST_FLASH_BOOT) [21:29:59]Saved PC:0x408052da [21:29:59]SPIWP:0xee [21:29:59]mode:DIO, clock div:2 [21:29:59]load:0x40875730,len:0x16bc [21:29:59]load:0x4086c110,len:0xdf4 [21:29:59]load:0x4086e610,len:0x3078 [21:29:59]entry 0x4086c110 [21:29:59]I (23) boot: ESP-IDF 5.4.2 2nd stage bootloader [21:29:59]I (23) boot: compile time Oct 14 2025 13:19:17 [21:29:59]I (23) boot: chip revision: v0.1 [21:29:59]I (23) boot: efuse block revision: v0.3 [21:29:59]I (24) boot.esp32c6: SPI Speed : 80MHz [21:29:59]I (24) boot.esp32c6: SPI Mode : DIO [21:29:59]I (24) boot.esp32c6: SPI Flash Size : 4MB [21:29:59]I (25) boot: Enabling RNG early entropy source... [21:29:59]I (25) boot: Partition Table: [21:29:59]I (25) boot: ## Label Usage Type ST Offset Length [21:29:59]I (26) boot: 0 otadata OTA data 01 00 00009000 00002000 [21:29:59]I (26) boot: 1 phy_init RF data 01 01 0000b000 00001000 [21:29:59]I (27) boot: 2 app0 OTA app 00 10 00010000 001c0000 [21:29:59]I (27) boot: 3 app1 OTA app 00 11 001d0000 001c0000 [21:29:59]I (28) boot: 4 nvs WiFi data 01 02 00390000 0006d000 [21:29:59]I (28) boot: End of partition table [21:29:59]I (29) esp_image: segment 0: paddr=00010020 vaddr=420c0020 size=2009ch (131228) map [21:29:59]I (54) esp_image: segment 1: paddr=000300c4 vaddr=40800000 size=0ff54h ( 65364) load [21:29:59]I (69) esp_image: segment 2: paddr=00040020 vaddr=42000020 size=bb090h (766096) map [21:29:59]I (213) esp_image: segment 3: paddr=000fb0b8 vaddr=4080ff54 size=0c18ch ( 49548) load [21:29:59]I (229) boot: Loaded app from partition at offset 0x10000 [21:29:59]I (230) boot: Disabling RNG early entropy source... [21:29:59][I][logger:165]: Log initialized [21:29:59][C][safe_mode:084]: Unsuccessful boot attempts: 0 [21:29:59][D][esp32.preferences:143]: Writing 1 items: 0 cached, 1 written, 0 failed [21:29:59][D][switch:020]: &#39;&#39; Turning ON. [21:29:59][D][switch:063]: &#39;&#39;: Sending state ON [21:29:59]Guru Meditation Error: Core 0 panic&#39;ed (Load access fault). Exception was unhandled. [21:29:59] [21:29:59]Core 0 register dump: [21:29:59]MEPC : 0x4200a47a RA : 0x4200a4f6 SP : 0x4082a520 GP : 0x408192d4 [21:29:59]TP : 0x4082a6f0 T0 : 0x40028192 T1 : 0x40829ffc T2 : 0x0000000a [21:29:59]S0/FP : 0x00000000 S1 : 0x4081c000 A0 : 0x00000000 A1 : 0x00000006 [21:29:59]A2 : 0x4082a54f A3 : 0x00000001 A4 : 0x00000030 A5 : 0x00000001 [21:29:59]A6 : 0x00000004 A7 : 0x0000000a S2 : 0x40822000 S3 : 0x4081c110 [21:29:59]S4 : 0x40825080 S5 : 0x40822000 S6 : 0x420cf000 S7 : 0x420c4000 [21:29:59]S8 : 0x40822000 S9 : 0x40822000 S10 : 0x40822000 S11 : 0x40822000 [21:29:59]T3 : 0x00000000 T4 : 0x420c3cd0 T5 : 0x0000003f T6 : 0x00000020 [21:29:59]MSTATUS : 0x00001881 MTVEC : 0x40800001 MCAUSE : 0x00000005 MTVAL : 0x0000000c [21:29:59]MHARTID : 0x00000000 [21:29:59] [21:29:59]Stack memory: [21:29:59]4082a520: 0x00000004 0x0000000a 0x40822000 0x4081c110 0x40825080 0x40822000 0x4082a610 0x420c4000 [21:29:59]4082a540: 0x40822000 0x40822000 0x40822000 0x01822000 0x00000000 0x420c3cd0 0x0000003f 0x4201edd6 [21:29:59]4082a560: 0xa5a5a5a5 0xa5a5a5a5 0xa5a5a5a5 0x40824cac 0xa5a5a5a5 0xa5a5a5a5 0x4082a610 0x00000001 [21:29:59]4082a580: 0x4082a610 0x00000001 0x4082a610 0x00000001 0x4082a610 0x00000001 0x4082a610 0x00000001 [21:29:59]4082a5a0: 0x4082a610 0x00000001 0x4082a610 0x00000001 0x4082a610 0x00000001 0x4082a610 0x00000001 [21:29:59]4082a5c0: 0x4082a610 0x00000001 0x4082a610 0x00000001 0x682d7067 0x6c2d6b6c 0x36343264 0xa5a50030 [21:29:59]4082a5e0: 0x4082a610 0x00000001 0x00000021 0xa5a5a5a5 0xa5a5a5a5 0xa5a5a5a5 0x40824604 0x00000013 [21:29:59]4082a600: 0x00000013 0xa5006361 0xa5a5a5a5 0xa5a5a5a5 0x40824dd0 0x00000006 0x62616e65 0x3600656c [21:29:59]4082a620: 0x35333636 0xa5002d00 0x4082a630 0x00000004 0x30435455 0x00000000 0x63616131 0xa5a5a500 [21:29:59]4082a640: 0x4082a648 0x00000000 0x6a7a6a00 0x36383336 0x35333636 0x00000000 0x00000000 0x008192d4 [21:29:59]4082a660: 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 [21:29:59]4082a680: 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 [21:29:59]4082a6a0: 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x42007c0a [21:29:59]4082a6c0: 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 [21:29:59]4082a6e0: 0x00000000 0xa5a5a5a5 0xa5a5a5a5 0xa5a5a5a5 0xa5a5a5a5 0x00000150 0x4082a4e0 0x00000068 [21:29:59]4082a700: 0x4081cdd8 0x4081cdd8 0x4082a6f8 0x4081cdd0 0x00000018 0x00000000 0x00000000 0x4082a6f8 [21:29:59]4082a720: 0x00000000 0x00000001 0x408286f4 0x706f6f6c 0x6b736154 0x00000000 0x00000000 0x4082a6f0 [21:29:59]4082a740: 0x00000001 0x00000000 0x00000000 0x00000000 0x00000000 0x40822b78 0x40822be0 0x40822c48 [21:29:59]4082a760: 0x00000000 0x00000000 0x00000001 0x00000000 0x00000000 0x00000000 0x4002849c 0x00000000 [21:29:59]4082a780: 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 [21:29:59]4082a7a0: 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 [21:29:59]4082a7c0: 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 [21:29:59]4082a7e0: 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 [21:29:59]4082a800: 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 [21:29:59]4082a820: 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 [21:29:59]4082a840: 0x00000000 0x00000000 0x0000000c 0x4082a85c 0x00000000 0x4082a844 0x00000014 0x0c160108 [21:29:59]4082a860: 0x00000000 0x00000000 0x99e59f84 0x4082a854 0x00000010 0x00000000 0x4082a6f8 0x00000000 [21:29:59]4082a880: 0x00000000 0x00000020 0x682d7067 0x6c2d6b6c 0x36343264 0x63322d30 0x63616131 0x420d5800 [21:29:59]4082a8a0: 0x420c159c 0x4082a880 0x00000024 0x420d4bd4 0x420d4c04 0x420c07f8 0x00000032 0x4082b644 [21:29:59]4082a8c0: 0xa89c0000 0xe6a0bce4 0x99e59f84 0x4082a8a4 0x00000048 0xe68db8e4 0xaee5af98 0x858ee5a2 [21:29:59]4082a8e0: 0x3432444c 0xbae43036 0xa89ce5ba 0xe6a0bce4 0x99e59f84 0x633220a8 0x63616131 0x3b305b00 [21:29:59]4082a900: 0x5b6d3633 0x735b5d44 0x63746977 0x36303a68 0x203a5d33 0x203a2727 0x4082a8cc 0x0000005c setup方法中的LOG根本没有，说明在初始化之前就出现了崩溃。 看到消息日志的存储信息，根据PC/MEPC和RA指针定位崩溃位置，参考这里 和这里
+" /><meta name="keywords" content="Hugo, theme, even" />
+
+
+
+
+
+
+<meta name="generator" content="Hugo 0.160.1 with theme even" />
+
+
+<link rel="canonical" href="http://localhost:1313/post/esphome/" />
+<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+<link rel="manifest" href="/manifest.json">
+<link rel="mask-icon" href="/safari-pinned-tab.svg" color="#5bbad5">
+
+
+
+<link href="/sass/main.min.af7fd1da18d66c2b017df5b4cae508ef44cfcac3fb4c7c7a327fe4f4f9e28b08.css" rel="stylesheet">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fancyapps/fancybox@3.1.20/dist/jquery.fancybox.min.css" integrity="sha256-7TyXnr2YU040zfSP+rEcz29ggW4j56/ujTPwjMzyqFY=" crossorigin="anonymous">
+
+
+<meta property="og:url" content="http://localhost:1313/post/esphome/">
+  <meta property="og:site_name" content="syno blog">
+  <meta property="og:title" content="Esphome">
+  <meta property="og:description" content="ESPHOME自定义组件崩溃调试方法 LD2460组件过程中遇到运行的崩溃问题，记录调试方法
+看日志 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71 72 73 74 75 76 77 78 79 80 81 82 83 84 [21:29:59]ESP-ROM:esp32c6-20220919 [21:29:59]Build:Sep 19 2022 [21:29:59]rst:0x15 (USB_UART_HPSYS),boot:0xc (SPI_FAST_FLASH_BOOT) [21:29:59]Saved PC:0x408052da [21:29:59]SPIWP:0xee [21:29:59]mode:DIO, clock div:2 [21:29:59]load:0x40875730,len:0x16bc [21:29:59]load:0x4086c110,len:0xdf4 [21:29:59]load:0x4086e610,len:0x3078 [21:29:59]entry 0x4086c110 [21:29:59]I (23) boot: ESP-IDF 5.4.2 2nd stage bootloader [21:29:59]I (23) boot: compile time Oct 14 2025 13:19:17 [21:29:59]I (23) boot: chip revision: v0.1 [21:29:59]I (23) boot: efuse block revision: v0.3 [21:29:59]I (24) boot.esp32c6: SPI Speed : 80MHz [21:29:59]I (24) boot.esp32c6: SPI Mode : DIO [21:29:59]I (24) boot.esp32c6: SPI Flash Size : 4MB [21:29:59]I (25) boot: Enabling RNG early entropy source... [21:29:59]I (25) boot: Partition Table: [21:29:59]I (25) boot: ## Label Usage Type ST Offset Length [21:29:59]I (26) boot: 0 otadata OTA data 01 00 00009000 00002000 [21:29:59]I (26) boot: 1 phy_init RF data 01 01 0000b000 00001000 [21:29:59]I (27) boot: 2 app0 OTA app 00 10 00010000 001c0000 [21:29:59]I (27) boot: 3 app1 OTA app 00 11 001d0000 001c0000 [21:29:59]I (28) boot: 4 nvs WiFi data 01 02 00390000 0006d000 [21:29:59]I (28) boot: End of partition table [21:29:59]I (29) esp_image: segment 0: paddr=00010020 vaddr=420c0020 size=2009ch (131228) map [21:29:59]I (54) esp_image: segment 1: paddr=000300c4 vaddr=40800000 size=0ff54h ( 65364) load [21:29:59]I (69) esp_image: segment 2: paddr=00040020 vaddr=42000020 size=bb090h (766096) map [21:29:59]I (213) esp_image: segment 3: paddr=000fb0b8 vaddr=4080ff54 size=0c18ch ( 49548) load [21:29:59]I (229) boot: Loaded app from partition at offset 0x10000 [21:29:59]I (230) boot: Disabling RNG early entropy source... [21:29:59][I][logger:165]: Log initialized [21:29:59][C][safe_mode:084]: Unsuccessful boot attempts: 0 [21:29:59][D][esp32.preferences:143]: Writing 1 items: 0 cached, 1 written, 0 failed [21:29:59][D][switch:020]: &#39;&#39; Turning ON. [21:29:59][D][switch:063]: &#39;&#39;: Sending state ON [21:29:59]Guru Meditation Error: Core 0 panic&#39;ed (Load access fault). Exception was unhandled. [21:29:59] [21:29:59]Core 0 register dump: [21:29:59]MEPC : 0x4200a47a RA : 0x4200a4f6 SP : 0x4082a520 GP : 0x408192d4 [21:29:59]TP : 0x4082a6f0 T0 : 0x40028192 T1 : 0x40829ffc T2 : 0x0000000a [21:29:59]S0/FP : 0x00000000 S1 : 0x4081c000 A0 : 0x00000000 A1 : 0x00000006 [21:29:59]A2 : 0x4082a54f A3 : 0x00000001 A4 : 0x00000030 A5 : 0x00000001 [21:29:59]A6 : 0x00000004 A7 : 0x0000000a S2 : 0x40822000 S3 : 0x4081c110 [21:29:59]S4 : 0x40825080 S5 : 0x40822000 S6 : 0x420cf000 S7 : 0x420c4000 [21:29:59]S8 : 0x40822000 S9 : 0x40822000 S10 : 0x40822000 S11 : 0x40822000 [21:29:59]T3 : 0x00000000 T4 : 0x420c3cd0 T5 : 0x0000003f T6 : 0x00000020 [21:29:59]MSTATUS : 0x00001881 MTVEC : 0x40800001 MCAUSE : 0x00000005 MTVAL : 0x0000000c [21:29:59]MHARTID : 0x00000000 [21:29:59] [21:29:59]Stack memory: [21:29:59]4082a520: 0x00000004 0x0000000a 0x40822000 0x4081c110 0x40825080 0x40822000 0x4082a610 0x420c4000 [21:29:59]4082a540: 0x40822000 0x40822000 0x40822000 0x01822000 0x00000000 0x420c3cd0 0x0000003f 0x4201edd6 [21:29:59]4082a560: 0xa5a5a5a5 0xa5a5a5a5 0xa5a5a5a5 0x40824cac 0xa5a5a5a5 0xa5a5a5a5 0x4082a610 0x00000001 [21:29:59]4082a580: 0x4082a610 0x00000001 0x4082a610 0x00000001 0x4082a610 0x00000001 0x4082a610 0x00000001 [21:29:59]4082a5a0: 0x4082a610 0x00000001 0x4082a610 0x00000001 0x4082a610 0x00000001 0x4082a610 0x00000001 [21:29:59]4082a5c0: 0x4082a610 0x00000001 0x4082a610 0x00000001 0x682d7067 0x6c2d6b6c 0x36343264 0xa5a50030 [21:29:59]4082a5e0: 0x4082a610 0x00000001 0x00000021 0xa5a5a5a5 0xa5a5a5a5 0xa5a5a5a5 0x40824604 0x00000013 [21:29:59]4082a600: 0x00000013 0xa5006361 0xa5a5a5a5 0xa5a5a5a5 0x40824dd0 0x00000006 0x62616e65 0x3600656c [21:29:59]4082a620: 0x35333636 0xa5002d00 0x4082a630 0x00000004 0x30435455 0x00000000 0x63616131 0xa5a5a500 [21:29:59]4082a640: 0x4082a648 0x00000000 0x6a7a6a00 0x36383336 0x35333636 0x00000000 0x00000000 0x008192d4 [21:29:59]4082a660: 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 [21:29:59]4082a680: 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 [21:29:59]4082a6a0: 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x42007c0a [21:29:59]4082a6c0: 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 [21:29:59]4082a6e0: 0x00000000 0xa5a5a5a5 0xa5a5a5a5 0xa5a5a5a5 0xa5a5a5a5 0x00000150 0x4082a4e0 0x00000068 [21:29:59]4082a700: 0x4081cdd8 0x4081cdd8 0x4082a6f8 0x4081cdd0 0x00000018 0x00000000 0x00000000 0x4082a6f8 [21:29:59]4082a720: 0x00000000 0x00000001 0x408286f4 0x706f6f6c 0x6b736154 0x00000000 0x00000000 0x4082a6f0 [21:29:59]4082a740: 0x00000001 0x00000000 0x00000000 0x00000000 0x00000000 0x40822b78 0x40822be0 0x40822c48 [21:29:59]4082a760: 0x00000000 0x00000000 0x00000001 0x00000000 0x00000000 0x00000000 0x4002849c 0x00000000 [21:29:59]4082a780: 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 [21:29:59]4082a7a0: 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 [21:29:59]4082a7c0: 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 [21:29:59]4082a7e0: 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 [21:29:59]4082a800: 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 [21:29:59]4082a820: 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 [21:29:59]4082a840: 0x00000000 0x00000000 0x0000000c 0x4082a85c 0x00000000 0x4082a844 0x00000014 0x0c160108 [21:29:59]4082a860: 0x00000000 0x00000000 0x99e59f84 0x4082a854 0x00000010 0x00000000 0x4082a6f8 0x00000000 [21:29:59]4082a880: 0x00000000 0x00000020 0x682d7067 0x6c2d6b6c 0x36343264 0x63322d30 0x63616131 0x420d5800 [21:29:59]4082a8a0: 0x420c159c 0x4082a880 0x00000024 0x420d4bd4 0x420d4c04 0x420c07f8 0x00000032 0x4082b644 [21:29:59]4082a8c0: 0xa89c0000 0xe6a0bce4 0x99e59f84 0x4082a8a4 0x00000048 0xe68db8e4 0xaee5af98 0x858ee5a2 [21:29:59]4082a8e0: 0x3432444c 0xbae43036 0xa89ce5ba 0xe6a0bce4 0x99e59f84 0x633220a8 0x63616131 0x3b305b00 [21:29:59]4082a900: 0x5b6d3633 0x735b5d44 0x63746977 0x36303a68 0x203a5d33 0x203a2727 0x4082a8cc 0x0000005c setup方法中的LOG根本没有，说明在初始化之前就出现了崩溃。 看到消息日志的存储信息，根据PC/MEPC和RA指针定位崩溃位置，参考这里 和这里">
+  <meta property="og:locale" content="locale">
+  <meta property="og:type" content="article">
+    <meta property="article:section" content="post">
+    <meta property="article:published_time" content="2026-04-20T23:10:28+08:00">
+    <meta property="article:modified_time" content="2026-04-20T23:10:28+08:00">
+
+  <meta itemprop="name" content="Esphome">
+  <meta itemprop="description" content="ESPHOME自定义组件崩溃调试方法 LD2460组件过程中遇到运行的崩溃问题，记录调试方法
+看日志 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71 72 73 74 75 76 77 78 79 80 81 82 83 84 [21:29:59]ESP-ROM:esp32c6-20220919 [21:29:59]Build:Sep 19 2022 [21:29:59]rst:0x15 (USB_UART_HPSYS),boot:0xc (SPI_FAST_FLASH_BOOT) [21:29:59]Saved PC:0x408052da [21:29:59]SPIWP:0xee [21:29:59]mode:DIO, clock div:2 [21:29:59]load:0x40875730,len:0x16bc [21:29:59]load:0x4086c110,len:0xdf4 [21:29:59]load:0x4086e610,len:0x3078 [21:29:59]entry 0x4086c110 [21:29:59]I (23) boot: ESP-IDF 5.4.2 2nd stage bootloader [21:29:59]I (23) boot: compile time Oct 14 2025 13:19:17 [21:29:59]I (23) boot: chip revision: v0.1 [21:29:59]I (23) boot: efuse block revision: v0.3 [21:29:59]I (24) boot.esp32c6: SPI Speed : 80MHz [21:29:59]I (24) boot.esp32c6: SPI Mode : DIO [21:29:59]I (24) boot.esp32c6: SPI Flash Size : 4MB [21:29:59]I (25) boot: Enabling RNG early entropy source... [21:29:59]I (25) boot: Partition Table: [21:29:59]I (25) boot: ## Label Usage Type ST Offset Length [21:29:59]I (26) boot: 0 otadata OTA data 01 00 00009000 00002000 [21:29:59]I (26) boot: 1 phy_init RF data 01 01 0000b000 00001000 [21:29:59]I (27) boot: 2 app0 OTA app 00 10 00010000 001c0000 [21:29:59]I (27) boot: 3 app1 OTA app 00 11 001d0000 001c0000 [21:29:59]I (28) boot: 4 nvs WiFi data 01 02 00390000 0006d000 [21:29:59]I (28) boot: End of partition table [21:29:59]I (29) esp_image: segment 0: paddr=00010020 vaddr=420c0020 size=2009ch (131228) map [21:29:59]I (54) esp_image: segment 1: paddr=000300c4 vaddr=40800000 size=0ff54h ( 65364) load [21:29:59]I (69) esp_image: segment 2: paddr=00040020 vaddr=42000020 size=bb090h (766096) map [21:29:59]I (213) esp_image: segment 3: paddr=000fb0b8 vaddr=4080ff54 size=0c18ch ( 49548) load [21:29:59]I (229) boot: Loaded app from partition at offset 0x10000 [21:29:59]I (230) boot: Disabling RNG early entropy source... [21:29:59][I][logger:165]: Log initialized [21:29:59][C][safe_mode:084]: Unsuccessful boot attempts: 0 [21:29:59][D][esp32.preferences:143]: Writing 1 items: 0 cached, 1 written, 0 failed [21:29:59][D][switch:020]: &#39;&#39; Turning ON. [21:29:59][D][switch:063]: &#39;&#39;: Sending state ON [21:29:59]Guru Meditation Error: Core 0 panic&#39;ed (Load access fault). Exception was unhandled. [21:29:59] [21:29:59]Core 0 register dump: [21:29:59]MEPC : 0x4200a47a RA : 0x4200a4f6 SP : 0x4082a520 GP : 0x408192d4 [21:29:59]TP : 0x4082a6f0 T0 : 0x40028192 T1 : 0x40829ffc T2 : 0x0000000a [21:29:59]S0/FP : 0x00000000 S1 : 0x4081c000 A0 : 0x00000000 A1 : 0x00000006 [21:29:59]A2 : 0x4082a54f A3 : 0x00000001 A4 : 0x00000030 A5 : 0x00000001 [21:29:59]A6 : 0x00000004 A7 : 0x0000000a S2 : 0x40822000 S3 : 0x4081c110 [21:29:59]S4 : 0x40825080 S5 : 0x40822000 S6 : 0x420cf000 S7 : 0x420c4000 [21:29:59]S8 : 0x40822000 S9 : 0x40822000 S10 : 0x40822000 S11 : 0x40822000 [21:29:59]T3 : 0x00000000 T4 : 0x420c3cd0 T5 : 0x0000003f T6 : 0x00000020 [21:29:59]MSTATUS : 0x00001881 MTVEC : 0x40800001 MCAUSE : 0x00000005 MTVAL : 0x0000000c [21:29:59]MHARTID : 0x00000000 [21:29:59] [21:29:59]Stack memory: [21:29:59]4082a520: 0x00000004 0x0000000a 0x40822000 0x4081c110 0x40825080 0x40822000 0x4082a610 0x420c4000 [21:29:59]4082a540: 0x40822000 0x40822000 0x40822000 0x01822000 0x00000000 0x420c3cd0 0x0000003f 0x4201edd6 [21:29:59]4082a560: 0xa5a5a5a5 0xa5a5a5a5 0xa5a5a5a5 0x40824cac 0xa5a5a5a5 0xa5a5a5a5 0x4082a610 0x00000001 [21:29:59]4082a580: 0x4082a610 0x00000001 0x4082a610 0x00000001 0x4082a610 0x00000001 0x4082a610 0x00000001 [21:29:59]4082a5a0: 0x4082a610 0x00000001 0x4082a610 0x00000001 0x4082a610 0x00000001 0x4082a610 0x00000001 [21:29:59]4082a5c0: 0x4082a610 0x00000001 0x4082a610 0x00000001 0x682d7067 0x6c2d6b6c 0x36343264 0xa5a50030 [21:29:59]4082a5e0: 0x4082a610 0x00000001 0x00000021 0xa5a5a5a5 0xa5a5a5a5 0xa5a5a5a5 0x40824604 0x00000013 [21:29:59]4082a600: 0x00000013 0xa5006361 0xa5a5a5a5 0xa5a5a5a5 0x40824dd0 0x00000006 0x62616e65 0x3600656c [21:29:59]4082a620: 0x35333636 0xa5002d00 0x4082a630 0x00000004 0x30435455 0x00000000 0x63616131 0xa5a5a500 [21:29:59]4082a640: 0x4082a648 0x00000000 0x6a7a6a00 0x36383336 0x35333636 0x00000000 0x00000000 0x008192d4 [21:29:59]4082a660: 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 [21:29:59]4082a680: 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 [21:29:59]4082a6a0: 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x42007c0a [21:29:59]4082a6c0: 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 [21:29:59]4082a6e0: 0x00000000 0xa5a5a5a5 0xa5a5a5a5 0xa5a5a5a5 0xa5a5a5a5 0x00000150 0x4082a4e0 0x00000068 [21:29:59]4082a700: 0x4081cdd8 0x4081cdd8 0x4082a6f8 0x4081cdd0 0x00000018 0x00000000 0x00000000 0x4082a6f8 [21:29:59]4082a720: 0x00000000 0x00000001 0x408286f4 0x706f6f6c 0x6b736154 0x00000000 0x00000000 0x4082a6f0 [21:29:59]4082a740: 0x00000001 0x00000000 0x00000000 0x00000000 0x00000000 0x40822b78 0x40822be0 0x40822c48 [21:29:59]4082a760: 0x00000000 0x00000000 0x00000001 0x00000000 0x00000000 0x00000000 0x4002849c 0x00000000 [21:29:59]4082a780: 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 [21:29:59]4082a7a0: 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 [21:29:59]4082a7c0: 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 [21:29:59]4082a7e0: 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 [21:29:59]4082a800: 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 [21:29:59]4082a820: 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 [21:29:59]4082a840: 0x00000000 0x00000000 0x0000000c 0x4082a85c 0x00000000 0x4082a844 0x00000014 0x0c160108 [21:29:59]4082a860: 0x00000000 0x00000000 0x99e59f84 0x4082a854 0x00000010 0x00000000 0x4082a6f8 0x00000000 [21:29:59]4082a880: 0x00000000 0x00000020 0x682d7067 0x6c2d6b6c 0x36343264 0x63322d30 0x63616131 0x420d5800 [21:29:59]4082a8a0: 0x420c159c 0x4082a880 0x00000024 0x420d4bd4 0x420d4c04 0x420c07f8 0x00000032 0x4082b644 [21:29:59]4082a8c0: 0xa89c0000 0xe6a0bce4 0x99e59f84 0x4082a8a4 0x00000048 0xe68db8e4 0xaee5af98 0x858ee5a2 [21:29:59]4082a8e0: 0x3432444c 0xbae43036 0xa89ce5ba 0xe6a0bce4 0x99e59f84 0x633220a8 0x63616131 0x3b305b00 [21:29:59]4082a900: 0x5b6d3633 0x735b5d44 0x63746977 0x36303a68 0x203a5d33 0x203a2727 0x4082a8cc 0x0000005c setup方法中的LOG根本没有，说明在初始化之前就出现了崩溃。 看到消息日志的存储信息，根据PC/MEPC和RA指针定位崩溃位置，参考这里 和这里">
+  <meta itemprop="datePublished" content="2026-04-20T23:10:28+08:00">
+  <meta itemprop="dateModified" content="2026-04-20T23:10:28+08:00">
+  <meta itemprop="wordCount" content="2269">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="Esphome">
+  <meta name="twitter:description" content="ESPHOME自定义组件崩溃调试方法 LD2460组件过程中遇到运行的崩溃问题，记录调试方法
+看日志 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71 72 73 74 75 76 77 78 79 80 81 82 83 84 [21:29:59]ESP-ROM:esp32c6-20220919 [21:29:59]Build:Sep 19 2022 [21:29:59]rst:0x15 (USB_UART_HPSYS),boot:0xc (SPI_FAST_FLASH_BOOT) [21:29:59]Saved PC:0x408052da [21:29:59]SPIWP:0xee [21:29:59]mode:DIO, clock div:2 [21:29:59]load:0x40875730,len:0x16bc [21:29:59]load:0x4086c110,len:0xdf4 [21:29:59]load:0x4086e610,len:0x3078 [21:29:59]entry 0x4086c110 [21:29:59]I (23) boot: ESP-IDF 5.4.2 2nd stage bootloader [21:29:59]I (23) boot: compile time Oct 14 2025 13:19:17 [21:29:59]I (23) boot: chip revision: v0.1 [21:29:59]I (23) boot: efuse block revision: v0.3 [21:29:59]I (24) boot.esp32c6: SPI Speed : 80MHz [21:29:59]I (24) boot.esp32c6: SPI Mode : DIO [21:29:59]I (24) boot.esp32c6: SPI Flash Size : 4MB [21:29:59]I (25) boot: Enabling RNG early entropy source... [21:29:59]I (25) boot: Partition Table: [21:29:59]I (25) boot: ## Label Usage Type ST Offset Length [21:29:59]I (26) boot: 0 otadata OTA data 01 00 00009000 00002000 [21:29:59]I (26) boot: 1 phy_init RF data 01 01 0000b000 00001000 [21:29:59]I (27) boot: 2 app0 OTA app 00 10 00010000 001c0000 [21:29:59]I (27) boot: 3 app1 OTA app 00 11 001d0000 001c0000 [21:29:59]I (28) boot: 4 nvs WiFi data 01 02 00390000 0006d000 [21:29:59]I (28) boot: End of partition table [21:29:59]I (29) esp_image: segment 0: paddr=00010020 vaddr=420c0020 size=2009ch (131228) map [21:29:59]I (54) esp_image: segment 1: paddr=000300c4 vaddr=40800000 size=0ff54h ( 65364) load [21:29:59]I (69) esp_image: segment 2: paddr=00040020 vaddr=42000020 size=bb090h (766096) map [21:29:59]I (213) esp_image: segment 3: paddr=000fb0b8 vaddr=4080ff54 size=0c18ch ( 49548) load [21:29:59]I (229) boot: Loaded app from partition at offset 0x10000 [21:29:59]I (230) boot: Disabling RNG early entropy source... [21:29:59][I][logger:165]: Log initialized [21:29:59][C][safe_mode:084]: Unsuccessful boot attempts: 0 [21:29:59][D][esp32.preferences:143]: Writing 1 items: 0 cached, 1 written, 0 failed [21:29:59][D][switch:020]: &#39;&#39; Turning ON. [21:29:59][D][switch:063]: &#39;&#39;: Sending state ON [21:29:59]Guru Meditation Error: Core 0 panic&#39;ed (Load access fault). Exception was unhandled. [21:29:59] [21:29:59]Core 0 register dump: [21:29:59]MEPC : 0x4200a47a RA : 0x4200a4f6 SP : 0x4082a520 GP : 0x408192d4 [21:29:59]TP : 0x4082a6f0 T0 : 0x40028192 T1 : 0x40829ffc T2 : 0x0000000a [21:29:59]S0/FP : 0x00000000 S1 : 0x4081c000 A0 : 0x00000000 A1 : 0x00000006 [21:29:59]A2 : 0x4082a54f A3 : 0x00000001 A4 : 0x00000030 A5 : 0x00000001 [21:29:59]A6 : 0x00000004 A7 : 0x0000000a S2 : 0x40822000 S3 : 0x4081c110 [21:29:59]S4 : 0x40825080 S5 : 0x40822000 S6 : 0x420cf000 S7 : 0x420c4000 [21:29:59]S8 : 0x40822000 S9 : 0x40822000 S10 : 0x40822000 S11 : 0x40822000 [21:29:59]T3 : 0x00000000 T4 : 0x420c3cd0 T5 : 0x0000003f T6 : 0x00000020 [21:29:59]MSTATUS : 0x00001881 MTVEC : 0x40800001 MCAUSE : 0x00000005 MTVAL : 0x0000000c [21:29:59]MHARTID : 0x00000000 [21:29:59] [21:29:59]Stack memory: [21:29:59]4082a520: 0x00000004 0x0000000a 0x40822000 0x4081c110 0x40825080 0x40822000 0x4082a610 0x420c4000 [21:29:59]4082a540: 0x40822000 0x40822000 0x40822000 0x01822000 0x00000000 0x420c3cd0 0x0000003f 0x4201edd6 [21:29:59]4082a560: 0xa5a5a5a5 0xa5a5a5a5 0xa5a5a5a5 0x40824cac 0xa5a5a5a5 0xa5a5a5a5 0x4082a610 0x00000001 [21:29:59]4082a580: 0x4082a610 0x00000001 0x4082a610 0x00000001 0x4082a610 0x00000001 0x4082a610 0x00000001 [21:29:59]4082a5a0: 0x4082a610 0x00000001 0x4082a610 0x00000001 0x4082a610 0x00000001 0x4082a610 0x00000001 [21:29:59]4082a5c0: 0x4082a610 0x00000001 0x4082a610 0x00000001 0x682d7067 0x6c2d6b6c 0x36343264 0xa5a50030 [21:29:59]4082a5e0: 0x4082a610 0x00000001 0x00000021 0xa5a5a5a5 0xa5a5a5a5 0xa5a5a5a5 0x40824604 0x00000013 [21:29:59]4082a600: 0x00000013 0xa5006361 0xa5a5a5a5 0xa5a5a5a5 0x40824dd0 0x00000006 0x62616e65 0x3600656c [21:29:59]4082a620: 0x35333636 0xa5002d00 0x4082a630 0x00000004 0x30435455 0x00000000 0x63616131 0xa5a5a500 [21:29:59]4082a640: 0x4082a648 0x00000000 0x6a7a6a00 0x36383336 0x35333636 0x00000000 0x00000000 0x008192d4 [21:29:59]4082a660: 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 [21:29:59]4082a680: 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 [21:29:59]4082a6a0: 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x42007c0a [21:29:59]4082a6c0: 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 [21:29:59]4082a6e0: 0x00000000 0xa5a5a5a5 0xa5a5a5a5 0xa5a5a5a5 0xa5a5a5a5 0x00000150 0x4082a4e0 0x00000068 [21:29:59]4082a700: 0x4081cdd8 0x4081cdd8 0x4082a6f8 0x4081cdd0 0x00000018 0x00000000 0x00000000 0x4082a6f8 [21:29:59]4082a720: 0x00000000 0x00000001 0x408286f4 0x706f6f6c 0x6b736154 0x00000000 0x00000000 0x4082a6f0 [21:29:59]4082a740: 0x00000001 0x00000000 0x00000000 0x00000000 0x00000000 0x40822b78 0x40822be0 0x40822c48 [21:29:59]4082a760: 0x00000000 0x00000000 0x00000001 0x00000000 0x00000000 0x00000000 0x4002849c 0x00000000 [21:29:59]4082a780: 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 [21:29:59]4082a7a0: 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 [21:29:59]4082a7c0: 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 [21:29:59]4082a7e0: 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 [21:29:59]4082a800: 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 [21:29:59]4082a820: 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 [21:29:59]4082a840: 0x00000000 0x00000000 0x0000000c 0x4082a85c 0x00000000 0x4082a844 0x00000014 0x0c160108 [21:29:59]4082a860: 0x00000000 0x00000000 0x99e59f84 0x4082a854 0x00000010 0x00000000 0x4082a6f8 0x00000000 [21:29:59]4082a880: 0x00000000 0x00000020 0x682d7067 0x6c2d6b6c 0x36343264 0x63322d30 0x63616131 0x420d5800 [21:29:59]4082a8a0: 0x420c159c 0x4082a880 0x00000024 0x420d4bd4 0x420d4c04 0x420c07f8 0x00000032 0x4082b644 [21:29:59]4082a8c0: 0xa89c0000 0xe6a0bce4 0x99e59f84 0x4082a8a4 0x00000048 0xe68db8e4 0xaee5af98 0x858ee5a2 [21:29:59]4082a8e0: 0x3432444c 0xbae43036 0xa89ce5ba 0xe6a0bce4 0x99e59f84 0x633220a8 0x63616131 0x3b305b00 [21:29:59]4082a900: 0x5b6d3633 0x735b5d44 0x63746977 0x36303a68 0x203a5d33 0x203a2727 0x4082a8cc 0x0000005c setup方法中的LOG根本没有，说明在初始化之前就出现了崩溃。 看到消息日志的存储信息，根据PC/MEPC和RA指针定位崩溃位置，参考这里 和这里">
+
+<!--[if lte IE 9]>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/classlist/1.1.20170427/classList.min.js"></script>
+<![endif]-->
+
+<!--[if lt IE 9]>
+  <script src="https://cdn.jsdelivr.net/npm/html5shiv@3.7.3/dist/html5shiv.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/respond.js@1.4.2/dest/respond.min.js"></script>
+<![endif]-->
+
+</head>
+<body>
+  <div id="mobile-navbar" class="mobile-navbar">
+  <div class="mobile-header-logo">
+    <a href="/" class="logo">-x</a>
+  </div>
+  <div class="mobile-navbar-icon">
+    <span></span>
+    <span></span>
+    <span></span>
+  </div>
+</div>
+<nav id="mobile-menu" class="mobile-menu slideout-menu">
+  <ul class="mobile-menu-list">
+    <a href="/">
+        <li class="mobile-menu-item">Home</li>
+      </a><a href="/post/">
+        <li class="mobile-menu-item">Archives</li>
+      </a><a href="/tags/">
+        <li class="mobile-menu-item">Tags</li>
+      </a><a href="/categories/">
+        <li class="mobile-menu-item">Categories</li>
+      </a>
+  </ul>
+
+  
+
+
+</nav>
+
+  <div class="container" id="mobile-panel">
+    <header id="header" class="header">
+        <div class="logo-wrapper">
+  <a href="/" class="logo">-x</a>
+</div>
+
+
+
+
+
+<nav class="site-navbar">
+  <ul id="menu" class="menu">
+    <li class="menu-item">
+        <a class="menu-item-link" href="/">Home</a>
+      </li><li class="menu-item">
+        <a class="menu-item-link" href="/post/">Archives</a>
+      </li><li class="menu-item">
+        <a class="menu-item-link" href="/tags/">Tags</a>
+      </li><li class="menu-item">
+        <a class="menu-item-link" href="/categories/">Categories</a>
+      </li>
+  </ul>
+</nav>
+
+    </header>
+
+    <main id="main" class="main">
+      <div class="content-wrapper">
+        <div id="content" class="content">
+          <article class="post">
+    
+    <header class="post-header">
+      <h1 class="post-title">Esphome</h1>
+
+      <div class="post-meta">
+        <span class="post-time"> 2026-04-20 </span>
+        
+        
+      </div>
+    </header>
+
+    <div class="post-toc" id="post-toc">
+  <h2 class="post-toc-title">Contents</h2>
+  <div class="post-toc-content always-active">
+    <nav id="TableOfContents">
+  <ul>
+    <li><a href="#esphome自定义组件崩溃调试方法">ESPHOME自定义组件崩溃调试方法</a>
+      <ul>
+        <li>
+          <ul>
+            <li><a href="#2025127更新">2025.12.7更新</a></li>
+          </ul>
+        </li>
+      </ul>
+    </li>
+  </ul>
+</nav>
+  </div>
+</div>
+    <div class="post-content">
+      <h1 id="esphome自定义组件崩溃调试方法">ESPHOME自定义组件崩溃调试方法</h1>
+<p><a href="https://github.com/ha-china/esphome_external_componnets/tree/main/components/ld2460">LD2460组件</a>过程中遇到运行的崩溃问题，记录调试方法</p>
+<ul>
+<li>看日志</li>
+</ul>
+<div class="highlight"><div class="chroma">
+<table class="lntable"><tr><td class="lntd">
+<pre tabindex="0" class="chroma"><code><span class="lnt"> 1
+</span><span class="lnt"> 2
+</span><span class="lnt"> 3
+</span><span class="lnt"> 4
+</span><span class="lnt"> 5
+</span><span class="lnt"> 6
+</span><span class="lnt"> 7
+</span><span class="lnt"> 8
+</span><span class="lnt"> 9
+</span><span class="lnt">10
+</span><span class="lnt">11
+</span><span class="lnt">12
+</span><span class="lnt">13
+</span><span class="lnt">14
+</span><span class="lnt">15
+</span><span class="lnt">16
+</span><span class="lnt">17
+</span><span class="lnt">18
+</span><span class="lnt">19
+</span><span class="lnt">20
+</span><span class="lnt">21
+</span><span class="lnt">22
+</span><span class="lnt">23
+</span><span class="lnt">24
+</span><span class="lnt">25
+</span><span class="lnt">26
+</span><span class="lnt">27
+</span><span class="lnt">28
+</span><span class="lnt">29
+</span><span class="lnt">30
+</span><span class="lnt">31
+</span><span class="lnt">32
+</span><span class="lnt">33
+</span><span class="lnt">34
+</span><span class="lnt">35
+</span><span class="lnt">36
+</span><span class="lnt">37
+</span><span class="lnt">38
+</span><span class="lnt">39
+</span><span class="lnt">40
+</span><span class="lnt">41
+</span><span class="lnt">42
+</span><span class="lnt">43
+</span><span class="lnt">44
+</span><span class="lnt">45
+</span><span class="lnt">46
+</span><span class="lnt">47
+</span><span class="lnt">48
+</span><span class="lnt">49
+</span><span class="lnt">50
+</span><span class="lnt">51
+</span><span class="lnt">52
+</span><span class="lnt">53
+</span><span class="lnt">54
+</span><span class="lnt">55
+</span><span class="lnt">56
+</span><span class="lnt">57
+</span><span class="lnt">58
+</span><span class="lnt">59
+</span><span class="lnt">60
+</span><span class="lnt">61
+</span><span class="lnt">62
+</span><span class="lnt">63
+</span><span class="lnt">64
+</span><span class="lnt">65
+</span><span class="lnt">66
+</span><span class="lnt">67
+</span><span class="lnt">68
+</span><span class="lnt">69
+</span><span class="lnt">70
+</span><span class="lnt">71
+</span><span class="lnt">72
+</span><span class="lnt">73
+</span><span class="lnt">74
+</span><span class="lnt">75
+</span><span class="lnt">76
+</span><span class="lnt">77
+</span><span class="lnt">78
+</span><span class="lnt">79
+</span><span class="lnt">80
+</span><span class="lnt">81
+</span><span class="lnt">82
+</span><span class="lnt">83
+</span><span class="lnt">84
+</span></code></pre></td>
+<td class="lntd">
+<pre tabindex="0" class="chroma"><code class="language-gdscript3" data-lang="gdscript3"><span class="line"><span class="cl"><span class="p">[</span><span class="mi">21</span><span class="p">:</span><span class="mi">29</span><span class="p">:</span><span class="mi">59</span><span class="p">]</span><span class="n">ESP</span><span class="o">-</span><span class="n">ROM</span><span class="p">:</span><span class="n">esp32c6</span><span class="o">-</span><span class="mi">20220919</span>
+</span></span><span class="line"><span class="cl"><span class="p">[</span><span class="mi">21</span><span class="p">:</span><span class="mi">29</span><span class="p">:</span><span class="mi">59</span><span class="p">]</span><span class="n">Build</span><span class="p">:</span><span class="n">Sep</span> <span class="mi">19</span> <span class="mi">2022</span>
+</span></span><span class="line"><span class="cl"><span class="p">[</span><span class="mi">21</span><span class="p">:</span><span class="mi">29</span><span class="p">:</span><span class="mi">59</span><span class="p">]</span><span class="n">rst</span><span class="p">:</span><span class="mh">0x15</span> <span class="p">(</span><span class="n">USB_UART_HPSYS</span><span class="p">),</span><span class="n">boot</span><span class="p">:</span><span class="mh">0xc</span> <span class="p">(</span><span class="n">SPI_FAST_FLASH_BOOT</span><span class="p">)</span>
+</span></span><span class="line"><span class="cl"><span class="p">[</span><span class="mi">21</span><span class="p">:</span><span class="mi">29</span><span class="p">:</span><span class="mi">59</span><span class="p">]</span><span class="n">Saved</span> <span class="n">PC</span><span class="p">:</span><span class="mh">0x408052da</span>
+</span></span><span class="line"><span class="cl"><span class="p">[</span><span class="mi">21</span><span class="p">:</span><span class="mi">29</span><span class="p">:</span><span class="mi">59</span><span class="p">]</span><span class="n">SPIWP</span><span class="p">:</span><span class="mh">0xee</span>
+</span></span><span class="line"><span class="cl"><span class="p">[</span><span class="mi">21</span><span class="p">:</span><span class="mi">29</span><span class="p">:</span><span class="mi">59</span><span class="p">]</span><span class="n">mode</span><span class="p">:</span><span class="n">DIO</span><span class="p">,</span> <span class="n">clock</span> <span class="n">div</span><span class="p">:</span><span class="mi">2</span>
+</span></span><span class="line"><span class="cl"><span class="p">[</span><span class="mi">21</span><span class="p">:</span><span class="mi">29</span><span class="p">:</span><span class="mi">59</span><span class="p">]</span><span class="nb">load</span><span class="p">:</span><span class="mh">0x40875730</span><span class="p">,</span><span class="n">len</span><span class="p">:</span><span class="mh">0x16bc</span>
+</span></span><span class="line"><span class="cl"><span class="p">[</span><span class="mi">21</span><span class="p">:</span><span class="mi">29</span><span class="p">:</span><span class="mi">59</span><span class="p">]</span><span class="nb">load</span><span class="p">:</span><span class="mh">0x4086c110</span><span class="p">,</span><span class="n">len</span><span class="p">:</span><span class="mh">0xdf4</span>
+</span></span><span class="line"><span class="cl"><span class="p">[</span><span class="mi">21</span><span class="p">:</span><span class="mi">29</span><span class="p">:</span><span class="mi">59</span><span class="p">]</span><span class="nb">load</span><span class="p">:</span><span class="mh">0x4086e610</span><span class="p">,</span><span class="n">len</span><span class="p">:</span><span class="mh">0x3078</span>
+</span></span><span class="line"><span class="cl"><span class="p">[</span><span class="mi">21</span><span class="p">:</span><span class="mi">29</span><span class="p">:</span><span class="mi">59</span><span class="p">]</span><span class="n">entry</span> <span class="mh">0x4086c110</span>
+</span></span><span class="line"><span class="cl"><span class="p">[</span><span class="mi">21</span><span class="p">:</span><span class="mi">29</span><span class="p">:</span><span class="mi">59</span><span class="p">]</span><span class="n">I</span> <span class="p">(</span><span class="mi">23</span><span class="p">)</span> <span class="n">boot</span><span class="p">:</span> <span class="n">ESP</span><span class="o">-</span><span class="n">IDF</span> <span class="mf">5.4</span><span class="o">.</span><span class="mi">2</span> <span class="mi">2</span><span class="n">nd</span> <span class="n">stage</span> <span class="n">bootloader</span>
+</span></span><span class="line"><span class="cl"><span class="p">[</span><span class="mi">21</span><span class="p">:</span><span class="mi">29</span><span class="p">:</span><span class="mi">59</span><span class="p">]</span><span class="n">I</span> <span class="p">(</span><span class="mi">23</span><span class="p">)</span> <span class="n">boot</span><span class="p">:</span> <span class="n">compile</span> <span class="n">time</span> <span class="n">Oct</span> <span class="mi">14</span> <span class="mi">2025</span> <span class="mi">13</span><span class="p">:</span><span class="mi">19</span><span class="p">:</span><span class="mi">17</span>
+</span></span><span class="line"><span class="cl"><span class="p">[</span><span class="mi">21</span><span class="p">:</span><span class="mi">29</span><span class="p">:</span><span class="mi">59</span><span class="p">]</span><span class="n">I</span> <span class="p">(</span><span class="mi">23</span><span class="p">)</span> <span class="n">boot</span><span class="p">:</span> <span class="n">chip</span> <span class="n">revision</span><span class="p">:</span> <span class="n">v0</span><span class="o">.</span><span class="mi">1</span>
+</span></span><span class="line"><span class="cl"><span class="p">[</span><span class="mi">21</span><span class="p">:</span><span class="mi">29</span><span class="p">:</span><span class="mi">59</span><span class="p">]</span><span class="n">I</span> <span class="p">(</span><span class="mi">23</span><span class="p">)</span> <span class="n">boot</span><span class="p">:</span> <span class="n">efuse</span> <span class="n">block</span> <span class="n">revision</span><span class="p">:</span> <span class="n">v0</span><span class="o">.</span><span class="mi">3</span>
+</span></span><span class="line"><span class="cl"><span class="p">[</span><span class="mi">21</span><span class="p">:</span><span class="mi">29</span><span class="p">:</span><span class="mi">59</span><span class="p">]</span><span class="n">I</span> <span class="p">(</span><span class="mi">24</span><span class="p">)</span> <span class="n">boot</span><span class="o">.</span><span class="n">esp32c6</span><span class="p">:</span> <span class="n">SPI</span> <span class="n">Speed</span>      <span class="p">:</span> <span class="mi">80</span><span class="n">MHz</span>
+</span></span><span class="line"><span class="cl"><span class="p">[</span><span class="mi">21</span><span class="p">:</span><span class="mi">29</span><span class="p">:</span><span class="mi">59</span><span class="p">]</span><span class="n">I</span> <span class="p">(</span><span class="mi">24</span><span class="p">)</span> <span class="n">boot</span><span class="o">.</span><span class="n">esp32c6</span><span class="p">:</span> <span class="n">SPI</span> <span class="n">Mode</span>       <span class="p">:</span> <span class="n">DIO</span>
+</span></span><span class="line"><span class="cl"><span class="p">[</span><span class="mi">21</span><span class="p">:</span><span class="mi">29</span><span class="p">:</span><span class="mi">59</span><span class="p">]</span><span class="n">I</span> <span class="p">(</span><span class="mi">24</span><span class="p">)</span> <span class="n">boot</span><span class="o">.</span><span class="n">esp32c6</span><span class="p">:</span> <span class="n">SPI</span> <span class="n">Flash</span> <span class="n">Size</span> <span class="p">:</span> <span class="mi">4</span><span class="n">MB</span>
+</span></span><span class="line"><span class="cl"><span class="p">[</span><span class="mi">21</span><span class="p">:</span><span class="mi">29</span><span class="p">:</span><span class="mi">59</span><span class="p">]</span><span class="n">I</span> <span class="p">(</span><span class="mi">25</span><span class="p">)</span> <span class="n">boot</span><span class="p">:</span> <span class="n">Enabling</span> <span class="n">RNG</span> <span class="n">early</span> <span class="n">entropy</span> <span class="n">source</span><span class="o">...</span>
+</span></span><span class="line"><span class="cl"><span class="p">[</span><span class="mi">21</span><span class="p">:</span><span class="mi">29</span><span class="p">:</span><span class="mi">59</span><span class="p">]</span><span class="n">I</span> <span class="p">(</span><span class="mi">25</span><span class="p">)</span> <span class="n">boot</span><span class="p">:</span> <span class="n">Partition</span> <span class="n">Table</span><span class="p">:</span>
+</span></span><span class="line"><span class="cl"><span class="p">[</span><span class="mi">21</span><span class="p">:</span><span class="mi">29</span><span class="p">:</span><span class="mi">59</span><span class="p">]</span><span class="n">I</span> <span class="p">(</span><span class="mi">25</span><span class="p">)</span> <span class="n">boot</span><span class="p">:</span> <span class="c1">## Label            Usage          Type ST Offset   Length</span>
+</span></span><span class="line"><span class="cl"><span class="p">[</span><span class="mi">21</span><span class="p">:</span><span class="mi">29</span><span class="p">:</span><span class="mi">59</span><span class="p">]</span><span class="n">I</span> <span class="p">(</span><span class="mi">26</span><span class="p">)</span> <span class="n">boot</span><span class="p">:</span>  <span class="mi">0</span> <span class="n">otadata</span>          <span class="n">OTA</span> <span class="n">data</span>         <span class="mi">01</span> <span class="mi">00</span> <span class="mi">00009000</span> <span class="mi">00002000</span>
+</span></span><span class="line"><span class="cl"><span class="p">[</span><span class="mi">21</span><span class="p">:</span><span class="mi">29</span><span class="p">:</span><span class="mi">59</span><span class="p">]</span><span class="n">I</span> <span class="p">(</span><span class="mi">26</span><span class="p">)</span> <span class="n">boot</span><span class="p">:</span>  <span class="mi">1</span> <span class="n">phy_init</span>         <span class="n">RF</span> <span class="n">data</span>          <span class="mi">01</span> <span class="mi">01</span> <span class="mi">0000</span><span class="n">b000</span> <span class="mi">00001000</span>
+</span></span><span class="line"><span class="cl"><span class="p">[</span><span class="mi">21</span><span class="p">:</span><span class="mi">29</span><span class="p">:</span><span class="mi">59</span><span class="p">]</span><span class="n">I</span> <span class="p">(</span><span class="mi">27</span><span class="p">)</span> <span class="n">boot</span><span class="p">:</span>  <span class="mi">2</span> <span class="n">app0</span>             <span class="n">OTA</span> <span class="n">app</span>          <span class="mi">00</span> <span class="mi">10</span> <span class="mi">00010000</span> <span class="mi">001</span><span class="n">c0000</span>
+</span></span><span class="line"><span class="cl"><span class="p">[</span><span class="mi">21</span><span class="p">:</span><span class="mi">29</span><span class="p">:</span><span class="mi">59</span><span class="p">]</span><span class="n">I</span> <span class="p">(</span><span class="mi">27</span><span class="p">)</span> <span class="n">boot</span><span class="p">:</span>  <span class="mi">3</span> <span class="n">app1</span>             <span class="n">OTA</span> <span class="n">app</span>          <span class="mi">00</span> <span class="mi">11</span> <span class="mi">001</span><span class="n">d0000</span> <span class="mi">001</span><span class="n">c0000</span>
+</span></span><span class="line"><span class="cl"><span class="p">[</span><span class="mi">21</span><span class="p">:</span><span class="mi">29</span><span class="p">:</span><span class="mi">59</span><span class="p">]</span><span class="n">I</span> <span class="p">(</span><span class="mi">28</span><span class="p">)</span> <span class="n">boot</span><span class="p">:</span>  <span class="mi">4</span> <span class="n">nvs</span>              <span class="n">WiFi</span> <span class="n">data</span>        <span class="mi">01</span> <span class="mi">02</span> <span class="mi">00390000</span> <span class="mi">0006</span><span class="n">d000</span>
+</span></span><span class="line"><span class="cl"><span class="p">[</span><span class="mi">21</span><span class="p">:</span><span class="mi">29</span><span class="p">:</span><span class="mi">59</span><span class="p">]</span><span class="n">I</span> <span class="p">(</span><span class="mi">28</span><span class="p">)</span> <span class="n">boot</span><span class="p">:</span> <span class="n">End</span> <span class="n">of</span> <span class="n">partition</span> <span class="n">table</span>
+</span></span><span class="line"><span class="cl"><span class="p">[</span><span class="mi">21</span><span class="p">:</span><span class="mi">29</span><span class="p">:</span><span class="mi">59</span><span class="p">]</span><span class="n">I</span> <span class="p">(</span><span class="mi">29</span><span class="p">)</span> <span class="n">esp_image</span><span class="p">:</span> <span class="n">segment</span> <span class="mi">0</span><span class="p">:</span> <span class="n">paddr</span><span class="o">=</span><span class="mi">00010020</span> <span class="n">vaddr</span><span class="o">=</span><span class="mi">420</span><span class="n">c0020</span> <span class="n">size</span><span class="o">=</span><span class="mi">2009</span><span class="n">ch</span> <span class="p">(</span><span class="mi">131228</span><span class="p">)</span> <span class="n">map</span>
+</span></span><span class="line"><span class="cl"><span class="p">[</span><span class="mi">21</span><span class="p">:</span><span class="mi">29</span><span class="p">:</span><span class="mi">59</span><span class="p">]</span><span class="n">I</span> <span class="p">(</span><span class="mi">54</span><span class="p">)</span> <span class="n">esp_image</span><span class="p">:</span> <span class="n">segment</span> <span class="mi">1</span><span class="p">:</span> <span class="n">paddr</span><span class="o">=</span><span class="mi">000300</span><span class="n">c4</span> <span class="n">vaddr</span><span class="o">=</span><span class="mi">40800000</span> <span class="n">size</span><span class="o">=</span><span class="mi">0</span><span class="n">ff54h</span> <span class="p">(</span> <span class="mi">65364</span><span class="p">)</span> <span class="nb">load</span>
+</span></span><span class="line"><span class="cl"><span class="p">[</span><span class="mi">21</span><span class="p">:</span><span class="mi">29</span><span class="p">:</span><span class="mi">59</span><span class="p">]</span><span class="n">I</span> <span class="p">(</span><span class="mi">69</span><span class="p">)</span> <span class="n">esp_image</span><span class="p">:</span> <span class="n">segment</span> <span class="mi">2</span><span class="p">:</span> <span class="n">paddr</span><span class="o">=</span><span class="mi">00040020</span> <span class="n">vaddr</span><span class="o">=</span><span class="mi">42000020</span> <span class="n">size</span><span class="o">=</span><span class="n">bb090h</span> <span class="p">(</span><span class="mi">766096</span><span class="p">)</span> <span class="n">map</span>
+</span></span><span class="line"><span class="cl"><span class="p">[</span><span class="mi">21</span><span class="p">:</span><span class="mi">29</span><span class="p">:</span><span class="mi">59</span><span class="p">]</span><span class="n">I</span> <span class="p">(</span><span class="mi">213</span><span class="p">)</span> <span class="n">esp_image</span><span class="p">:</span> <span class="n">segment</span> <span class="mi">3</span><span class="p">:</span> <span class="n">paddr</span><span class="o">=</span><span class="mi">000</span><span class="n">fb0b8</span> <span class="n">vaddr</span><span class="o">=</span><span class="mi">4080</span><span class="n">ff54</span> <span class="n">size</span><span class="o">=</span><span class="mi">0</span><span class="n">c18ch</span> <span class="p">(</span> <span class="mi">49548</span><span class="p">)</span> <span class="nb">load</span>
+</span></span><span class="line"><span class="cl"><span class="p">[</span><span class="mi">21</span><span class="p">:</span><span class="mi">29</span><span class="p">:</span><span class="mi">59</span><span class="p">]</span><span class="n">I</span> <span class="p">(</span><span class="mi">229</span><span class="p">)</span> <span class="n">boot</span><span class="p">:</span> <span class="n">Loaded</span> <span class="n">app</span> <span class="n">from</span> <span class="n">partition</span> <span class="n">at</span> <span class="n">offset</span> <span class="mh">0x10000</span>
+</span></span><span class="line"><span class="cl"><span class="p">[</span><span class="mi">21</span><span class="p">:</span><span class="mi">29</span><span class="p">:</span><span class="mi">59</span><span class="p">]</span><span class="n">I</span> <span class="p">(</span><span class="mi">230</span><span class="p">)</span> <span class="n">boot</span><span class="p">:</span> <span class="n">Disabling</span> <span class="n">RNG</span> <span class="n">early</span> <span class="n">entropy</span> <span class="n">source</span><span class="o">...</span>
+</span></span><span class="line"><span class="cl"><span class="p">[</span><span class="mi">21</span><span class="p">:</span><span class="mi">29</span><span class="p">:</span><span class="mi">59</span><span class="p">][</span><span class="n">I</span><span class="p">][</span><span class="n">logger</span><span class="p">:</span><span class="mi">165</span><span class="p">]:</span> <span class="n">Log</span> <span class="n">initialized</span>
+</span></span><span class="line"><span class="cl"><span class="p">[</span><span class="mi">21</span><span class="p">:</span><span class="mi">29</span><span class="p">:</span><span class="mi">59</span><span class="p">][</span><span class="n">C</span><span class="p">][</span><span class="n">safe_mode</span><span class="p">:</span><span class="mi">084</span><span class="p">]:</span> <span class="n">Unsuccessful</span> <span class="n">boot</span> <span class="n">attempts</span><span class="p">:</span> <span class="mi">0</span>
+</span></span><span class="line"><span class="cl"><span class="p">[</span><span class="mi">21</span><span class="p">:</span><span class="mi">29</span><span class="p">:</span><span class="mi">59</span><span class="p">][</span><span class="n">D</span><span class="p">][</span><span class="n">esp32</span><span class="o">.</span><span class="n">preferences</span><span class="p">:</span><span class="mi">143</span><span class="p">]:</span> <span class="n">Writing</span> <span class="mi">1</span> <span class="n">items</span><span class="p">:</span> <span class="mi">0</span> <span class="n">cached</span><span class="p">,</span> <span class="mi">1</span> <span class="n">written</span><span class="p">,</span> <span class="mi">0</span> <span class="n">failed</span>
+</span></span><span class="line"><span class="cl"><span class="p">[</span><span class="mi">21</span><span class="p">:</span><span class="mi">29</span><span class="p">:</span><span class="mi">59</span><span class="p">][</span><span class="n">D</span><span class="p">][</span><span class="k">switch</span><span class="p">:</span><span class="mi">020</span><span class="p">]:</span> <span class="s1">&#39;&#39;</span> <span class="n">Turning</span> <span class="n">ON</span><span class="o">.</span>
+</span></span><span class="line"><span class="cl"><span class="p">[</span><span class="mi">21</span><span class="p">:</span><span class="mi">29</span><span class="p">:</span><span class="mi">59</span><span class="p">][</span><span class="n">D</span><span class="p">][</span><span class="k">switch</span><span class="p">:</span><span class="mi">063</span><span class="p">]:</span> <span class="s1">&#39;&#39;</span><span class="p">:</span> <span class="n">Sending</span> <span class="n">state</span> <span class="n">ON</span>
+</span></span><span class="line"><span class="cl"><span class="p">[</span><span class="mi">21</span><span class="p">:</span><span class="mi">29</span><span class="p">:</span><span class="mi">59</span><span class="p">]</span><span class="n">Guru</span> <span class="n">Meditation</span> <span class="n">Error</span><span class="p">:</span> <span class="n">Core</span>  <span class="mi">0</span> <span class="n">panic</span><span class="s1">&#39;ed (Load access fault). Exception was unhandled.</span>
+</span></span><span class="line"><span class="cl"><span class="p">[</span><span class="mi">21</span><span class="p">:</span><span class="mi">29</span><span class="p">:</span><span class="mi">59</span><span class="p">]</span>
+</span></span><span class="line"><span class="cl"><span class="p">[</span><span class="mi">21</span><span class="p">:</span><span class="mi">29</span><span class="p">:</span><span class="mi">59</span><span class="p">]</span><span class="n">Core</span>  <span class="mi">0</span> <span class="n">register</span> <span class="n">dump</span><span class="p">:</span>
+</span></span><span class="line"><span class="cl"><span class="p">[</span><span class="mi">21</span><span class="p">:</span><span class="mi">29</span><span class="p">:</span><span class="mi">59</span><span class="p">]</span><span class="n">MEPC</span>    <span class="p">:</span> <span class="mh">0x4200a47a</span>  <span class="n">RA</span>      <span class="p">:</span> <span class="mh">0x4200a4f6</span>  <span class="n">SP</span>      <span class="p">:</span> <span class="mh">0x4082a520</span>  <span class="n">GP</span>      <span class="p">:</span> <span class="mh">0x408192d4</span>  
+</span></span><span class="line"><span class="cl"><span class="p">[</span><span class="mi">21</span><span class="p">:</span><span class="mi">29</span><span class="p">:</span><span class="mi">59</span><span class="p">]</span><span class="n">TP</span>      <span class="p">:</span> <span class="mh">0x4082a6f0</span>  <span class="n">T0</span>      <span class="p">:</span> <span class="mh">0x40028192</span>  <span class="n">T1</span>      <span class="p">:</span> <span class="mh">0x40829ffc</span>  <span class="n">T2</span>      <span class="p">:</span> <span class="mh">0x0000000a</span>  
+</span></span><span class="line"><span class="cl"><span class="p">[</span><span class="mi">21</span><span class="p">:</span><span class="mi">29</span><span class="p">:</span><span class="mi">59</span><span class="p">]</span><span class="n">S0</span><span class="o">/</span><span class="n">FP</span>   <span class="p">:</span> <span class="mh">0x00000000</span>  <span class="n">S1</span>      <span class="p">:</span> <span class="mh">0x4081c000</span>  <span class="n">A0</span>      <span class="p">:</span> <span class="mh">0x00000000</span>  <span class="n">A1</span>      <span class="p">:</span> <span class="mh">0x00000006</span>  
+</span></span><span class="line"><span class="cl"><span class="p">[</span><span class="mi">21</span><span class="p">:</span><span class="mi">29</span><span class="p">:</span><span class="mi">59</span><span class="p">]</span><span class="n">A2</span>      <span class="p">:</span> <span class="mh">0x4082a54f</span>  <span class="n">A3</span>      <span class="p">:</span> <span class="mh">0x00000001</span>  <span class="n">A4</span>      <span class="p">:</span> <span class="mh">0x00000030</span>  <span class="n">A5</span>      <span class="p">:</span> <span class="mh">0x00000001</span>  
+</span></span><span class="line"><span class="cl"><span class="p">[</span><span class="mi">21</span><span class="p">:</span><span class="mi">29</span><span class="p">:</span><span class="mi">59</span><span class="p">]</span><span class="n">A6</span>      <span class="p">:</span> <span class="mh">0x00000004</span>  <span class="n">A7</span>      <span class="p">:</span> <span class="mh">0x0000000a</span>  <span class="n">S2</span>      <span class="p">:</span> <span class="mh">0x40822000</span>  <span class="n">S3</span>      <span class="p">:</span> <span class="mh">0x4081c110</span>  
+</span></span><span class="line"><span class="cl"><span class="p">[</span><span class="mi">21</span><span class="p">:</span><span class="mi">29</span><span class="p">:</span><span class="mi">59</span><span class="p">]</span><span class="n">S4</span>      <span class="p">:</span> <span class="mh">0x40825080</span>  <span class="n">S5</span>      <span class="p">:</span> <span class="mh">0x40822000</span>  <span class="n">S6</span>      <span class="p">:</span> <span class="mh">0x420cf000</span>  <span class="n">S7</span>      <span class="p">:</span> <span class="mh">0x420c4000</span>  
+</span></span><span class="line"><span class="cl"><span class="p">[</span><span class="mi">21</span><span class="p">:</span><span class="mi">29</span><span class="p">:</span><span class="mi">59</span><span class="p">]</span><span class="n">S8</span>      <span class="p">:</span> <span class="mh">0x40822000</span>  <span class="n">S9</span>      <span class="p">:</span> <span class="mh">0x40822000</span>  <span class="n">S10</span>     <span class="p">:</span> <span class="mh">0x40822000</span>  <span class="n">S11</span>     <span class="p">:</span> <span class="mh">0x40822000</span>  
+</span></span><span class="line"><span class="cl"><span class="p">[</span><span class="mi">21</span><span class="p">:</span><span class="mi">29</span><span class="p">:</span><span class="mi">59</span><span class="p">]</span><span class="n">T3</span>      <span class="p">:</span> <span class="mh">0x00000000</span>  <span class="n">T4</span>      <span class="p">:</span> <span class="mh">0x420c3cd0</span>  <span class="n">T5</span>      <span class="p">:</span> <span class="mh">0x0000003f</span>  <span class="n">T6</span>      <span class="p">:</span> <span class="mh">0x00000020</span>  
+</span></span><span class="line"><span class="cl"><span class="p">[</span><span class="mi">21</span><span class="p">:</span><span class="mi">29</span><span class="p">:</span><span class="mi">59</span><span class="p">]</span><span class="n">MSTATUS</span> <span class="p">:</span> <span class="mh">0x00001881</span>  <span class="n">MTVEC</span>   <span class="p">:</span> <span class="mh">0x40800001</span>  <span class="n">MCAUSE</span>  <span class="p">:</span> <span class="mh">0x00000005</span>  <span class="n">MTVAL</span>   <span class="p">:</span> <span class="mh">0x0000000c</span>  
+</span></span><span class="line"><span class="cl"><span class="p">[</span><span class="mi">21</span><span class="p">:</span><span class="mi">29</span><span class="p">:</span><span class="mi">59</span><span class="p">]</span><span class="n">MHARTID</span> <span class="p">:</span> <span class="mh">0x00000000</span>  
+</span></span><span class="line"><span class="cl"><span class="p">[</span><span class="mi">21</span><span class="p">:</span><span class="mi">29</span><span class="p">:</span><span class="mi">59</span><span class="p">]</span>
+</span></span><span class="line"><span class="cl"><span class="p">[</span><span class="mi">21</span><span class="p">:</span><span class="mi">29</span><span class="p">:</span><span class="mi">59</span><span class="p">]</span><span class="n">Stack</span> <span class="n">memory</span><span class="p">:</span>
+</span></span><span class="line"><span class="cl"><span class="p">[</span><span class="mi">21</span><span class="p">:</span><span class="mi">29</span><span class="p">:</span><span class="mi">59</span><span class="p">]</span><span class="mi">4082</span><span class="n">a520</span><span class="p">:</span> <span class="mh">0x00000004</span> <span class="mh">0x0000000a</span> <span class="mh">0x40822000</span> <span class="mh">0x4081c110</span> <span class="mh">0x40825080</span> <span class="mh">0x40822000</span> <span class="mh">0x4082a610</span> <span class="mh">0x420c4000</span>
+</span></span><span class="line"><span class="cl"><span class="p">[</span><span class="mi">21</span><span class="p">:</span><span class="mi">29</span><span class="p">:</span><span class="mi">59</span><span class="p">]</span><span class="mi">4082</span><span class="n">a540</span><span class="p">:</span> <span class="mh">0x40822000</span> <span class="mh">0x40822000</span> <span class="mh">0x40822000</span> <span class="mh">0x01822000</span> <span class="mh">0x00000000</span> <span class="mh">0x420c3cd0</span> <span class="mh">0x0000003f</span> <span class="mh">0x4201edd6</span>
+</span></span><span class="line"><span class="cl"><span class="p">[</span><span class="mi">21</span><span class="p">:</span><span class="mi">29</span><span class="p">:</span><span class="mi">59</span><span class="p">]</span><span class="mi">4082</span><span class="n">a560</span><span class="p">:</span> <span class="mh">0xa5a5a5a5</span> <span class="mh">0xa5a5a5a5</span> <span class="mh">0xa5a5a5a5</span> <span class="mh">0x40824cac</span> <span class="mh">0xa5a5a5a5</span> <span class="mh">0xa5a5a5a5</span> <span class="mh">0x4082a610</span> <span class="mh">0x00000001</span>
+</span></span><span class="line"><span class="cl"><span class="p">[</span><span class="mi">21</span><span class="p">:</span><span class="mi">29</span><span class="p">:</span><span class="mi">59</span><span class="p">]</span><span class="mi">4082</span><span class="n">a580</span><span class="p">:</span> <span class="mh">0x4082a610</span> <span class="mh">0x00000001</span> <span class="mh">0x4082a610</span> <span class="mh">0x00000001</span> <span class="mh">0x4082a610</span> <span class="mh">0x00000001</span> <span class="mh">0x4082a610</span> <span class="mh">0x00000001</span>
+</span></span><span class="line"><span class="cl"><span class="p">[</span><span class="mi">21</span><span class="p">:</span><span class="mi">29</span><span class="p">:</span><span class="mi">59</span><span class="p">]</span><span class="mi">4082</span><span class="n">a5a0</span><span class="p">:</span> <span class="mh">0x4082a610</span> <span class="mh">0x00000001</span> <span class="mh">0x4082a610</span> <span class="mh">0x00000001</span> <span class="mh">0x4082a610</span> <span class="mh">0x00000001</span> <span class="mh">0x4082a610</span> <span class="mh">0x00000001</span>
+</span></span><span class="line"><span class="cl"><span class="p">[</span><span class="mi">21</span><span class="p">:</span><span class="mi">29</span><span class="p">:</span><span class="mi">59</span><span class="p">]</span><span class="mi">4082</span><span class="n">a5c0</span><span class="p">:</span> <span class="mh">0x4082a610</span> <span class="mh">0x00000001</span> <span class="mh">0x4082a610</span> <span class="mh">0x00000001</span> <span class="mh">0x682d7067</span> <span class="mh">0x6c2d6b6c</span> <span class="mh">0x36343264</span> <span class="mh">0xa5a50030</span>
+</span></span><span class="line"><span class="cl"><span class="p">[</span><span class="mi">21</span><span class="p">:</span><span class="mi">29</span><span class="p">:</span><span class="mi">59</span><span class="p">]</span><span class="mi">4082</span><span class="n">a5e0</span><span class="p">:</span> <span class="mh">0x4082a610</span> <span class="mh">0x00000001</span> <span class="mh">0x00000021</span> <span class="mh">0xa5a5a5a5</span> <span class="mh">0xa5a5a5a5</span> <span class="mh">0xa5a5a5a5</span> <span class="mh">0x40824604</span> <span class="mh">0x00000013</span>
+</span></span><span class="line"><span class="cl"><span class="p">[</span><span class="mi">21</span><span class="p">:</span><span class="mi">29</span><span class="p">:</span><span class="mi">59</span><span class="p">]</span><span class="mi">4082</span><span class="n">a600</span><span class="p">:</span> <span class="mh">0x00000013</span> <span class="mh">0xa5006361</span> <span class="mh">0xa5a5a5a5</span> <span class="mh">0xa5a5a5a5</span> <span class="mh">0x40824dd0</span> <span class="mh">0x00000006</span> <span class="mh">0x62616e65</span> <span class="mh">0x3600656c</span>
+</span></span><span class="line"><span class="cl"><span class="p">[</span><span class="mi">21</span><span class="p">:</span><span class="mi">29</span><span class="p">:</span><span class="mi">59</span><span class="p">]</span><span class="mi">4082</span><span class="n">a620</span><span class="p">:</span> <span class="mh">0x35333636</span> <span class="mh">0xa5002d00</span> <span class="mh">0x4082a630</span> <span class="mh">0x00000004</span> <span class="mh">0x30435455</span> <span class="mh">0x00000000</span> <span class="mh">0x63616131</span> <span class="mh">0xa5a5a500</span>
+</span></span><span class="line"><span class="cl"><span class="p">[</span><span class="mi">21</span><span class="p">:</span><span class="mi">29</span><span class="p">:</span><span class="mi">59</span><span class="p">]</span><span class="mi">4082</span><span class="n">a640</span><span class="p">:</span> <span class="mh">0x4082a648</span> <span class="mh">0x00000000</span> <span class="mh">0x6a7a6a00</span> <span class="mh">0x36383336</span> <span class="mh">0x35333636</span> <span class="mh">0x00000000</span> <span class="mh">0x00000000</span> <span class="mh">0x008192d4</span>
+</span></span><span class="line"><span class="cl"><span class="p">[</span><span class="mi">21</span><span class="p">:</span><span class="mi">29</span><span class="p">:</span><span class="mi">59</span><span class="p">]</span><span class="mi">4082</span><span class="n">a660</span><span class="p">:</span> <span class="mh">0x00000000</span> <span class="mh">0x00000000</span> <span class="mh">0x00000000</span> <span class="mh">0x00000000</span> <span class="mh">0x00000000</span> <span class="mh">0x00000000</span> <span class="mh">0x00000000</span> <span class="mh">0x00000000</span>
+</span></span><span class="line"><span class="cl"><span class="p">[</span><span class="mi">21</span><span class="p">:</span><span class="mi">29</span><span class="p">:</span><span class="mi">59</span><span class="p">]</span><span class="mi">4082</span><span class="n">a680</span><span class="p">:</span> <span class="mh">0x00000000</span> <span class="mh">0x00000000</span> <span class="mh">0x00000000</span> <span class="mh">0x00000000</span> <span class="mh">0x00000000</span> <span class="mh">0x00000000</span> <span class="mh">0x00000000</span> <span class="mh">0x00000000</span>
+</span></span><span class="line"><span class="cl"><span class="p">[</span><span class="mi">21</span><span class="p">:</span><span class="mi">29</span><span class="p">:</span><span class="mi">59</span><span class="p">]</span><span class="mi">4082</span><span class="n">a6a0</span><span class="p">:</span> <span class="mh">0x00000000</span> <span class="mh">0x00000000</span> <span class="mh">0x00000000</span> <span class="mh">0x00000000</span> <span class="mh">0x00000000</span> <span class="mh">0x00000000</span> <span class="mh">0x00000000</span> <span class="mh">0x42007c0a</span>
+</span></span><span class="line"><span class="cl"><span class="p">[</span><span class="mi">21</span><span class="p">:</span><span class="mi">29</span><span class="p">:</span><span class="mi">59</span><span class="p">]</span><span class="mi">4082</span><span class="n">a6c0</span><span class="p">:</span> <span class="mh">0x00000000</span> <span class="mh">0x00000000</span> <span class="mh">0x00000000</span> <span class="mh">0x00000000</span> <span class="mh">0x00000000</span> <span class="mh">0x00000000</span> <span class="mh">0x00000000</span> <span class="mh">0x00000000</span>
+</span></span><span class="line"><span class="cl"><span class="p">[</span><span class="mi">21</span><span class="p">:</span><span class="mi">29</span><span class="p">:</span><span class="mi">59</span><span class="p">]</span><span class="mi">4082</span><span class="n">a6e0</span><span class="p">:</span> <span class="mh">0x00000000</span> <span class="mh">0xa5a5a5a5</span> <span class="mh">0xa5a5a5a5</span> <span class="mh">0xa5a5a5a5</span> <span class="mh">0xa5a5a5a5</span> <span class="mh">0x00000150</span> <span class="mh">0x4082a4e0</span> <span class="mh">0x00000068</span>
+</span></span><span class="line"><span class="cl"><span class="p">[</span><span class="mi">21</span><span class="p">:</span><span class="mi">29</span><span class="p">:</span><span class="mi">59</span><span class="p">]</span><span class="mi">4082</span><span class="n">a700</span><span class="p">:</span> <span class="mh">0x4081cdd8</span> <span class="mh">0x4081cdd8</span> <span class="mh">0x4082a6f8</span> <span class="mh">0x4081cdd0</span> <span class="mh">0x00000018</span> <span class="mh">0x00000000</span> <span class="mh">0x00000000</span> <span class="mh">0x4082a6f8</span>
+</span></span><span class="line"><span class="cl"><span class="p">[</span><span class="mi">21</span><span class="p">:</span><span class="mi">29</span><span class="p">:</span><span class="mi">59</span><span class="p">]</span><span class="mi">4082</span><span class="n">a720</span><span class="p">:</span> <span class="mh">0x00000000</span> <span class="mh">0x00000001</span> <span class="mh">0x408286f4</span> <span class="mh">0x706f6f6c</span> <span class="mh">0x6b736154</span> <span class="mh">0x00000000</span> <span class="mh">0x00000000</span> <span class="mh">0x4082a6f0</span>
+</span></span><span class="line"><span class="cl"><span class="p">[</span><span class="mi">21</span><span class="p">:</span><span class="mi">29</span><span class="p">:</span><span class="mi">59</span><span class="p">]</span><span class="mi">4082</span><span class="n">a740</span><span class="p">:</span> <span class="mh">0x00000001</span> <span class="mh">0x00000000</span> <span class="mh">0x00000000</span> <span class="mh">0x00000000</span> <span class="mh">0x00000000</span> <span class="mh">0x40822b78</span> <span class="mh">0x40822be0</span> <span class="mh">0x40822c48</span>
+</span></span><span class="line"><span class="cl"><span class="p">[</span><span class="mi">21</span><span class="p">:</span><span class="mi">29</span><span class="p">:</span><span class="mi">59</span><span class="p">]</span><span class="mi">4082</span><span class="n">a760</span><span class="p">:</span> <span class="mh">0x00000000</span> <span class="mh">0x00000000</span> <span class="mh">0x00000001</span> <span class="mh">0x00000000</span> <span class="mh">0x00000000</span> <span class="mh">0x00000000</span> <span class="mh">0x4002849c</span> <span class="mh">0x00000000</span>
+</span></span><span class="line"><span class="cl"><span class="p">[</span><span class="mi">21</span><span class="p">:</span><span class="mi">29</span><span class="p">:</span><span class="mi">59</span><span class="p">]</span><span class="mi">4082</span><span class="n">a780</span><span class="p">:</span> <span class="mh">0x00000000</span> <span class="mh">0x00000000</span> <span class="mh">0x00000000</span> <span class="mh">0x00000000</span> <span class="mh">0x00000000</span> <span class="mh">0x00000000</span> <span class="mh">0x00000000</span> <span class="mh">0x00000000</span>
+</span></span><span class="line"><span class="cl"><span class="p">[</span><span class="mi">21</span><span class="p">:</span><span class="mi">29</span><span class="p">:</span><span class="mi">59</span><span class="p">]</span><span class="mi">4082</span><span class="n">a7a0</span><span class="p">:</span> <span class="mh">0x00000000</span> <span class="mh">0x00000000</span> <span class="mh">0x00000000</span> <span class="mh">0x00000000</span> <span class="mh">0x00000000</span> <span class="mh">0x00000000</span> <span class="mh">0x00000000</span> <span class="mh">0x00000000</span>
+</span></span><span class="line"><span class="cl"><span class="p">[</span><span class="mi">21</span><span class="p">:</span><span class="mi">29</span><span class="p">:</span><span class="mi">59</span><span class="p">]</span><span class="mi">4082</span><span class="n">a7c0</span><span class="p">:</span> <span class="mh">0x00000000</span> <span class="mh">0x00000000</span> <span class="mh">0x00000000</span> <span class="mh">0x00000000</span> <span class="mh">0x00000000</span> <span class="mh">0x00000000</span> <span class="mh">0x00000000</span> <span class="mh">0x00000000</span>
+</span></span><span class="line"><span class="cl"><span class="p">[</span><span class="mi">21</span><span class="p">:</span><span class="mi">29</span><span class="p">:</span><span class="mi">59</span><span class="p">]</span><span class="mi">4082</span><span class="n">a7e0</span><span class="p">:</span> <span class="mh">0x00000000</span> <span class="mh">0x00000000</span> <span class="mh">0x00000000</span> <span class="mh">0x00000000</span> <span class="mh">0x00000000</span> <span class="mh">0x00000000</span> <span class="mh">0x00000000</span> <span class="mh">0x00000000</span>
+</span></span><span class="line"><span class="cl"><span class="p">[</span><span class="mi">21</span><span class="p">:</span><span class="mi">29</span><span class="p">:</span><span class="mi">59</span><span class="p">]</span><span class="mi">4082</span><span class="n">a800</span><span class="p">:</span> <span class="mh">0x00000000</span> <span class="mh">0x00000000</span> <span class="mh">0x00000000</span> <span class="mh">0x00000000</span> <span class="mh">0x00000000</span> <span class="mh">0x00000000</span> <span class="mh">0x00000000</span> <span class="mh">0x00000000</span>
+</span></span><span class="line"><span class="cl"><span class="p">[</span><span class="mi">21</span><span class="p">:</span><span class="mi">29</span><span class="p">:</span><span class="mi">59</span><span class="p">]</span><span class="mi">4082</span><span class="n">a820</span><span class="p">:</span> <span class="mh">0x00000000</span> <span class="mh">0x00000000</span> <span class="mh">0x00000000</span> <span class="mh">0x00000000</span> <span class="mh">0x00000000</span> <span class="mh">0x00000000</span> <span class="mh">0x00000000</span> <span class="mh">0x00000000</span>
+</span></span><span class="line"><span class="cl"><span class="p">[</span><span class="mi">21</span><span class="p">:</span><span class="mi">29</span><span class="p">:</span><span class="mi">59</span><span class="p">]</span><span class="mi">4082</span><span class="n">a840</span><span class="p">:</span> <span class="mh">0x00000000</span> <span class="mh">0x00000000</span> <span class="mh">0x0000000c</span> <span class="mh">0x4082a85c</span> <span class="mh">0x00000000</span> <span class="mh">0x4082a844</span> <span class="mh">0x00000014</span> <span class="mh">0x0c160108</span>
+</span></span><span class="line"><span class="cl"><span class="p">[</span><span class="mi">21</span><span class="p">:</span><span class="mi">29</span><span class="p">:</span><span class="mi">59</span><span class="p">]</span><span class="mi">4082</span><span class="n">a860</span><span class="p">:</span> <span class="mh">0x00000000</span> <span class="mh">0x00000000</span> <span class="mh">0x99e59f84</span> <span class="mh">0x4082a854</span> <span class="mh">0x00000010</span> <span class="mh">0x00000000</span> <span class="mh">0x4082a6f8</span> <span class="mh">0x00000000</span>
+</span></span><span class="line"><span class="cl"><span class="p">[</span><span class="mi">21</span><span class="p">:</span><span class="mi">29</span><span class="p">:</span><span class="mi">59</span><span class="p">]</span><span class="mi">4082</span><span class="n">a880</span><span class="p">:</span> <span class="mh">0x00000000</span> <span class="mh">0x00000020</span> <span class="mh">0x682d7067</span> <span class="mh">0x6c2d6b6c</span> <span class="mh">0x36343264</span> <span class="mh">0x63322d30</span> <span class="mh">0x63616131</span> <span class="mh">0x420d5800</span>
+</span></span><span class="line"><span class="cl"><span class="p">[</span><span class="mi">21</span><span class="p">:</span><span class="mi">29</span><span class="p">:</span><span class="mi">59</span><span class="p">]</span><span class="mi">4082</span><span class="n">a8a0</span><span class="p">:</span> <span class="mh">0x420c159c</span> <span class="mh">0x4082a880</span> <span class="mh">0x00000024</span> <span class="mh">0x420d4bd4</span> <span class="mh">0x420d4c04</span> <span class="mh">0x420c07f8</span> <span class="mh">0x00000032</span> <span class="mh">0x4082b644</span>
+</span></span><span class="line"><span class="cl"><span class="p">[</span><span class="mi">21</span><span class="p">:</span><span class="mi">29</span><span class="p">:</span><span class="mi">59</span><span class="p">]</span><span class="mi">4082</span><span class="n">a8c0</span><span class="p">:</span> <span class="mh">0xa89c0000</span> <span class="mh">0xe6a0bce4</span> <span class="mh">0x99e59f84</span> <span class="mh">0x4082a8a4</span> <span class="mh">0x00000048</span> <span class="mh">0xe68db8e4</span> <span class="mh">0xaee5af98</span> <span class="mh">0x858ee5a2</span>
+</span></span><span class="line"><span class="cl"><span class="p">[</span><span class="mi">21</span><span class="p">:</span><span class="mi">29</span><span class="p">:</span><span class="mi">59</span><span class="p">]</span><span class="mi">4082</span><span class="n">a8e0</span><span class="p">:</span> <span class="mh">0x3432444c</span> <span class="mh">0xbae43036</span> <span class="mh">0xa89ce5ba</span> <span class="mh">0xe6a0bce4</span> <span class="mh">0x99e59f84</span> <span class="mh">0x633220a8</span> <span class="mh">0x63616131</span> <span class="mh">0x3b305b00</span>
+</span></span><span class="line"><span class="cl"><span class="p">[</span><span class="mi">21</span><span class="p">:</span><span class="mi">29</span><span class="p">:</span><span class="mi">59</span><span class="p">]</span><span class="mi">4082</span><span class="n">a900</span><span class="p">:</span> <span class="mh">0x5b6d3633</span> <span class="mh">0x735b5d44</span> <span class="mh">0x63746977</span> <span class="mh">0x36303a68</span> <span class="mh">0x203a5d33</span> <span class="mh">0x203a2727</span> <span class="mh">0x4082a8cc</span> <span class="mh">0x0000005c</span>
+</span></span></code></pre></td></tr></table>
+</div>
+</div><p>setup方法中的LOG根本没有，说明在初始化之前就出现了崩溃。
+看到消息日志的存储信息，根据PC/MEPC和RA指针定位崩溃位置，<a href="https://docs.espressif.com/projects/esp-techpedia/zh_CN/latest/esp-friends/advanced-development/debugging/guru-meditation.html#esp">参考这里</a>
+和<a href="https://docs.espressif.com/projects/esp-techpedia/zh_CN/latest/esp-friends/advanced-development/debugging/backtrace-coredump.html">这里</a></p>
+<p>esphome下载ELF文件，这个有用。
+使用<code>riscv32-esp-elf-objdump -S xxx.elf &gt; a.txt</code>进行反汇编，得到反汇编文件，之后有用。
+使用<code>riscv32-esp-elf-addr2line -pfiaC -e path.elf 0x4200a47a 0x4200a4f6</code>，查询PC指针和RA指针是什么，得到崩溃位置的函数，</p>
+<div class="highlight"><div class="chroma">
+<table class="lntable"><tr><td class="lntd">
+<pre tabindex="0" class="chroma"><code><span class="lnt">1
+</span><span class="lnt">2
+</span><span class="lnt">3
+</span></code></pre></td>
+<td class="lntd">
+<pre tabindex="0" class="chroma"><code class="language-gdscript3" data-lang="gdscript3"><span class="line"><span class="cl"><span class="n">riscv32</span><span class="o">-</span><span class="n">esp</span><span class="o">-</span><span class="n">elf</span><span class="o">-</span><span class="n">addr2line</span> <span class="o">-</span><span class="n">pfiaC</span> <span class="o">-</span><span class="n">e</span> <span class="s2">&#34;gp-hlk-ld2460 (2).elf&#34;</span>  <span class="mh">0x4200a47a</span>  <span class="mh">0x4200a4f6</span>
+</span></span><span class="line"><span class="cl"><span class="mh">0x4200a47a</span><span class="p">:</span> <span class="n">esphome</span><span class="p">::</span><span class="n">ld2460</span><span class="p">::</span><span class="n">LD2460Component</span><span class="p">::</span><span class="n">send_command</span><span class="p">(</span><span class="n">unsigned</span> <span class="n">char</span><span class="p">,</span> <span class="n">unsigned</span> <span class="n">char</span> <span class="k">const</span><span class="o">*</span><span class="p">,</span> <span class="n">unsigned</span> <span class="n">short</span><span class="p">)</span> <span class="n">at</span> <span class="o">/</span><span class="n">config</span><span class="o">/.</span><span class="n">esphome</span><span class="o">/</span><span class="n">build</span><span class="o">/</span><span class="n">gp</span><span class="o">-</span><span class="n">hlk</span><span class="o">-</span><span class="n">ld2460</span><span class="o">/</span><span class="n">src</span><span class="o">/</span><span class="n">esphome</span><span class="o">/</span><span class="n">components</span><span class="o">/</span><span class="n">ld2460</span><span class="o">/</span><span class="n">ld2460</span><span class="o">.</span><span class="n">cpp</span><span class="p">:</span><span class="mi">395</span>
+</span></span><span class="line"><span class="cl"><span class="mh">0x4200a4f6</span><span class="p">:</span> <span class="n">esphome</span><span class="p">::</span><span class="n">ld2460</span><span class="p">::</span><span class="n">LD2460Component</span><span class="p">::</span><span class="n">enable_upload</span><span class="p">(</span><span class="ne">bool</span><span class="p">)</span> <span class="n">at</span> <span class="o">/</span><span class="n">config</span><span class="o">/.</span><span class="n">esphome</span><span class="o">/</span><span class="n">build</span><span class="o">/</span><span class="n">gp</span><span class="o">-</span><span class="n">hlk</span><span class="o">-</span><span class="n">ld2460</span><span class="o">/</span><span class="n">src</span><span class="o">/</span><span class="n">esphome</span><span class="o">/</span><span class="n">components</span><span class="o">/</span><span class="n">ld2460</span><span class="o">/</span><span class="n">ld2460</span><span class="o">.</span><span class="n">cpp</span><span class="p">:</span><span class="mi">285</span>
+</span></span></code></pre></td></tr></table>
+</div>
+</div><p>汇编文件中</p>
+<div class="highlight"><div class="chroma">
+<table class="lntable"><tr><td class="lntd">
+<pre tabindex="0" class="chroma"><code><span class="lnt"> 1
+</span><span class="lnt"> 2
+</span><span class="lnt"> 3
+</span><span class="lnt"> 4
+</span><span class="lnt"> 5
+</span><span class="lnt"> 6
+</span><span class="lnt"> 7
+</span><span class="lnt"> 8
+</span><span class="lnt"> 9
+</span><span class="lnt">10
+</span><span class="lnt">11
+</span><span class="lnt">12
+</span><span class="lnt">13
+</span><span class="lnt">14
+</span><span class="lnt">15
+</span><span class="lnt">16
+</span><span class="lnt">17
+</span><span class="lnt">18
+</span><span class="lnt">19
+</span><span class="lnt">20
+</span><span class="lnt">21
+</span><span class="lnt">22
+</span><span class="lnt">23
+</span><span class="lnt">24
+</span><span class="lnt">25
+</span><span class="lnt">26
+</span><span class="lnt">27
+</span><span class="lnt">28
+</span><span class="lnt">29
+</span><span class="lnt">30
+</span><span class="lnt">31
+</span><span class="lnt">32
+</span><span class="lnt">33
+</span><span class="lnt">34
+</span><span class="lnt">35
+</span><span class="lnt">36
+</span><span class="lnt">37
+</span><span class="lnt">38
+</span><span class="lnt">39
+</span><span class="lnt">40
+</span><span class="lnt">41
+</span><span class="lnt">42
+</span><span class="lnt">43
+</span><span class="lnt">44
+</span><span class="lnt">45
+</span><span class="lnt">46
+</span><span class="lnt">47
+</span><span class="lnt">48
+</span><span class="lnt">49
+</span><span class="lnt">50
+</span><span class="lnt">51
+</span><span class="lnt">52
+</span><span class="lnt">53
+</span><span class="lnt">54
+</span><span class="lnt">55
+</span><span class="lnt">56
+</span></code></pre></td>
+<td class="lntd">
+<pre tabindex="0" class="chroma"><code class="language-gdscript3" data-lang="gdscript3"><span class="line"><span class="cl"><span class="mi">4200</span><span class="n">a474</span> <span class="o">&lt;</span><span class="n">_ZN7esphome6ld246015LD2460Component12send_commandEhPKht</span><span class="o">&gt;</span><span class="p">:</span>
+</span></span><span class="line"><span class="cl"><span class="mi">4200</span><span class="n">a474</span><span class="p">:</span>	<span class="mi">1101</span>                	<span class="n">addi</span>	<span class="n">sp</span><span class="p">,</span><span class="n">sp</span><span class="p">,</span><span class="o">-</span><span class="mi">32</span>
+</span></span><span class="line"><span class="cl"><span class="mi">4200</span><span class="n">a476</span><span class="p">:</span>	<span class="n">cc22</span>                	<span class="n">sw</span>	<span class="n">s0</span><span class="p">,</span><span class="mi">24</span><span class="p">(</span><span class="n">sp</span><span class="p">)</span>
+</span></span><span class="line"><span class="cl"><span class="mi">4200</span><span class="n">a478</span><span class="p">:</span>	<span class="mi">842</span><span class="n">a</span>                	<span class="n">mv</span>	<span class="n">s0</span><span class="p">,</span><span class="n">a0</span>
+</span></span><span class="line"><span class="cl"><span class="mi">4200</span><span class="n">a47a</span><span class="p">:</span>	<span class="mi">4548</span>                	<span class="n">lw</span>	<span class="n">a0</span><span class="p">,</span><span class="mi">12</span><span class="p">(</span><span class="n">a0</span><span class="p">)</span>  <span class="c1"># 崩溃位置</span>
+</span></span><span class="line"><span class="cl"><span class="mi">4200</span><span class="n">a47c</span><span class="p">:</span>	<span class="n">c452</span>                	<span class="n">sw</span>	<span class="n">s4</span><span class="p">,</span><span class="mi">8</span><span class="p">(</span><span class="n">sp</span><span class="p">)</span>
+</span></span><span class="line"><span class="cl"><span class="mi">4200</span><span class="n">a47e</span><span class="p">:</span>	<span class="mi">8</span><span class="n">a2e</span>                	<span class="n">mv</span>	<span class="n">s4</span><span class="p">,</span><span class="n">a1</span>
+</span></span><span class="line"><span class="cl"><span class="mi">4200</span><span class="n">a480</span><span class="p">:</span>	<span class="n">ca26</span>                	<span class="n">sw</span>	<span class="n">s1</span><span class="p">,</span><span class="mi">20</span><span class="p">(</span><span class="n">sp</span><span class="p">)</span>
+</span></span><span class="line"><span class="cl"><span class="mi">4200</span><span class="n">a482</span><span class="p">:</span>	<span class="mi">81</span><span class="n">c18593</span>          	<span class="n">addi</span>	<span class="n">a1</span><span class="p">,</span><span class="n">gp</span><span class="p">,</span><span class="o">-</span><span class="mi">2020</span> <span class="c1"># 40818af0 &lt;_ZN7esphome6ld2460L15LD2460_CMD_HEADE&gt;</span>
+</span></span><span class="line"><span class="cl"><span class="mi">4200</span><span class="n">a486</span><span class="p">:</span>	<span class="mi">84</span><span class="n">b2</span>                	<span class="n">mv</span>	<span class="n">s1</span><span class="p">,</span><span class="n">a2</span>
+</span></span><span class="line"><span class="cl"><span class="mi">4200</span><span class="n">a488</span><span class="p">:</span>	<span class="mi">4611</span>                	<span class="n">li</span>	<span class="n">a2</span><span class="p">,</span><span class="mi">4</span>
+</span></span><span class="line"><span class="cl"><span class="mi">4200</span><span class="n">a48a</span><span class="p">:</span>	<span class="n">ce06</span>                	<span class="n">sw</span>	<span class="n">ra</span><span class="p">,</span><span class="mi">28</span><span class="p">(</span><span class="n">sp</span><span class="p">)</span>
+</span></span><span class="line"><span class="cl"><span class="mi">4200</span><span class="n">a48c</span><span class="p">:</span>	<span class="n">c84a</span>                	<span class="n">sw</span>	<span class="n">s2</span><span class="p">,</span><span class="mi">16</span><span class="p">(</span><span class="n">sp</span><span class="p">)</span>
+</span></span><span class="line"><span class="cl"><span class="mi">4200</span><span class="n">a48e</span><span class="p">:</span>	<span class="n">c64e</span>                	<span class="n">sw</span>	<span class="n">s3</span><span class="p">,</span><span class="mi">12</span><span class="p">(</span><span class="n">sp</span><span class="p">)</span>
+</span></span><span class="line"><span class="cl"><span class="mi">4200</span><span class="n">a490</span><span class="p">:</span>	<span class="mi">8936</span>                	<span class="n">mv</span>	<span class="n">s2</span><span class="p">,</span><span class="n">a3</span>
+</span></span><span class="line"><span class="cl"><span class="mi">4200</span><span class="n">a492</span><span class="p">:</span>	<span class="mi">00</span><span class="n">b68993</span>          	<span class="n">addi</span>	<span class="n">s3</span><span class="p">,</span><span class="n">a3</span><span class="p">,</span><span class="mi">11</span>
+</span></span><span class="line"><span class="cl"><span class="mi">4200</span><span class="n">a496</span><span class="p">:</span>	<span class="n">d1bff0ef</span>          	<span class="n">jal</span>	<span class="mi">4200</span><span class="n">a1b0</span> <span class="o">&lt;</span><span class="n">_ZN7esphome4uart10UARTDevice11write_arrayEPKhj</span><span class="o">.</span><span class="n">isra</span><span class="o">.</span><span class="mi">0</span><span class="o">&gt;</span>
+</span></span><span class="line"><span class="cl"><span class="mi">4200</span><span class="n">a49a</span><span class="p">:</span>	<span class="mi">4448</span>                	<span class="n">lw</span>	<span class="n">a0</span><span class="p">,</span><span class="mi">12</span><span class="p">(</span><span class="n">s0</span><span class="p">)</span>
+</span></span><span class="line"><span class="cl"><span class="mi">4200</span><span class="n">a49c</span><span class="p">:</span>	<span class="mi">85</span><span class="n">d2</span>                	<span class="n">mv</span>	<span class="n">a1</span><span class="p">,</span><span class="n">s4</span>
+</span></span><span class="line"><span class="cl"><span class="mi">4200</span><span class="n">a49e</span><span class="p">:</span>	<span class="mi">09</span><span class="n">c2</span>                	<span class="n">slli</span>	<span class="n">s3</span><span class="p">,</span><span class="n">s3</span><span class="p">,</span><span class="mh">0x10</span>
+</span></span><span class="line"><span class="cl"><span class="mi">4200</span><span class="n">a4a0</span><span class="p">:</span>	<span class="n">d17ff0ef</span>          	<span class="n">jal</span>	<span class="mi">4200</span><span class="n">a1b6</span> <span class="o">&lt;</span><span class="n">_ZN7esphome4uart10UARTDevice10write_byteEh</span><span class="o">.</span><span class="n">isra</span><span class="o">.</span><span class="mi">0</span><span class="o">&gt;</span>
+</span></span><span class="line"><span class="cl"><span class="mi">4200</span><span class="n">a4a4</span><span class="p">:</span>	<span class="mi">4448</span>                	<span class="n">lw</span>	<span class="n">a0</span><span class="p">,</span><span class="mi">12</span><span class="p">(</span><span class="n">s0</span><span class="p">)</span>
+</span></span><span class="line"><span class="cl"><span class="mi">4200</span><span class="n">a4a6</span><span class="p">:</span>	<span class="mi">0109</span><span class="n">d993</span>          	<span class="n">srli</span>	<span class="n">s3</span><span class="p">,</span><span class="n">s3</span><span class="p">,</span><span class="mh">0x10</span>
+</span></span><span class="line"><span class="cl"><span class="mi">4200</span><span class="n">a4aa</span><span class="p">:</span>	<span class="mi">0</span><span class="n">ff9f593</span>          	<span class="n">zext</span><span class="o">.</span><span class="n">b</span>	<span class="n">a1</span><span class="p">,</span><span class="n">s3</span>
+</span></span><span class="line"><span class="cl"><span class="mi">4200</span><span class="n">a4ae</span><span class="p">:</span>	<span class="n">d09ff0ef</span>          	<span class="n">jal</span>	<span class="mi">4200</span><span class="n">a1b6</span> <span class="o">&lt;</span><span class="n">_ZN7esphome4uart10UARTDevice10write_byteEh</span><span class="o">.</span><span class="n">isra</span><span class="o">.</span><span class="mi">0</span><span class="o">&gt;</span>
+</span></span><span class="line"><span class="cl"><span class="mi">4200</span><span class="n">a4b2</span><span class="p">:</span>	<span class="mi">4448</span>                	<span class="n">lw</span>	<span class="n">a0</span><span class="p">,</span><span class="mi">12</span><span class="p">(</span><span class="n">s0</span><span class="p">)</span>
+</span></span><span class="line"><span class="cl"><span class="mi">4200</span><span class="n">a4b4</span><span class="p">:</span>	<span class="mi">0089</span><span class="n">d593</span>          	<span class="n">srli</span>	<span class="n">a1</span><span class="p">,</span><span class="n">s3</span><span class="p">,</span><span class="mh">0x8</span>
+</span></span><span class="line"><span class="cl"><span class="mi">4200</span><span class="n">a4b8</span><span class="p">:</span>	<span class="n">cffff0ef</span>          	<span class="n">jal</span>	<span class="mi">4200</span><span class="n">a1b6</span> <span class="o">&lt;</span><span class="n">_ZN7esphome4uart10UARTDevice10write_byteEh</span><span class="o">.</span><span class="n">isra</span><span class="o">.</span><span class="mi">0</span><span class="o">&gt;</span>
+</span></span><span class="line"><span class="cl"><span class="mi">4200</span><span class="n">a4bc</span><span class="p">:</span>	<span class="n">c491</span>                	<span class="n">beqz</span>	<span class="n">s1</span><span class="p">,</span><span class="mi">4200</span><span class="n">a4c8</span> <span class="o">&lt;</span><span class="n">_ZN7esphome6ld246015LD2460Component12send_commandEhPKht</span><span class="o">+</span><span class="mh">0x54</span><span class="o">&gt;</span>
+</span></span><span class="line"><span class="cl"><span class="mi">4200</span><span class="n">a4be</span><span class="p">:</span>	<span class="mi">4448</span>                	<span class="n">lw</span>	<span class="n">a0</span><span class="p">,</span><span class="mi">12</span><span class="p">(</span><span class="n">s0</span><span class="p">)</span>
+</span></span><span class="line"><span class="cl"><span class="mi">4200</span><span class="n">a4c0</span><span class="p">:</span>	<span class="mi">864</span><span class="n">a</span>                	<span class="n">mv</span>	<span class="n">a2</span><span class="p">,</span><span class="n">s2</span>
+</span></span><span class="line"><span class="cl"><span class="mi">4200</span><span class="n">a4c2</span><span class="p">:</span>	<span class="mi">85</span><span class="n">a6</span>                	<span class="n">mv</span>	<span class="n">a1</span><span class="p">,</span><span class="n">s1</span>
+</span></span><span class="line"><span class="cl"><span class="mi">4200</span><span class="n">a4c4</span><span class="p">:</span>	<span class="n">cedff0ef</span>          	<span class="n">jal</span>	<span class="mi">4200</span><span class="n">a1b0</span> <span class="o">&lt;</span><span class="n">_ZN7esphome4uart10UARTDevice11write_arrayEPKhj</span><span class="o">.</span><span class="n">isra</span><span class="o">.</span><span class="mi">0</span><span class="o">&gt;</span>
+</span></span><span class="line"><span class="cl"><span class="mi">4200</span><span class="n">a4c8</span><span class="p">:</span>	<span class="mi">4448</span>                	<span class="n">lw</span>	<span class="n">a0</span><span class="p">,</span><span class="mi">12</span><span class="p">(</span><span class="n">s0</span><span class="p">)</span>
+</span></span><span class="line"><span class="cl"><span class="mi">4200</span><span class="n">a4ca</span><span class="p">:</span>	<span class="mi">4462</span>                	<span class="n">lw</span>	<span class="n">s0</span><span class="p">,</span><span class="mi">24</span><span class="p">(</span><span class="n">sp</span><span class="p">)</span>
+</span></span><span class="line"><span class="cl"><span class="mi">4200</span><span class="n">a4cc</span><span class="p">:</span>	<span class="mi">40</span><span class="n">f2</span>                	<span class="n">lw</span>	<span class="n">ra</span><span class="p">,</span><span class="mi">28</span><span class="p">(</span><span class="n">sp</span><span class="p">)</span>
+</span></span><span class="line"><span class="cl"><span class="mi">4200</span><span class="n">a4ce</span><span class="p">:</span>	<span class="mi">44</span><span class="n">d2</span>                	<span class="n">lw</span>	<span class="n">s1</span><span class="p">,</span><span class="mi">20</span><span class="p">(</span><span class="n">sp</span><span class="p">)</span>
+</span></span><span class="line"><span class="cl"><span class="mi">4200</span><span class="n">a4d0</span><span class="p">:</span>	<span class="mi">4942</span>                	<span class="n">lw</span>	<span class="n">s2</span><span class="p">,</span><span class="mi">16</span><span class="p">(</span><span class="n">sp</span><span class="p">)</span>
+</span></span><span class="line"><span class="cl"><span class="mi">4200</span><span class="n">a4d2</span><span class="p">:</span>	<span class="mi">49</span><span class="n">b2</span>                	<span class="n">lw</span>	<span class="n">s3</span><span class="p">,</span><span class="mi">12</span><span class="p">(</span><span class="n">sp</span><span class="p">)</span>
+</span></span><span class="line"><span class="cl"><span class="mi">4200</span><span class="n">a4d4</span><span class="p">:</span>	<span class="mi">4</span><span class="n">a22</span>                	<span class="n">lw</span>	<span class="n">s4</span><span class="p">,</span><span class="mi">8</span><span class="p">(</span><span class="n">sp</span><span class="p">)</span>
+</span></span><span class="line"><span class="cl"><span class="mi">4200</span><span class="n">a4d6</span><span class="p">:</span>	<span class="mi">4611</span>                	<span class="n">li</span>	<span class="n">a2</span><span class="p">,</span><span class="mi">4</span>
+</span></span><span class="line"><span class="cl"><span class="mi">4200</span><span class="n">a4d8</span><span class="p">:</span>	<span class="mi">81818593</span>          	<span class="n">addi</span>	<span class="n">a1</span><span class="p">,</span><span class="n">gp</span><span class="p">,</span><span class="o">-</span><span class="mi">2024</span> <span class="c1"># 40818aec &lt;_ZN7esphome6ld2460L15LD2460_CMD_TAILE&gt;</span>
+</span></span><span class="line"><span class="cl"><span class="mi">4200</span><span class="n">a4dc</span><span class="p">:</span>	<span class="mi">6105</span>                	<span class="n">addi</span>	<span class="n">sp</span><span class="p">,</span><span class="n">sp</span><span class="p">,</span><span class="mi">32</span>
+</span></span><span class="line"><span class="cl"><span class="mi">4200</span><span class="n">a4de</span><span class="p">:</span>	<span class="n">cd3ff06f</span>          	<span class="n">j</span>	<span class="mi">4200</span><span class="n">a1b0</span> <span class="o">&lt;</span><span class="n">_ZN7esphome4uart10UARTDevice11write_arrayEPKhj</span><span class="o">.</span><span class="n">isra</span><span class="o">.</span><span class="mi">0</span><span class="o">&gt;</span>
+</span></span><span class="line"><span class="cl">
+</span></span><span class="line"><span class="cl"><span class="mi">4200</span><span class="n">a4e2</span> <span class="o">&lt;</span><span class="n">_ZN7esphome6ld246015LD2460Component13enable_uploadEb</span><span class="o">&gt;</span><span class="p">:</span>
+</span></span><span class="line"><span class="cl"><span class="mi">4200</span><span class="n">a4e2</span><span class="p">:</span>	<span class="mi">1101</span>                	<span class="n">addi</span>	<span class="n">sp</span><span class="p">,</span><span class="n">sp</span><span class="p">,</span><span class="o">-</span><span class="mi">32</span>
+</span></span><span class="line"><span class="cl"><span class="mi">4200</span><span class="n">a4e4</span><span class="p">:</span>	<span class="mi">00</span><span class="n">b107a3</span>          	<span class="n">sb</span>	<span class="n">a1</span><span class="p">,</span><span class="mi">15</span><span class="p">(</span><span class="n">sp</span><span class="p">)</span>
+</span></span><span class="line"><span class="cl"><span class="mi">4200</span><span class="n">a4e8</span><span class="p">:</span>	<span class="mi">00</span><span class="n">f10613</span>          	<span class="n">addi</span>	<span class="n">a2</span><span class="p">,</span><span class="n">sp</span><span class="p">,</span><span class="mi">15</span>
+</span></span><span class="line"><span class="cl"><span class="mi">4200</span><span class="n">a4ec</span><span class="p">:</span>	<span class="mi">4685</span>                	<span class="n">li</span>	<span class="n">a3</span><span class="p">,</span><span class="mi">1</span>
+</span></span><span class="line"><span class="cl"><span class="mi">4200</span><span class="n">a4ee</span><span class="p">:</span>	<span class="mi">4599</span>                	<span class="n">li</span>	<span class="n">a1</span><span class="p">,</span><span class="mi">6</span>
+</span></span><span class="line"><span class="cl"><span class="mi">4200</span><span class="n">a4f0</span><span class="p">:</span>	<span class="n">ce06</span>                	<span class="n">sw</span>	<span class="n">ra</span><span class="p">,</span><span class="mi">28</span><span class="p">(</span><span class="n">sp</span><span class="p">)</span>
+</span></span><span class="line"><span class="cl"><span class="mi">4200</span><span class="n">a4f2</span><span class="p">:</span>	<span class="n">f83ff0ef</span>          	<span class="n">jal</span>	<span class="mi">4200</span><span class="n">a474</span> <span class="o">&lt;</span><span class="n">_ZN7esphome6ld246015LD2460Component12send_commandEhPKht</span><span class="o">&gt;</span>
+</span></span><span class="line"><span class="cl"><span class="mi">4200</span><span class="n">a4f6</span><span class="p">:</span>	<span class="mi">40</span><span class="n">f2</span>                	<span class="n">lw</span>	<span class="n">ra</span><span class="p">,</span><span class="mi">28</span><span class="p">(</span><span class="n">sp</span><span class="p">)</span>
+</span></span><span class="line"><span class="cl"><span class="mi">4200</span><span class="n">a4f8</span><span class="p">:</span>	<span class="mi">6105</span>                	<span class="n">addi</span>	<span class="n">sp</span><span class="p">,</span><span class="n">sp</span><span class="p">,</span><span class="mi">32</span>
+</span></span><span class="line"><span class="cl"><span class="mi">4200</span><span class="n">a4fa</span><span class="p">:</span>	<span class="mi">8082</span>                	<span class="n">ret</span><span class="s2">&#34;&#34;&#34;
+</span></span></span></code></pre></td></tr></table>
+</div>
+</div><p>是send_command方法中崩溃的，而它是enable_upload调用的。查询哪调用了enable_upload，在yaml文件和全部代码中分析，只能是EnableUploadSwitch调用的。</p>
+<p>查看A0,A1等寄存器，MTVAL接近0，可能是读取了一个<code>NULL</code>附近的地址。
+比如把<code>nullptr</code>当对象访问了他的成员，此时A0是0，即 <em>this指针是nullptr</em> ，A1是6，
+符合enable_upload调用send_command的command参数的值，A3是1，符合data_size参数的值，所以定位崩溃函数enable_upload。</p>
+<div class="highlight"><div class="chroma">
+<table class="lntable"><tr><td class="lntd">
+<pre tabindex="0" class="chroma"><code><span class="lnt">1
+</span><span class="lnt">2
+</span><span class="lnt">3
+</span><span class="lnt">4
+</span></code></pre></td>
+<td class="lntd">
+<pre tabindex="0" class="chroma"><code class="language-cpp" data-lang="cpp"><span class="line"><span class="cl"><span class="kt">void</span> <span class="n">LD2460Component</span><span class="o">::</span><span class="n">enable_upload</span><span class="p">(</span><span class="kt">bool</span> <span class="n">enable</span><span class="p">)</span> <span class="p">{</span>
+</span></span><span class="line"><span class="cl">  <span class="kt">uint8_t</span> <span class="n">data</span> <span class="o">=</span> <span class="n">enable</span> <span class="o">?</span> <span class="mh">0x01</span> <span class="o">:</span> <span class="mh">0x00</span><span class="p">;</span>
+</span></span><span class="line"><span class="cl">  <span class="k">this</span><span class="o">-&gt;</span><span class="n">send_command</span><span class="p">(</span><span class="mh">0x06</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">data</span><span class="p">,</span> <span class="mi">1</span><span class="p">);</span>
+</span></span><span class="line"><span class="cl"><span class="p">}</span>
+</span></span></code></pre></td></tr></table>
+</div>
+</div><p>最终原因是对nullptr调用了他的enable_upload方法，导致了崩溃。为什么this指针是nullptr？</p>
+<div class="highlight"><div class="chroma">
+<table class="lntable"><tr><td class="lntd">
+<pre tabindex="0" class="chroma"><code><span class="lnt"> 1
+</span><span class="lnt"> 2
+</span><span class="lnt"> 3
+</span><span class="lnt"> 4
+</span><span class="lnt"> 5
+</span><span class="lnt"> 6
+</span><span class="lnt"> 7
+</span><span class="lnt"> 8
+</span><span class="lnt"> 9
+</span><span class="lnt">10
+</span><span class="lnt">11
+</span><span class="lnt">12
+</span><span class="lnt">13
+</span><span class="lnt">14
+</span><span class="lnt">15
+</span><span class="lnt">16
+</span><span class="lnt">17
+</span><span class="lnt">18
+</span><span class="lnt">19
+</span><span class="lnt">20
+</span></code></pre></td>
+<td class="lntd">
+<pre tabindex="0" class="chroma"><code class="language-cpp" data-lang="cpp"><span class="line"><span class="cl"><span class="cp">#pragma once
+</span></span></span><span class="line"><span class="cl">
+</span></span><span class="line"><span class="cl"><span class="cp">#include</span> <span class="cpf">&#34;esphome/components/switch/switch.h&#34;</span><span class="cp">
+</span></span></span><span class="line"><span class="cl"><span class="cp">#include</span> <span class="cpf">&#34;../ld2460.h&#34;</span><span class="cp">
+</span></span></span><span class="line"><span class="cl">
+</span></span><span class="line"><span class="cl"><span class="k">namespace</span> <span class="n">esphome</span> <span class="p">{</span>
+</span></span><span class="line"><span class="cl"><span class="k">namespace</span> <span class="n">ld2460</span> <span class="p">{</span>
+</span></span><span class="line"><span class="cl">
+</span></span><span class="line"><span class="cl"><span class="k">class</span> <span class="nc">EnableUploadSwitch</span> <span class="o">:</span> <span class="k">public</span> <span class="n">switch_</span><span class="o">::</span><span class="n">Switch</span><span class="p">,</span> <span class="k">public</span> <span class="n">Parented</span><span class="o">&lt;</span><span class="n">LD2460Component</span><span class="o">&gt;</span> <span class="p">{</span>
+</span></span><span class="line"><span class="cl"> <span class="k">public</span><span class="o">:</span>
+</span></span><span class="line"><span class="cl">  <span class="n">EnableUploadSwitch</span><span class="p">()</span> <span class="p">{</span>
+</span></span><span class="line"><span class="cl">    <span class="k">this</span><span class="o">-&gt;</span><span class="n">turn_on</span><span class="p">();</span>
+</span></span><span class="line"><span class="cl">  <span class="p">}</span>
+</span></span><span class="line"><span class="cl">  
+</span></span><span class="line"><span class="cl"> <span class="k">protected</span><span class="o">:</span>
+</span></span><span class="line"><span class="cl">  <span class="kt">void</span> <span class="n">write_state</span><span class="p">(</span><span class="kt">bool</span> <span class="n">state</span><span class="p">)</span> <span class="k">override</span><span class="p">;</span>
+</span></span><span class="line"><span class="cl"><span class="p">};</span>
+</span></span><span class="line"><span class="cl">
+</span></span><span class="line"><span class="cl"><span class="p">}</span>  <span class="c1">// namespace ld2460
+</span></span></span><span class="line"><span class="cl"><span class="p">}</span>  <span class="c1">// namespace esphome
+</span></span></span></code></pre></td></tr></table>
+</div>
+</div><div class="highlight"><div class="chroma">
+<table class="lntable"><tr><td class="lntd">
+<pre tabindex="0" class="chroma"><code><span class="lnt">1
+</span><span class="lnt">2
+</span><span class="lnt">3
+</span><span class="lnt">4
+</span><span class="lnt">5
+</span><span class="lnt">6
+</span><span class="lnt">7
+</span><span class="lnt">8
+</span></code></pre></td>
+<td class="lntd">
+<pre tabindex="0" class="chroma"><code class="language-python" data-lang="python"><span class="line"><span class="cl"><span class="c1"># switch/__init__.py</span>
+</span></span><span class="line"><span class="cl"><span class="k">async</span> <span class="k">def</span> <span class="nf">to_code</span><span class="p">(</span><span class="n">config</span><span class="p">):</span>
+</span></span><span class="line"><span class="cl">    <span class="n">ld2460_component</span> <span class="o">=</span> <span class="k">await</span> <span class="n">cg</span><span class="o">.</span><span class="n">get_variable</span><span class="p">(</span><span class="n">config</span><span class="p">[</span><span class="n">CONF_LD2460_ID</span><span class="p">])</span>
+</span></span><span class="line"><span class="cl">
+</span></span><span class="line"><span class="cl">    <span class="k">if</span> <span class="n">enable_upload_config</span> <span class="o">:=</span> <span class="n">config</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">CONF_ENABLE_UPLOAD</span><span class="p">):</span>
+</span></span><span class="line"><span class="cl">        <span class="n">s</span> <span class="o">=</span> <span class="k">await</span> <span class="n">switch</span><span class="o">.</span><span class="n">new_switch</span><span class="p">(</span><span class="n">enable_upload_config</span><span class="p">)</span>
+</span></span><span class="line"><span class="cl">        <span class="k">await</span> <span class="n">cg</span><span class="o">.</span><span class="n">register_parented</span><span class="p">(</span><span class="n">s</span><span class="p">,</span> <span class="n">config</span><span class="p">[</span><span class="n">CONF_LD2460_ID</span><span class="p">])</span>
+</span></span><span class="line"><span class="cl">        <span class="n">cg</span><span class="o">.</span><span class="n">add</span><span class="p">(</span><span class="n">ld2460_component</span><span class="o">.</span><span class="n">set_enable_upload_switch</span><span class="p">(</span><span class="n">s</span><span class="p">))</span>
+</span></span></code></pre></td></tr></table>
+</div>
+</div><p>看py的codegen文件，原来这个Switch实例是先构造（<code>switch.new_switch</code>），再赋值<code>this-&gt;parent_ = parent;</code>，
+构造的时候<code>this-&gt;parent_</code>为nullptr，但是这时候就开始调用它的方法了(<code>turn_on</code>会调用<code>write_state</code>，后面涉及到对parent_的调用)，
+这显然是造成崩溃的罪魁祸首。
+因此，不要在Switch、Button、Select类的构造方法中调用parent的方法，弄个成员列表初始化即可。</p>
+<p>当然你硬要在构造方法调用parent的方法也行，new_xxx的时候parent就应该作为构造方法的参数传入。
+这样后面就不需要<code>register_parented</code>了，构造方法中就可以拿到parent对象。
+这两种方法都可以，看esphome官方这两种方法都有。</p>
+<p>另外idf5.4似乎还整了个活，如果在完全初始化之前调用uart、i2c、spi的write之类的方法。
+多半会得到一个freertos底层的新信错误，这个没法修，只能进一步推迟执行时间到loop方法开始执行的时候,这可以用一个队列实现。</p>
+<h3 id="2025127更新">2025.12.7更新</h3>
+<p>官方的<a href="https://esphome.github.io/esp-stacktrace-decoder/">好东西</a>，直接查看调用栈</p>
+
+    </div>
+
+    <div class="post-copyright">
+  <p class="copyright-item">
+    <span class="item-title">Author</span>
+    <span class="item-content"></span>
+  </p>
+  <p class="copyright-item">
+    <span class="item-title">LastMod</span>
+    <span class="item-content">
+        2026-04-20
+        
+    </span>
+  </p>
+  
+  
+</div>
+<footer class="post-footer">
+      
+      <nav class="post-nav">
+        
+        
+      </nav>
+    </footer>
+  </article>
+        </div>
+        
+
+  
+
+  
+
+      </div>
+    </main>
+
+    <footer id="footer" class="footer">
+      <div class="social-links">
+      <a href="mailto:your@email.com" class="iconfont icon-email" title="email"></a>
+      <a href="http://localhost:1313" class="iconfont icon-stack-overflow" title="stack-overflow"></a>
+      <a href="http://localhost:1313" class="iconfont icon-twitter" title="twitter"></a>
+      <a href="http://localhost:1313" class="iconfont icon-facebook" title="facebook"></a>
+      <a href="http://localhost:1313" class="iconfont icon-linkedin" title="linkedin"></a>
+      <a href="http://localhost:1313" class="iconfont icon-google" title="google"></a>
+      <a href="http://localhost:1313" class="iconfont icon-github" title="github"></a>
+      <a href="http://localhost:1313" class="iconfont icon-weibo" title="weibo"></a>
+      <a href="http://localhost:1313" class="iconfont icon-zhihu" title="zhihu"></a>
+      <a href="http://localhost:1313" class="iconfont icon-douban" title="douban"></a>
+      <a href="http://localhost:1313" class="iconfont icon-pocket" title="pocket"></a>
+      <a href="http://localhost:1313" class="iconfont icon-tumblr" title="tumblr"></a>
+      <a href="http://localhost:1313" class="iconfont icon-instagram" title="instagram"></a>
+      <a href="http://localhost:1313" class="iconfont icon-gitlab" title="gitlab"></a>
+      <a href="http://localhost:1313" class="iconfont icon-bilibili" title="bilibili"></a>
+  
+</div>
+
+<div class="copyright">
+  <span class="power-by">
+    Powered by <a class="hexo-link" href="https://gohugo.io">Hugo</a>
+  </span>
+  <span class="division">|</span>
+  <span class="theme-info">
+    Theme - 
+    <a class="theme-link" href="https://github.com/olOwOlo/hugo-theme-even">Even</a>
+  </span>
+
+  
+
+  <span class="copyright-year">
+    &copy; 
+    2017 - 
+    2026<span class="heart"><i class="iconfont icon-heart"></i></span><span></span>
+  </span>
+</div>
+
+    </footer>
+
+    <div class="back-to-top" id="back-to-top">
+      <i class="iconfont icon-up"></i>
+    </div>
+  </div>
+  
+  <script src="https://cdn.jsdelivr.net/npm/jquery@3.2.1/dist/jquery.min.js" integrity="sha256-hwg4gsxgFZhOsEEamdOYGBf13FyQuiTwlAQgxVSNgt4=" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/slideout@1.0.1/dist/slideout.min.js" integrity="sha256-t+zJ/g8/KXIJMjSVQdnibt4dlaDxc9zXr/9oNPeWqdg=" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@fancyapps/fancybox@3.1.20/dist/jquery.fancybox.min.js" integrity="sha256-XVLffZaxoWfGUEbdzuLi7pwaUJv1cecsQJQqGLe7axY=" crossorigin="anonymous"></script>
+
+
+
+<script type="text/javascript" src="/js/main.min.4ae89da218555efa0e7093a20b92017d2e1202b66fff9fc2edf4cb8d44b44c6e.js"></script>
+
+
+
+
+
+
+
+
+</body>
+</html>
