@@ -2,6 +2,7 @@
 date = '2026-04-20T23:10:28+08:00'
 draft = false
 title = 'Esphome'
+author = 'synodriver'
 +++
 # ESPHOME自定义组件崩溃调试方法
 
