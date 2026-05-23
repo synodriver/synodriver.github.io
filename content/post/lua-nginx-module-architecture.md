@@ -1,9 +1,10 @@
-+++
-date = '2026-05-15T00:26:40+08:00'
-draft = false
-title = 'lua-nginx-module 设计思路与架构深度剖析'
-author = 'synodriver'
-+++
+---
+date: '2026-05-15T00:26:40+08:00'
+draft: false
+title: 'lua-nginx-module 设计思路与架构深度剖析'
+author: 'synodriver'
+tags: ["nginx", "lua", "c"]
+---
 
 # lua-nginx-module 设计思路与架构深度剖析
 

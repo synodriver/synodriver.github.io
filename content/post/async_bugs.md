@@ -1,9 +1,10 @@
-+++
-date = '2026-04-25T03:11:51+08:00'
-draft = false
-title = '异步三坑'
-author = 'synodriver'
-+++
+---
+date: '2026-04-25T03:11:51+08:00'
+draft: false
+title: '异步三坑'
+author: 'synodriver'
+tags: ["python", "asyncio"]
+---
 
 # 异步三坑
 

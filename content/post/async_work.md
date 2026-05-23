@@ -1,9 +1,10 @@
-+++
-date = '2026-04-21T22:23:42+08:00'
-draft = false
-title = '论"异步"工作'
-author = 'synodriver'
-+++
+---
+date: '2026-04-21T22:23:42+08:00'
+draft: false
+title: '论"异步"工作'
+author: 'synodriver'
+tags: ["杂谈"]
+---
 # 论"异步"工作
 
 -- *很可惜，你不是事件循环，上下文切换的开销巨大*

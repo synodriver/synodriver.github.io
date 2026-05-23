@@ -1,9 +1,10 @@
-+++
-date = '2026-04-28T22:10:28+08:00'
-draft = false
-title = 'ESPHOME ai 教程'
-author = 'synodriver'
-+++
+---
+date: '2026-04-28T22:10:28+08:00'
+draft: false
+title: 'ESPHOME ai 教程'
+author: 'synodriver'
+tags: ["python", "c", "c++", "iot", "esphome"]
+---
 # ESPHome AI 协作指南
 
 本文档为与本项目交互的 AI 模型提供必要的上下文。遵循这些指南将确保一致性并维护代码质量。

@@ -1,9 +1,10 @@
-+++
-date = '2026-05-04T22:39:16+08:00'
-draft = false
-title = 'PEP 7 – C 代码风格指南'
-author = 'synodriver'
-+++
+---
+date: '2026-05-04T22:39:16+08:00'
+draft: false
+title: 'PEP 7 – C 代码风格指南'
+author: 'synodriver'
+tags: ["python", "c"]
+---
 
 # PEP 7 – C 代码风格指南
 

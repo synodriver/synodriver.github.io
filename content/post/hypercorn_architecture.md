@@ -1,9 +1,10 @@
-+++
-date = '2026-05-02T03:11:51+08:00'
-draft = false
-title = 'Hypercorn ASGI服务器架构与设计思路'
-author = 'synodriver'
-+++
+---
+date: '2026-05-02T03:11:51+08:00'
+draft: false
+title: 'Hypercorn ASGI服务器架构与设计思路'
+author: 'synodriver'
+tags: ["python", "asgi", "hypercorn", "nonecorn"]
+---
 
 # Hypercorn ASGI服务器架构与设计思路（nonecorn版）
 

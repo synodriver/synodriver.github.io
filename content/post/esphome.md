@@ -1,9 +1,10 @@
-+++
-date = '2026-04-20T23:10:28+08:00'
-draft = false
-title = 'ESPHOME自定义组件崩溃调试方法'
-author = 'synodriver'
-+++
+---
+date: '2026-04-20T23:10:28+08:00'
+draft: false
+title: 'ESPHOME自定义组件崩溃调试方法'
+author: 'synodriver'
+tags: ["python", "c++", "iot", "esphome"]
+---
 # ESPHOME自定义组件崩溃调试方法
 
 [LD2460组件](https://github.com/ha-china/esphome_external_componnets/tree/main/components/ld2460)过程中遇到运行的崩溃问题，记录调试方法

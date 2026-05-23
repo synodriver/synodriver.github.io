@@ -1,9 +1,10 @@
-+++
-date = '2026-05-04T12:51:00+08:00'
-draft = false
-title = 'Gunicorn Dirty Arbiters：异步脏调度器详解'
-author = 'synodriver'
-+++
+---
+date: '2026-05-04T12:51:00+08:00'
+draft: false
+title: 'Gunicorn Dirty Arbiters：异步脏调度器详解'
+author: 'synodriver'
+tags: ["python", "gunicorn"]
+---
 # Gunicorn Dirty Arbiters：异步脏调度器详解
 
 > **Beta 特性**：Dirty Arbiters 是 Gunicorn 25.0.0 中引入的测试版功能。虽然已经过测试，但 API 和行为可能在后续版本中变更。如有问题请在 GitHub 上反馈。

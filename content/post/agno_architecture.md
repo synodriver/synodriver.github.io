@@ -1,9 +1,10 @@
-+++
-date = '2026-05-12T22:43:15+08:00'
-draft = false
-title = 'Agno AI Agent框架架构与设计思路'
-author = 'synodriver'
-+++
+---
+date: '2026-05-12T22:43:15+08:00'
+draft: false
+title: 'Agno AI Agent框架架构与设计思路'
+author: 'synodriver'
+tags: ["python", "llm", "agent"]
+---
 
 # Agno AI Agent 框架架构与设计思路
 
