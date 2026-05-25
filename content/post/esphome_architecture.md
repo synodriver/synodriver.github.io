@@ -670,29 +670,249 @@ void loop() {
 
 ---
 
-## 八、设计哲学总结
+## 八、命令行接口 (CLI)
 
-### 8.1 配置即代码
+ESPHome 的所有功能通过命令行驱动，CLI 定义在 `esphome/__main__.py` 中，使用 `argparse` 的 subparsers 机制注册子命令。
+
+### 8.1 全局选项
+
+所有子命令共享以下选项：
+
+| 选项 | 短选项 | 说明 |
+|------|--------|------|
+| `--verbose` | `-v` | 启用详细日志（等价于 `--log-level DEBUG`） |
+| `--quiet` | `-q` | 禁用所有日志（等价于 `--log-level CRITICAL`） |
+| `--log-level` | `-l` | 设置日志级别：`DEBUG`、`INFO`、`WARNING`、`ERROR`、`CRITICAL` |
+| `--substitution` | `-s` | 添加 YAML 替换，格式：`-s key value`，可多次使用 |
+| `--toolchain` | | 选择编译工具链：`platformio` 或 `esp-idf`，覆盖 YAML 中的设置 |
+| `--version` | | 打印版本号并退出 |
+
+相关环境变量：
+
+| 环境变量 | 用途 |
+|----------|------|
+| `ESPHOME_VERBOSE` | 默认启用 verbose |
+| `ESPHOME_LOG_LEVEL` | 默认日志级别 |
+| `ESPHOME_UPLOAD_SPEED` | esptool 默认上传速度（回退值 `460800`） |
+| `ESPHOME_SERIAL_LOGGING_RESET` | 默认启用串口日志前重置设备 |
+
+### 8.2 常用命令
+
+#### `run` — 编译 + 上传 + 日志（最常用）
+
+```bash
+esphome run device.yaml
+```
+
+这是最常用的命令，执行完整流程：生成 C++ → 编译 → 上传 → 显示日志。
+
+| 选项 | 说明 |
+|------|------|
+| `--device` | 手动指定上传目标（串口/IP/`OTA`），可多次指定用于回退 |
+| `--upload_speed` | 覆盖上传速度 |
+| `--no-logs` | 上传成功后不启动日志查看 |
+| `--no-states` | 不显示实体状态变化 |
+| `-r` / `--reset` | 串口日志前重置设备 |
+| `--ota-platform` | OTA 平台：`esphome`（默认）或 `web_server` |
+
+**`--device` 特殊值**：
+- 串口路径：`/dev/ttyUSB0`、`COM3` — 通过 esptool 串口刷写
+- `OTA` — 从配置自动解析（mDNS/DNS/MQTT）
+- IP 地址 / mDNS 主机名 — 网络 OTA 上传
+- `MQTT` — 通过 MQTT 发现 IP
+- `BOOTSEL` — RP2040 BOOTSEL 模式（通过 picotool）
+
+```bash
+# 编译 + 通过串口上传 + 查看日志
+esphome run device.yaml --device /dev/ttyUSB0
+
+# 编译 + OTA 上传
+esphome run device.yaml --device 192.168.1.100
+
+# 仅编译上传，不看日志
+esphome run device.yaml --no-logs --device OTA
+```
+
+#### `compile` — 编译固件
+
+```bash
+esphome compile device.yaml
+```
+
+| 选项 | 说明 |
+|------|------|
+| `--only-generate` | 仅生成 C++ 源代码，不编译 |
+
+```bash
+# 仅生成 main.cpp 等源文件，不触发编译
+esphome compile device.yaml --only-generate
+
+# 使用 ESP-IDF 工具链编译
+esphome compile device.yaml --toolchain esp-idf
+```
+
+#### `upload` — 上传固件
+
+```bash
+esphome upload device.yaml --device /dev/ttyUSB0
+```
+
+| 选项 | 说明 |
+|------|------|
+| `--device` | 指定上传目标（同 `run`） |
+| `--upload_speed` | 覆盖上传速度 |
+| `--file` | 手动指定二进制文件路径 |
+| `--ota-platform` | `esphome` 或 `web_server` |
+| `--partition-table` | 通过 OTA 上传分区表（需 `allow_partition_access: true`） |
+| `--bootloader` | 通过 OTA 上传引导加载程序（需 `allow_partition_access: true`） |
+
+**上传路径选择**：
+1. **串口**：ESP32/ESP8266 用 `esptool`，RP2040/LibreTiny 用 PlatformIO
+2. **BOOTSEL**：用 `picotool load -v -x <elf>`
+3. **网络 OTA**：
+   - `esphome` 平台 → 原生 API 挑战-响应认证（更安全，默认）
+   - `web_server` 平台 → HTTP Basic 认证
+
+esptool 默认上传速度为 `460800`，失败后自动回退 `115200`。
+
+#### `logs` — 查看日志
+
+```bash
+esphome logs device.yaml
+```
+
+| 选项 | 短选项 | 说明 |
+|------|--------|------|
+| `--device` | | 指定日志来源（同 `run`） |
+| `--reset` | `-r` | 串口日志前重置设备 |
+| `--no-states` | | 不显示实体状态变化 |
+
+**日志来源优先级**：
+1. **串口**：直接读取串口数据，波特率从配置的 `logger.baud_rate` 读取
+2. **API**：通过原生 API 连接获取日志（默认订阅状态变化）
+3. **MQTT**：最后的回退方案
+
+```bash
+# 串口日志（波特率自动从配置读取）
+esphome logs device.yaml --device /dev/ttyUSB0
+
+# 通过 WiFi 查看远程日志
+esphome logs device.yaml --device 192.168.1.100
+
+# 串口日志前重置设备
+esphome logs device.yaml -r --device COM3
+```
+
+#### `config` — 验证并输出配置
+
+```bash
+esphome config device.yaml
+```
+
+| 选项 | 说明 |
+|------|------|
+| `--show-secrets` | 在输出中显示密码/密钥（默认隐藏） |
+
+### 8.3 其他命令
+
+| 命令 | 说明 |
+|------|------|
+| `wizard <config>` | 交互式 4 步设置向导（设备名 → 平台 → 开发板 → WiFi） |
+| `version` | 打印版本号 |
+| `clean <config>` | 清理构建文件 |
+| `clean-all` | 清理所有构建和平台文件 |
+| `clean-mqtt <config>` | 清理 MQTT 保留消息 |
+| `dashboard <dir>` | 启动 Web 仪表盘（默认端口 6052） |
+| `rename <config> <name>` | 重命名设备（修改 YAML + 重新编译上传） |
+| `idedata <config>` | 输出 PlatformIO IDE 数据（仅 PlatformIO 工具链） |
+| `analyze-memory <config>` | 组件级内存分析（使用 objdump + readelf） |
+| `bundle <config>` | 创建自包含配置打包文件 (.esphomebundle) |
+| `update-all <dir>` | 编译+上传目录下所有 YAML 配置 |
+| `vscode <config>` | VSCode 集成模式（stdin/stdout JSON 验证协议） |
+| `discover <config>` | 通过 MQTT 发现设备 |
+| `config-hash <config>` | 计算配置哈希值 |
+
+### 8.4 Dashboard 命令
+
+```bash
+esphome dashboard /path/to/configs/
+```
+
+| 选项 | 默认值 | 说明 |
+|------|--------|------|
+| `--port` | `6052` | HTTP 端口 |
+| `--address` | `0.0.0.0` | 绑定地址 |
+| `--username` | | 认证用户名 |
+| `--password` | | 认证密码（也可从 `$PASSWORD` 环境变量读取） |
+| `--open-ui` | | 自动在浏览器中打开 |
+
+```bash
+# 本地启动（自动打开浏览器）
+esphome dashboard ./configs/ --open-ui
+
+# 带认证的远程访问
+esphome dashboard ./configs/ --address 0.0.0.0 --port 6052 --username admin --password secret
+```
+
+### 8.5 典型工作流
+
+```bash
+# 1. 首次使用：创建配置
+esphome wizard my-device.yaml
+
+# 2. 验证配置正确
+esphome config my-device.yaml
+
+# 3. 首次烧录（串口）
+esphome run my-device.yaml --device /dev/ttyUSB0
+
+# 4. 后续更新（OTA 无线）
+esphome run my-device.yaml --device OTA
+
+# 5. 仅查看日志
+esphome logs my-device.yaml
+
+# 6. 仅编译不烧录
+esphome compile my-device.yaml
+
+# 7. 调试：查看生成的 C++ 源码
+esphome compile my-device.yaml --only-generate -v
+
+# 8. 分析内存使用
+esphome analyze-memory my-device.yaml
+
+# 9. 使用 YAML 替换变量
+esphome run my-device.yaml -s wifi_ssid MyHome -s wifi_password secret123
+
+# 10. 批量更新所有设备
+esphome update-all ./configs/
+```
+
+---
+
+## 九、设计哲学总结
+
+### 9.1 配置即代码
 
 YAML 配置 → C++ 固件 的全自动转换，用户无需编写任何 C++ 代码。代价是灵活性受限于组件开发者提供的 schema。
 
-### 8.2 编译期裁剪
+### 9.2 编译期裁剪
 
 通过条件编译宏（`defines.h`）和模板元编程（`HasLoopOverride<T>`、`StaticVector`），ESPHome 在编译期就确定了组件数量和类型，避免了运行时开销，使固件在资源受限的 MCU 上也能高效运行。
 
-### 8.3 确定性代码生成
+### 9.3 确定性代码生成
 
 Python 侧的伪协程系统保证相同 YAML 总是生成相同的 C++ 代码，使得增量编译成为可能。
 
-### 8.4 观察者模式
+### 9.4 观察者模式
 
 `Controller` 基类 + `EntityBase` 的回调系统构成了经典的观察者模式。实体状态变化时自动通知 `APIServer`、`WebServer` 等控制器，无需组件代码显式推送。
 
-### 8.5 X-macro 代码生成
+### 9.5 X-macro 代码生成
 
 C++ 侧使用 X-macro 技术消除实体类型相关的重复代码（注册方法、控制器回调、计数宏等），而 Python 侧也有对应的 `entity_helpers.py` 生成字符串查找表。
 
-### 8.6 嵌入式友好的内存管理
+### 9.6 嵌入式友好的内存管理
 
 - **Placement new**：避免堆碎片
 - **StaticVector**：编译期固定大小的向量
@@ -702,7 +922,7 @@ C++ 侧使用 X-macro 技术消除实体类型相关的重复代码（注册方�
 
 ---
 
-## 九、关键文件索引
+## 十、关键文件索引
 
 | 文件 | 作用 |
 |------|------|
@@ -715,6 +935,7 @@ C++ 侧使用 X-macro 技术消除实体类型相关的重复代码（注册方�
 | `esphome/config.py` | YAML 配置加载与验证 |
 | `esphome/automation.py` | 自动化框架的 Python 侧注册 |
 | `esphome/loader.py` | 组件动态加载 |
+| `esphome/__main__.py` | CLI 命令行接口（所有子命令定义） |
 | `esphome/core/component.h` | Component / PollingComponent 基类 |
 | `esphome/core/entity_base.h` | EntityBase / StatefulEntityBase 基类 |
 | `esphome/core/controller.h` | Controller 观察者基类 |
