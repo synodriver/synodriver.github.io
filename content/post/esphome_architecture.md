@@ -79,7 +79,7 @@ config.py + config_validation.py → 验证 YAML 合法性
 loader.py → 动态加载组件模块 (ComponentManifest)
     ↓
 各组件的 __init__.py:
-  - CONFIG_SCHEMA: 定义 YAML schema (使用 voluptuous 库)
+  - CONFIG_SCHEMA: 定义 YAML schema (基于 voluptuous，通过 `cv` 模块封装)
   - to_code(): async def, 使用 cg (codegen) 生成 C++ 表达式
     ↓
 coroutine.py → FakeEventLoop 按优先级调度所有 to_code() 协程
@@ -142,11 +142,23 @@ ESPHome **故意不使用真正的 asyncio 事件循环**。`FakeEventLoop.flush
 | EARLY_INIT | 1100 | logger |
 | PLATFORM | 1000 | esp32, esp8266, rp2040 |
 | NETWORK | 201 | network |
-| CORE | 100 | 各实体基类 (sensor, switch, light...) |
+| NETWORK_TRANSPORT | 200 | async_tcp |
+| DIAGNOSTICS | 90 | esp32_ble_tracker |
+| STATUS | 80 | status_led |
+| WEB_SERVER_BASE | 65 | web_server_base |
+| CAPTIVE_PORTAL | 64 | captive_portal |
 | COMMUNICATION | 60 | wifi, ethernet |
+| NETWORK_SERVICES | 55 | api, ota |
+| OTA_UPDATES | 54 | ota |
+| WEB_SERVER_OTA | 52 | web_server (OTA) |
+| PREFERENCES | 51 | preferences |
+| APPLICATION | 50 | 各实体基类 (sensor, switch, light...) |
+| WEB | 40 | web_server |
+| AUTOMATION | 30 | automation |
 | BUS | 1 | i2c |
 | COMPONENT | 0 | 默认优先级 |
 | LATE | -100 | globals |
+| WORKAROUNDS | -999 | 组件兼容性补丁 |
 | FINAL | -1000 | add_includes, 平台定义 |
 
 高优先级的协程先执行，确保基础设施（如平台初始化、网络、总线）在依赖它们的组件之前完成代码生成。
@@ -168,7 +180,7 @@ cg.add(App.register_sensor(var))    # 生成 App.register_sensor(var);
 class MockObj(Expression):
     def __getattr__(self, attr):
         # obj.set_name → MockObj("obj.set_name", ".")
-        # obj.Pset_name → MockObj("obj->set_name", "->")
+        # obj.Pset_name → MockObj("obj.set_name", "->")  (当 op 非 "::" 或 "" 时)
     
     def __call__(self, *args):
         # obj(args) → CallExpression
@@ -186,10 +198,12 @@ class MockObj(Expression):
 ```cpp
 // Python: cg.Pvariable(id_, id_.type.new(...))
 // 生成的 C++:
-alignas(ActualType) static unsigned char ns__id__pstorage[sizeof(ActualType)];
-static BaseType *const id = reinterpret_cast<BaseType *>(ns__id__pstorage);
+alignas(ActualType) static unsigned char {component_ns}__{id}__pstorage[sizeof(ActualType)];
+static BaseType *const id = reinterpret_cast<BaseType *>({component_ns}__{id}__pstorage);
 new(id) ActualType(constructor_args...);
 ```
+
+其中 `{component_ns}` 是从类型中提取的组件命名空间（如 `sensor`、`logger`），`{id}` 是变量 ID。例如 `my_sensor` 的存储名为 `sensor__my_sensor__pstorage`。
 
 ### 2.5 CORE 全局状态对象
 
@@ -235,7 +249,7 @@ EntityBase (esphome/core/entity_base.h)
 └── configure_entity_() — 代码生成调用的统一配置方法
 
 StatefulEntityBase<T> : EntityBase
-├── get_state() = 0 — 获取当前状态
+├── get_state() — 获取当前状态
 ├── add_on_state_callback() — 状态变化回调
 ├── add_full_state_callback() — 含旧值的状态变化回调
 └── set_new_state() — 状态更新 + 回调触发
@@ -297,10 +311,10 @@ Application (esphome/core/application.h)
 
 #### StatefulEntityBase\<T\> — 有状态实体
 
-模板化的有状态实体基类，管理状态变化和回调分发：
-- `Sensor : StatefulEntityBase<float>`
+模板化的有状态实体基类，管理状态变化和回调分发。注意：并非所有实体类型都继承 `StatefulEntityBase`，例如 `Sensor` 直接继承 `EntityBase` 并自行管理 `float state`，而 `BinarySensor` 则继承 `StatefulEntityBase<bool>`：
 - `BinarySensor : StatefulEntityBase<bool>`
 - `TextSensor : StatefulEntityBase<std::string>`
+- `Sensor : EntityBase`（自行管理 `float state`，未使用 `StatefulEntityBase<float>`）
 
 回调分为两级：
 - `state_callbacks_`：仅在新值有效且非首次设置（或配置了触发首次）时触发
@@ -413,10 +427,14 @@ Home Assistant ←──── TCP ────→ APIServer (MCU)
 
 ### 4.2 APIServer — 服务端入口
 
-`APIServer` 继承 `Component` 和 `Controller`：
+`APIServer` 继承 `Component` 和 `Controller`（条件编译时还继承 `camera::CameraListener`）：
 
 ```cpp
-class APIServer final : public Component, public Controller {
+class APIServer final : public Component, public Controller
+#ifdef USE_CAMERA
+    , public camera::CameraListener
+#endif
+{
     void setup() override;     // 监听 TCP 端口
     void loop() override;      // 接受新连接、处理 I/O
     float get_setup_priority() const override; // AFTER_CONNECTION
@@ -565,8 +583,8 @@ Python 侧：
 - `sensor/dht/__init__.py`：定义 DHT 平台的 schema 和 `to_code()`
 
 C++ 侧：
-- `sensor/sensor.h`：`Sensor` 基类（继承 `StatefulEntityBase<float>` + `Component`）
-- `dht/dht.h`：`DHTSensor` 继承 `Sensor`，实现 `update()` 读取硬件
+- `sensor/sensor.h`：`Sensor` 基类（继承 `EntityBase`，自行管理 `float state`）
+- `dht/dht.h`：`DHTSensor` 继承 `Sensor` + `PollingComponent`，实现 `update()` 读取硬件
 
 ### 5.5 唤醒系统
 
@@ -630,13 +648,15 @@ async def to_code(config):
 
 C++ 侧 (`binary_sensor.h`)：
 ```cpp
-class BinarySensor : public StatefulEntityBase<bool>, public Component {
+class BinarySensor : public StatefulEntityBase<bool> {
 public:
     void publish_state(bool state);  // 发布新状态
     void add_filter(Filter *filter);
     // ...
 };
 ```
+
+注意 `BinarySensor` 只继承 `StatefulEntityBase<bool>`，不继承 `Component`。轮询逻辑由具体的平台实现类（如 `GPIOBinarySensor`）通过 `PollingComponent` 单独提供。
 
 ---
 
@@ -890,29 +910,196 @@ esphome update-all ./configs/
 
 ---
 
-## 九、设计哲学总结
+## 九、工具链安装与路径管理
 
-### 9.1 配置即代码
+ESPHome 支持两种编译工具链：**PlatformIO** 和 **ESP-IDF**，通过 `--toolchain` 参数或 YAML 中的 `esphome.toolchain:` 配置选择，默认为 PlatformIO。首次编译时，ESPHome 会自动下载安装所需工具链。
+
+### 9.1 PlatformIO 工具链
+
+#### 安装方式
+
+PlatformIO 作为 Python 依赖通过 pip 安装（版本固定在 `requirements.txt` 中：`platformio==6.1.19`），安装 ESPHome 时自动安装。首次编译时，PlatformIO 会自动下载目标平台的编译器、框架等。
+
+#### 默认存储路径
+
+```
+~/.platformio/                          # PlatformIO 核心目录（不可自定义 core_dir）
+├── platforms/                          # 平台（如 espressif32）
+├── packages/                           # 工具包（如 toolchain-xtensa32、framework-arduinoespressif32）
+└── appstate.json                       # 设置文件（core_dir 不可自定义的原因）
+
+<config_dir>/.esphome/<device_name>/    # ESPHome 构建目录
+├── .pioenvs/                           # 构建输出（firmware.bin 等）
+└── .piolibdeps/                        # 库依赖
+```
+
+- **Linux/macOS**: `~/.platformio`
+- **Windows**: `%USERPROFILE%\.platformio`
+
+#### 自定义选项
+
+| 环境变量 | 说明 | 默认值 |
+|----------|------|--------|
+| `PLATFORMIO_BUILD_DIR` | 构建输出目录 | `<build_path>/.pioenvs` |
+| `PLATFORMIO_LIBDEPS_DIR` | 库依赖目录 | `<build_path>/.piolibdeps` |
+
+> **注意**：PlatformIO 的 `core_dir`（`~/.platformio`）**不可自定义**，因为其设置文件 `appstate.json` 存储在 core_dir 中。但可以自定义其下的 `platforms/`、`packages/`、`cache/` 子目录（Docker 环境中通过 `PLATFORMIO_PLATFORMS_DIR`、`PLATFORMIO_PACKAGES_DIR`、`PLATFORMIO_CACHE_DIR` 控制）。
+
+### 9.2 ESP-IDF 工具链
+
+#### 安装方式
+
+ESP-IDF 工具链由 ESPHome **自行管理**，不依赖 PlatformIO。首次使用 ESP-IDF 工具链编译时，`check_esp_idf_install()` 自动执行：
+
+1. **框架下载**：从 GitHub 镜像下载 ESP-IDF tar.xz 包并解压
+2. **工具安装**：通过 `idf_tools.py install` 安装交叉编译器（xtensa-esp-elf）、cmake、ninja 等
+3. **Python 环境**：创建独立 venv 并安装 IDF Python 依赖
+
+#### 默认存储路径
+
+```
+<config_dir>/.esphome/idf/             # ESP-IDF 工具根目录 (IDF_TOOLS_PATH)
+├── frameworks/
+│   └── <version>/                     # IDF 框架源码（如 5.5.2/）
+│       ├── tools/idf_tools.py
+│       ├── components/
+│       └── version.txt
+├── penvs/
+│   └── <version>/                     # Python 虚拟环境
+│       ├── bin/python
+│       └── lib/
+├── tools/                             # 下载的编译器等工具
+│   └── tools/
+│       ├── xtensa-esp-elf/
+│       ├── cmake/
+│       └── ninja/
+└── espidf.constraints.v<ver>.txt      # pip 约束文件
+```
+
+#### 自定义选项
+
+| 环境变量 | 说明 | 默认值 |
+|----------|------|--------|
+| `ESPHOME_ESP_IDF_PREFIX` | ESP-IDF 工具根目录 | `<data_dir>/idf` |
+| `ESPHOME_IDF_FRAMEWORK_MIRRORS` | 框架下载镜像 URL 列表 | GitHub esphome-libs 镜像 |
+| `ESP_IDF_CONSTRAINTS_MIRRORS` | pip 约束文件 URL | dl.espressif.com |
+| `IDF_PATH` | 已安装的 IDF 路径（若已设置则跳过安装） | 由 ESPHome 自动设置 |
+| `IDF_TOOLS_PATH` | IDF 工具安装根目录 | 同 `ESPHOME_ESP_IDF_PREFIX` |
+
+镜像 URL 支持模板替换：`{VERSION}`、`{MAJOR}`、`{MINOR}`、`{PATCH}`、`{EXTRA}`。
+
+```bash
+# 自定义 ESP-IDF 安装到 /opt/esphome-idf
+export ESPHOME_ESP_IDF_PREFIX=/opt/esphome-idf
+esphome compile device.yaml --toolchain esp-idf
+
+# 使用国内镜像加速下载
+export ESPHOME_IDF_FRAMEWORK_MIRRORS='https://mirrors.example.com/esp-idf/v{VERSION}/esp-idf-v{VERSION}.tar.xz'
+esphome compile device.yaml --toolchain esp-idf
+
+# 使用已安装的 ESP-IDF（跳过自动安装）
+export IDF_PATH=/opt/esp/v5.5.2
+esphome compile device.yaml --toolchain esp-idf
+```
+
+### 9.3 ESPHome 数据目录
+
+`CORE.data_dir` 是 ESPHome 的核心数据目录，控制所有中间文件的存储位置：
+
+| 环境 | 路径 |
+|------|------|
+| 本地开发（默认） | `<config_dir>/.esphome/` |
+| 自定义 | `$ESPHOME_DATA_DIR` |
+| Home Assistant 插件 | `/data/` |
+| Docker | `/config/.esphome/` 或 `$ESPHOME_DATA_DIR` |
+
+```bash
+# 自定义 ESPHome 数据目录
+export ESPHOME_DATA_DIR=/home/user/.local/share/esphome
+```
+
+### 9.4 完整路径结构示例
+
+以本地开发环境为例，YAML 配置文件为 `/home/user/mydevice.yaml`：
+
+```
+/home/user/
+├── mydevice.yaml                       # 用户配置文件
+└── .esphome/                           # ESPHome 数据目录 (CORE.data_dir)
+    ├── esphome.json                    # ESPHome 元数据
+    ├── storage/mydevice.yaml.json      # 配置存储
+    ├── idf/                            # ESP-IDF 工具根目录
+    │   ├── frameworks/5.5.2/           # IDF 框架
+    │   ├── penvs/5.5.2/               # Python venv
+    │   └── tools/                      # 交叉编译器
+    └── mydevice/                       # 构建目录 (CORE.build_path)
+        ├── platformio.ini              # PlatformIO 项目文件
+        ├── CMakeLists.txt              # ESP-IDF 项目文件
+        ├── src/                        # 生成的 C++ 源码
+        │   ├── main.cpp
+        │   └── esphome.h
+        ├── .pioenvs/mydevice/          # PIO 构建输出
+        │   └── firmware.bin
+        └── build/                      # IDF 构建输出
+            └── firmware.factory.bin
+
+~/.platformio/                          # PlatformIO 核心目录
+├── platforms/espressif32/              # ESP32 平台
+├── packages/
+│   ├── toolchain-xtensa32/            # 交叉编译器
+│   └── framework-arduinoespressif32/  # Arduino 框架
+└── appstate.json
+```
+
+### 9.5 编译流程
+
+```
+compile_program()
+├── PlatformIO 路径:
+│   run_platformio_cli_run()
+│   → python -m esphome.platformio.runner  [子进程，带补丁]
+│   → platformio run
+│
+└── ESP-IDF 路径:
+    check_esp_idf_install()              [首次运行：下载框架 + 工具 + Python 环境]
+    → run_idf_py("reconfigure")          [组件发现]
+    → write_project()                    [重新生成 CMakeLists.txt]
+    → run_idf_py("build", "size")        [编译]
+    → create_factory_bin()               [合并 bootloader + 分区表 + 固件]
+    → create_ota_bin()                   [OTA 固件副本]
+```
+
+PlatformIO runner 对 PlatformIO 做了两项重要补丁：
+- **patch_structhash()**：避免结构哈希变化导致完整重建，改用 mtime 检查
+- **patch_file_downloader()**：为包下载添加指数退避重试（5 次）
+
+ESP-IDF runner 使 `isatty()` 返回 True 以获取 TTY 格式的进度输出，并过滤嘈杂的 IDF/CMake/Ninja 输出。
+
+---
+
+## 十、设计哲学总结
+
+### 10.1 配置即代码
 
 YAML 配置 → C++ 固件 的全自动转换，用户无需编写任何 C++ 代码。代价是灵活性受限于组件开发者提供的 schema。
 
-### 9.2 编译期裁剪
+### 10.2 编译期裁剪
 
 通过条件编译宏（`defines.h`）和模板元编程（`HasLoopOverride<T>`、`StaticVector`），ESPHome 在编译期就确定了组件数量和类型，避免了运行时开销，使固件在资源受限的 MCU 上也能高效运行。
 
-### 9.3 确定性代码生成
+### 10.3 确定性代码生成
 
 Python 侧的伪协程系统保证相同 YAML 总是生成相同的 C++ 代码，使得增量编译成为可能。
 
-### 9.4 观察者模式
+### 10.4 观察者模式
 
 `Controller` 基类 + `EntityBase` 的回调系统构成了经典的观察者模式。实体状态变化时自动通知 `APIServer`、`WebServer` 等控制器，无需组件代码显式推送。
 
-### 9.5 X-macro 代码生成
+### 10.5 X-macro 代码生成
 
 C++ 侧使用 X-macro 技术消除实体类型相关的重复代码（注册方法、控制器回调、计数宏等），而 Python 侧也有对应的 `entity_helpers.py` 生成字符串查找表。
 
-### 9.6 嵌入式友好的内存管理
+### 10.6 嵌入式友好的内存管理
 
 - **Placement new**：避免堆碎片
 - **StaticVector**：编译期固定大小的向量
@@ -922,7 +1109,7 @@ C++ 侧使用 X-macro 技术消除实体类型相关的重复代码（注册方�
 
 ---
 
-## 十、关键文件索引
+## 十一、关键文件索引
 
 | 文件 | 作用 |
 |------|------|
@@ -948,3 +1135,8 @@ C++ 侧使用 X-macro 技术消除实体类型相关的重复代码（注册方�
 | `esphome/core/defines.h` | 条件编译宏（自动生成） |
 | `esphome/components/api/` | Native API 完整实现 |
 | `esphome/components/api/api.proto` | Protobuf 服务定义 |
+| `esphome/platformio/toolchain.py` | PlatformIO 编译调用 |
+| `esphome/platformio/runner.py` | PlatformIO 补丁（structhash、重试） |
+| `esphome/espidf/framework.py` | ESP-IDF 框架下载与安装 |
+| `esphome/espidf/toolchain.py` | ESP-IDF 编译调用 |
+| `esphome/espidf/runner.py` | ESP-IDF 输出过滤 |
