@@ -604,7 +604,127 @@ esphome/core/wake/
 - 外部中断
 - 其他线程/ISR 的 `wake_loop_threadsafe()` 唤醒
 
-### 5.6 构建系统
+### 5.6 持久化存储 (Preferences)
+
+ESPHome 通过 Preferences 系统实现断电后状态恢复，采用**分层架构**：
+
+```
+组件层 (fan/switch/light/cover...)
+    │  调用 rtc_.save(&state) / rtc_.load(&recovered)
+    ▼
+ESPPreferenceObject (类型安全模板包装器)
+    │  调用 backend_->save(data, len) / backend_->load(data, len)
+    ▼
+PreferenceBackend (平台相关后端)
+    ├── ESP32: NVS (Non-Volatile Storage)
+    ├── ESP8266: RTC 用户内存 + Flash 扇区
+    ├── RP2040 / LibreTiny / Host / Zephyr: 各自实现
+    └── Stub: 空实现
+```
+
+#### ESPPreferenceObject — 类型安全包装器
+
+```cpp
+class ESPPreferenceObject {
+  PreferenceBackend *backend_{nullptr};
+public:
+  template<typename T> bool save(const T *src) {
+    return this->backend_->save(reinterpret_cast<const uint8_t *>(src), sizeof(T));
+  }
+  template<typename T> bool load(T *dest) {
+    return this->backend_->load(reinterpret_cast<uint8_t *>(dest), sizeof(T));
+  }
+};
+```
+
+通过模板将任意 `trivially_copyable` 类型序列化为字节流，内部只持有 `PreferenceBackend*` 指针。
+
+#### Key 生成机制
+
+`EntityBase::make_entity_preference<T>(version)` 生成持久化对象，key 计算方式：
+
+```
+key = fnv1_hash(object_id) ^ device_id ^ version
+```
+
+- `object_id`：YAML 中的实体名称
+- `device_id`：设备标识（多设备时区分）
+- `version`：硬编码随机常量（如 Fan 的 `0x71700ABB`），修改存储结构时更改，旧数据自动失效
+
+#### ESP32 实现：基于 NVS
+
+ESP32 使用 ESP-IDF 的 NVS（Non-Volatile Storage），调用以下 ESP-IDF 函数：
+
+| 函数 | 用途 |
+|------|------|
+| `nvs_flash_init()` | 初始化 NVS 分区 |
+| `nvs_open("esphome", NVS_READWRITE, &handle)` | 打开 "esphome" 命名空间 |
+| `nvs_get_blob(handle, key, data, &len)` | 读取二进制数据 |
+| `nvs_set_blob(handle, key, data, len)` | 写入二进制数据 |
+| `nvs_commit(handle)` | 提交写入 |
+| `nvs_flash_erase()` | 擦除整个 NVS 分区（损坏/重置时） |
+
+**核心设计 — 延迟写入**：`save()` 不直接写 flash，而是追加到 `s_pending_save` 内存向量。同一 key 多次 save 只保留最新值。`sync()` 时通过 `is_changed_()` 先读取旧值 memcmp 比较，仅写入真正变化的数据，最大限度减少 flash 写入。
+
+```
+组件 save(&state) → 存入 s_pending_save 内存
+                          ↓ (每 60s 或关机时)
+sync() → is_changed_(旧值 vs 新值) → nvs_set_blob() → nvs_commit()
+```
+
+NVS 自带磨损均衡和校验，ESP32 上 `in_flash` 参数被忽略（全部走 NVS）。
+
+#### ESP8266 实现：RTC 内存 + Flash 扇区
+
+ESP8266 采用**双存储架构**，远比 ESP32 复杂：
+
+1. **RTC 用户内存**（`0x60001200`）：128 个 32-bit word（512 字节）
+   - 深度睡眠后保留，**断电后丢失**
+   - Normal 区域仅 78 words（312 字节），空间极其有限
+2. **Flash 扇区**：SPIFFS 之后的整扇区
+   - 断电后保留
+   - 通过 `spi_flash_erase_sector()` / `spi_flash_write()` 操作
+   - **无磨损均衡**，整扇区擦除+重写
+
+每个偏好数据附带 CRC word（`type` 参数参与计算），load 时校验。ESP32 无需此机制（NVS 内部有校验）。
+
+#### 两平台差异对比
+
+| 特性 | ESP32 (NVS) | ESP8266 (RTC+Flash) |
+|------|-------------|---------------------|
+| 存储后端 | NVS（自带磨损均衡+校验） | 手动管理 RTC + Flash |
+| save() 语义 | 延迟（内存缓冲） | RTC: 立即; Flash: 写 RAM 缓冲 |
+| 变更检测 | memcmp 旧值，跳过未变化数据 | Flash: dirty flag; RTC: 无条件写 |
+| Flash 写入 | 单键值对（nvs_set_blob） | 整扇区擦除+重写 |
+| 空间限制 | NVS 分区（16-24KB） | RTC: 312B; Flash: 256-512B |
+
+#### Sync 机制
+
+`IntervalSyncer` 组件（优先级 `BUS`）负责定时同步：
+
+- 默认每 **60 秒** `sync()` 一次（可通过 `preferences.flash_write_interval` 配置）
+- 设为 `0s` 时，每次 `loop()` 都 sync（编译宏 `USE_PREFERENCES_SYNC_EVERY_LOOP`）
+- **关机时额外 sync**（`on_shutdown`），确保数据不丢失
+
+#### 哪些对象需要持久化
+
+需要断电恢复状态的实体才使用持久化，典型包括：
+
+| 组件 | 存储结构 | 大小 | 说明 |
+|------|---------|------|------|
+| Switch | `bool` | 1B | 开关状态 |
+| Fan | `FanRestoreState` | ~8B | 风速、方向、振荡 |
+| Light | `LightStateRTCState` | ~44B | 亮度、色温、颜色、效果 |
+| Cover | `CoverRestoreState` | ~8B | 位置、倾斜角 |
+| Number | 平台相关 | 4-8B | 数值设定（如 LD2450 的存在超时） |
+
+不需要持久化的实体：
+- **Sensor / BinarySensor**：实时读取硬件值，无需恢复
+- **TextSensor**：动态生成文本
+- **Button**：瞬时动作，无状态
+- **Select**：部分实现使用，部分不使用
+
+### 5.7 构建系统
 
 ESPHome 支持两种构建后端：
 
@@ -657,6 +777,98 @@ public:
 ```
 
 注意 `BinarySensor` 只继承 `StatefulEntityBase<bool>`，不继承 `Component`。轮询逻辑由具体的平台实现类（如 `GPIOBinarySensor`）通过 `PollingComponent` 单独提供。
+
+---
+
+### 6.1 实战分析：LD2450 毫米波雷达组件
+
+LD2450 是一个典型的复杂组件，展示了 ESPHome 组件架构的多种模式。它是一个 24GHz 毫米波人体存在传感器，通过 UART 通信，支持多目标追踪和区域检测。
+
+### 组件结构
+
+```
+esphome/components/ld2450/
+├── __init__.py                    # CONFIG_SCHEMA + to_code()
+├── ld2450.h / ld2450.cpp          # 核心 C++ 类 (UART + Component)
+├── binary_sensor.py               # 目标检测二值传感器
+├── sensor.py                      # 坐标/速度/距离等数值传感器
+├── text_sensor.py                 # 版本/MAC/方向文本传感器
+├── button/                        # 恢复出厂 + 重启按钮
+├── number/                        # 存在超时 + 区域坐标 Number
+├── select/                        # 波特率 + 区域类型选择器
+└── switch/                        # 蓝牙 + 多目标模式开关
+```
+
+依赖共享基类 `ld24xx/ld24xx.h`，提供 `SensorWithDedup<T>` 去重传感器模板和辅助宏。
+
+### UART 通信协议
+
+LD2450 使用自定义二进制协议，两种帧格式：
+
+**命令帧**：`FD FC FB FA` + 长度 + 命令 + 参数 + `04 03 02 01`
+
+**数据帧**（周期性）：`AA FF 03 00` + 3×8字节目标数据 + `55 CC`
+
+```
+每个目标 8 字节：
+┌─────────┬──────────┬──────────┬──────────┬──────────┐
+│ X(2B)   │ Y(2B)    │ Speed(2B)│ Res(1B)  │ Flags(1B)│
+└─────────┴──────────┴──────────┴──────────┴──────────┘
+```
+
+通信流程：`send_command_()` → `readline_()` 逐字节解析 → `handle_periodic_data_()` / `handle_ack_data_()`。大部分命令需要先进入配置模式（`CMD_ENABLE_CONF`）。
+
+### 提供的实体类型
+
+| 类型 | 数量 | 说明 |
+|------|------|------|
+| Binary Sensor | 3 | 有目标/移动目标/静止目标（带存在超时） |
+| Sensor | 6+9×3+9×3=60 | 全局计数 + 每目标坐标/速度/角度/距离 + 每区域计数 |
+| Text Sensor | 2+3 | 版本/MAC + 每目标方向 |
+| Number | 1+3×4=13 | 存在超时 + 3区域×4坐标 |
+| Select | 2 | 波特率 / 区域类型 |
+| Switch | 2 | 蓝牙 / 多目标模式 |
+| Button | 2 | 恢复出厂 / 重启 |
+
+### 区域检测系统
+
+最多 3 个矩形区域，每个区域由对角点 (x1,y1)-(x2,y2) 定义：
+
+- **Detection 模式**：仅检测区域内的目标
+- **Filter 模式**：过滤掉区域内的目标
+- **Disabled**：区域禁用
+
+`count_targets_in_zone_()` 在 `handle_periodic_data_()` 中对每个目标判断是否在区域内，使用严格不等号。
+
+### 持久化存储
+
+LD2450 **仅持久化一个值**：`presence_timeout`（存在超时，默认 5 秒）。
+
+```cpp
+// setup() 中初始化偏好对象
+this->pref_ = this->presence_timeout_number_->make_entity_preference<float>();
+
+// 保存到 flash
+void LD2450Component::save_to_flash_(float value) { this->pref_.save(&value); }
+
+// 从 flash 恢复
+float LD2450Component::restore_from_flash_() {
+    float value;
+    if (!this->pref_.load(&value))
+        value = DEFAULT_PRESENCE_TIMEOUT;  // 5 秒
+    return value;
+}
+```
+
+区域坐标、蓝牙状态、多目标模式等**不持久化**——雷达硬件自身有内部存储，重启后从硬件重新读取。
+
+### 设计亮点
+
+1. **条件编译**：所有实体类型通过 `#ifdef USE_xxx` 裁剪，未使用的实体零开销
+2. **去重机制**：`SensorWithDedup<T>` + `Deduplicator<T>`，避免重复发布相同值
+3. **存在超时**：Binary Sensor 不立即清除状态，等待可配置超时后才切换 OFF
+4. **自动帧同步**：UART 解析器通过帧尾检测实现自动重新同步
+5. **懒加载回调**：`LazyCallbackManager<void()>` 仅在注册 `on_data` 自动化时才分配内存
 
 ---
 
@@ -1140,3 +1352,8 @@ C++ 侧使用 X-macro 技术消除实体类型相关的重复代码（注册方�
 | `esphome/espidf/framework.py` | ESP-IDF 框架下载与安装 |
 | `esphome/espidf/toolchain.py` | ESP-IDF 编译调用 |
 | `esphome/espidf/runner.py` | ESP-IDF 输出过滤 |
+| `esphome/core/preference_backend.h` | PreferenceBackend 接口 + ESPPreferenceObject + PreferencesMixin |
+| `esphome/core/preferences.h` | 平台分发头文件 |
+| `esphome/components/esp32/preferences.cpp` | ESP32 NVS 后端实现 |
+| `esphome/components/esp8266/preferences.cpp` | ESP8266 RTC+Flash 后端实现 |
+| `esphome/components/preferences/syncer.h` | IntervalSyncer 定时同步 |
