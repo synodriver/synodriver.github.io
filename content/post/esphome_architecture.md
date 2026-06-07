@@ -389,19 +389,286 @@ ENTITY_CONTROLLER_TYPE_(sensor::Sensor, sensor, sensors, ESPHOME_ENTITY_SENSOR_C
 
 ### 3.5 Automation 框架
 
-ESPHome 的自动化系统（`esphome/core/automation.h`）是声明式的触发-动作系统：
+ESPHome 的自动化系统（`esphome/core/automation.h` + `esphome/core/base_automation.h`）是声明式的触发-动作系统，用于实现事件驱动的控制逻辑。
+
+#### 3.5.1 核心架构
 
 ```
-Trigger<T...> ──触发──→ Action<T...> ──执行──→ 下一个 Action
+┌───────────────────────────────────────────────────────────────────┐
+│  Trigger<Ts...>                                                  │
+│    trigger(x...) → Automation::trigger(x...)                     │
+│                         │                                         │
+│                         ▼                                         │
+│  Automation<Ts...>                                               │
+│    trigger(x...) → ActionList::play(x...)                        │
+│                         │                                         │
+│                         ▼                                         │
+│  ActionList<Ts...>     (actions_ 指向链头)                        │
+│    play(x...) → action1.play_complex(x...)                       │
+│                         │                                         │
+│    ┌────────────────────▼─────────────────────────────────────┐   │
+│    │ Action 链 (单向链表，next_ 连接)                           │   │
+│    │                                                            │   │
+│    │ Action1 ──next_──> Action2 ──next_──> Action3 ──> nullptr │   │
+│    │                                                            │   │
+│    │ 每个 play_complex() 做三件事:                              │   │
+│    │   1. num_running_++                                        │   │
+│    │   2. play(x...)        ← 子类实现具体动作                  │   │
+│    │   3. play_next_(x...)  ← 传递到下一个 Action               │   │
+│    └────────────────────────────────────────────────────────────┘   │
+└───────────────────────────────────────────────────────────────────┘
 ```
 
 核心类：
-- **`Trigger<T...>`**：触发器，调用 `trigger()` 激活所有绑定的动作
-- **`Action<T...>`**：动作基类，`play()` 执行，支持链式组合
-- **`TemplatableFn<T, X...>`**：4 字节函数指针存储（替代 8 字节的 `TemplatableValue`）
-- **`TemplatableStorage<T, X...>`**：自动选择 `TemplatableFn`（trivially copyable）或 `TemplatableValue`（非 trivial）
+- **`Trigger<Ts...>`**：触发器，持有 `Automation*` 指针，`trigger()` 激活绑定的动作链
+- **`Automation<Ts...>`**：绑定 Trigger 和 ActionList，`trigger()` 转发到 `ActionList::play()`
+- **`ActionList<Ts...>`**：管理 Action 单向链表，`play()` 调用链头的 `play_complex()`
+- **`Action<Ts...>`**：动作基类，通过 `next_` 指针形成链表
 
-动作链通过 `play_complex()` 实现异步执行，支持 DelayAction、IfAction、WhileAction 等控制流。
+#### 3.5.2 Action 的三个核心方法
+
+```cpp
+template<typename... Ts> class Action {
+ public:
+  // 入口方法：驱动整个动作链执行
+  virtual void play_complex(const Ts &...x) {
+    this->num_running_++;      // (1) 标记运行中
+    this->play(x...);          // (2) 执行本动作的具体逻辑
+    this->play_next_(x...);    // (3) 传递给链中的下一个动作
+  }
+
+ protected:
+  // 纯虚函数：子类必须实现，定义动作的具体行为
+  virtual void play(const Ts &...x) = 0;
+
+  // 链传递方法：将参数传递给下一个 Action
+  void play_next_(const Ts &...x) {
+    if (this->num_running_ > 0) {       // 确认此动作仍在运行（未被 stop 中止）
+      this->num_running_--;              // 递减运行计数
+      if (this->next_ != nullptr) {
+        this->next_->play_complex(x...); // 递归调用下一个动作
+      }
+    }
+  }
+
+  Action<Ts...> *next_{nullptr};   // 单向链表指针
+  int num_running_{0};             // 并发运行实例计数
+};
+```
+
+**三个方法的职责**：
+
+| 方法 | 调用者 | 职责 |
+|------|--------|------|
+| `play_complex()` | 上一个 Action 的 `play_next_()` 或 `ActionList::play()` | 运行计数管理 + 调度 `play()` 和 `play_next_()` |
+| `play()` | `play_complex()` | 执行动作的具体逻辑（纯虚函数，子类必须实现） |
+| `play_next_()` | `play_complex()` | 检查运行状态，将参数透传给链中下一个 Action |
+
+#### 3.5.3 调用链的形成过程
+
+**1. 构建阶段（setup 时由代码生成器构建）**：
+
+```cpp
+// Python 侧 build_automation() 生成等价代码：
+auto automation = new Automation<SomeType>(trigger);
+
+auto action1 = new SomeAction<SomeType>(...);
+auto action2 = new AnotherAction<SomeType>(...);
+auto action3 = new DelayAction<SomeType>(...);
+
+// add_actions() 将 Action 串成单向链表
+automation->add_actions({action1, action2, action3});
+// 内部：action1->next_ = action2;  action2->next_ = action3;  action3->next_ = nullptr;
+```
+
+**2. 运行时调用链**：
+
+```
+some_trigger.trigger(x...)
+  → Automation::trigger(x...)           // ESPHOME_ALWAYS_INLINE 强制内联
+    → ActionList::play(x...)            // ESPHOME_ALWAYS_INLINE 强制内联
+      → action1.play_complex(x...)
+          num_running_++
+          play(x...)                    // action1 的具体逻辑
+          play_next_(x...)
+            num_running_--
+            → action2.play_complex(x...)
+                num_running_++
+                play(x...)              // action2 的具体逻辑
+                play_next_(x...)
+                  num_running_--
+                  → action3.play_complex(x...)
+                      ...（继续递归）
+```
+
+> `Trigger::trigger()` → `Automation::trigger()` → `ActionList::play()` 这三层转发全部被 `ESPHOME_ALWAYS_INLINE`（`__attribute__((always_inline))`）强制内联，编译后等价于直接调用第一个 Action 的 `play_complex()`。
+
+**3. 参数透传**：触发器参数 `Ts...` 完整无损地从链头传到链尾，每次都是 const 引用传递。对于需要延迟调用的场景（如 DelayAction），参数被**按值捕获**到 lambda 中，因为原始引用可能在延迟后失效。
+
+#### 3.5.4 同步动作 vs 异步动作
+
+**模式 A：同步动作**（最常见）— 只实现 `play()`，不重写 `play_complex()`
+
+基类的 `play_complex()` 在 `play()` 返回后立即调用 `play_next_()`，动作链顺序执行：
+
+```cpp
+// Switch TurnOnAction — 最简单的同步动作
+template<typename... Ts> class TurnOnAction : public Action<Ts...> {
+  void play(const Ts &...x) override { this->switch_->turn_on(); }
+  Switch *switch_;
+};
+
+// Switch ControlAction — 使用 TEMPLATABLE_VALUE 的同步动作
+template<typename... Ts> class ControlAction : public Action<Ts...> {
+  TEMPLATABLE_VALUE(bool, state)        // 仅 4 字节（TemplatableFn）
+  void play(const Ts &...x) override {
+    auto state = this->state_.optional_value(x...);
+    if (state.has_value()) this->switch_->control(*state);
+  }
+};
+```
+
+**模式 B：异步/复合动作** — 重写 `play_complex()`，延迟调用 `play_next_()`
+
+这些动作不能同步完成，需要在某个条件满足后才继续链：
+
+```cpp
+// DelayAction — 延迟后通过调度器回调继续
+void play_complex(const Ts &...x) override {
+  this->num_running_++;
+  // 注册定时器，延迟后回调 play_next_()
+  if constexpr (sizeof...(Ts) == 0) {
+    App.scheduler.set_timeout(this, "", this->delay_.value(),
+      [this]() { this->play_next_(); });
+  } else {
+    auto f = [this, x...]() mutable { this->play_next_(x...); };  // 按值捕获参数
+    App.scheduler.set_timeout(this, "", this->delay_.value(x...), std::move(f));
+  }
+}
+void play(const Ts &...x) override { /* 空 - 逻辑在 play_complex 中 */ }
+void stop() override { App.scheduler.cancel_timeout(this); }  // 取消定时器
+```
+
+```cpp
+// IfAction — 条件分支，子链通过 ContinuationAction 回到主链
+void play_complex(const Ts &...x) override {
+  this->num_running_++;
+  if (this->condition_->check(x...)) {
+    this->then_.play(x...);    // 执行 then 子链，末尾的 ContinuationAction 会调用 play_next_
+    return;                     // 不直接 play_next_，等子链完成
+  } else if constexpr (HasElse) {
+    this->else_.play(x...);    // 执行 else 子链
+    return;
+  }
+  this->play_next_(x...);      // 无匹配子链时直接继续
+}
+```
+
+#### 3.5.5 ContinuationAction — 子链回到主链的桥梁
+
+分支动作（If/While/Repeat）的子链末尾都有一个 `ContinuationAction`，其 `play()` 调用父动作的 `play_next_()`，使控制流从子链无缝回到主链：
+
+```cpp
+template<typename... Ts> class ContinuationAction : public Action<Ts...> {
+ public:
+  explicit ContinuationAction(Action<Ts...> *parent) : parent_(parent) {}
+  void play(const Ts &...x) override { this->parent_->play_next_(x...); }
+ protected:
+  Action<Ts...> *parent_;   // 仅 4/8 字节
+};
+```
+
+**IfAction 的链结构**：
+```
+IfAction → [then_: Action1 → Action2 → ContinuationAction(this)] → ActionAfterIf
+         → [else_: Action3 → ContinuationAction(this)]            ↗
+```
+
+**WhileAction 的循环机制**：子链末尾的 `WhileLoopContinuation` 检查条件——条件为 true 则重新执行子链，为 false 则调用 `parent_->play_next_()` 退出循环：
+
+```cpp
+template<typename... Ts> void WhileLoopContinuation<Ts...>::play(const Ts &...x) {
+  if (this->parent_->num_running_ > 0 && this->parent_->condition_->check(x...)) {
+    this->parent_->then_.play(x...);   // 条件仍满足，重新执行子链（循环）
+  } else {
+    this->parent_->play_next_(x...);   // 条件不满足，继续主链
+  }
+}
+```
+
+**RepeatAction 的参数注入**：子链类型是 `ActionList<uint32_t, Ts...>`，每次迭代将当前迭代号作为第一个参数传入，子链中的动作可以使用这个迭代号。
+
+#### 3.5.6 异步实现机制
+
+ESPHome **不使用** coroutine/yield，异步通过两种机制实现：
+
+| 机制 | 使用者 | 原理 |
+|------|--------|------|
+| **Scheduler 定时器** | DelayAction | `play_complex()` 注册定时器 → 等待 → 定时器回调 `play_next_()` |
+| **Component::loop() 轮询** | WaitUntilAction, ScriptWaitAction | `play_complex()` 存入队列 + `enable_loop()` → 每 loop() 检查条件 → 条件满足时 `play_next_tuple_()` + `disable_loop()` |
+
+WaitUntilAction 继承 `Component` 以使用 `loop()` 机制，使用队列存储等待中的参数（支持并发），按需启用/禁用 loop 以避免空转开销：
+
+```cpp
+// WaitUntilAction 简化逻辑
+void play_complex(const Ts &...x) override {
+  this->num_running_++;
+  if (this->condition_->check(x...)) {
+    this->play_next_(x...);   // 条件已满足，直接继续
+  } else {
+    this->var_queue_.emplace_back(millis(), timeout, std::make_tuple(x...));
+    this->enable_loop();       // 启用 loop() 轮询
+  }
+}
+void loop() override {
+  // 每次主循环迭代检查队列中的等待项
+  if (!this->process_queue_(App.get_loop_component_start_time()))
+    this->disable_loop();      // 队列空了，停止轮询
+}
+```
+
+#### 3.5.7 num_running_ 并发控制
+
+`num_running_` 计数器支持同一动作链的多次并行触发。例如，一个按钮的 `on_press` 触发器被快速连按两次：
+
+```
+第1次触发：action1.num_running_ = 1 → action2.num_running_ = 1 → ...
+第2次触发：action1.num_running_ = 2 → action2.num_running_ = 2 → ...
+```
+
+每次 `play_next_()` 递减计数，`stop_complex()` 直接将 `num_running_` 置 0 中止所有实例。DelayAction 使用 `skip_cancel` 参数控制并行实例的行为——当 `num_running_ > 1` 时，新延迟不会取消正在运行的旧延迟。
+
+#### 3.5.8 TemplatableValue / TemplatableFn — 4 字节优化
+
+`TEMPLATABLE_VALUE(type, name)` 宏为 Action 子类生成"可模板化"的值成员，支持常量值或 lambda 表达式：
+
+```cpp
+#define TEMPLATABLE_VALUE(type, name) \
+ protected: TemplatableStorage<type, Ts...> name##_{}; \
+ public: template<typename V> void set_##name(V name) { this->name##_ = name; }
+```
+
+`TemplatableStorage` 根据类型自动选择存储方式：
+- **Trivially copyable 类型**（int, float, bool 等）→ `TemplatableFn`：仅 4 字节，只存函数指针
+- **非 trivial 类型**（std::string 等）→ `TemplatableValue`：8 字节，存值或函数指针
+
+Python 代码生成器将常量包装为无状态 lambda（可转为函数指针），避免 `std::function` 的 32 字节开销。LightControlAction 更进一步，将所有字段设置打包成单个 `ApplyFn` 函数指针，无论配置了多少字段，Action 对象始终只占 8 字节。
+
+#### 3.5.9 TriggerForwarder — 回调式自动化构建
+
+新式自动化构建不再创建 Trigger 对象，而是直接将 Automation 注册为回调：
+
+```cpp
+template<typename... Ts> struct TriggerForwarder {
+  Automation<Ts...> *automation;
+  void operator()(const Ts &...args) const { this->automation->trigger(args...); }
+};
+static_assert(sizeof(TriggerForwarder<>) <= sizeof(void *));  // 可内联存储在 Callback::ctx_ 中
+```
+
+特化前向器提供条件触发：
+- `TriggerOnTrueForwarder`：仅当 bool 参数为 true 时触发
+- `TriggerOnFalseForwarder`：仅当 bool 参数为 false 时触发
 
 ---
 
@@ -1339,7 +1606,8 @@ C++ 侧使用 X-macro 技术消除实体类型相关的重复代码（注册方�
 | `esphome/core/entity_base.h` | EntityBase / StatefulEntityBase 基类 |
 | `esphome/core/controller.h` | Controller 观察者基类 |
 | `esphome/core/application.h` | Application 全局管理器 |
-| `esphome/core/automation.h` | Trigger / Action / TemplatableFn |
+| `esphome/core/automation.h` | Trigger / Action / Automation / ActionList / TemplatableFn |
+| `esphome/core/base_automation.h` | DelayAction / IfAction / WhileAction / RepeatAction / WaitUntilAction / ContinuationAction |
 | `esphome/core/scheduler.h` | 定时任务调度器 |
 | `esphome/core/helpers.h` | CallbackManager、StaticVector 等工具 |
 | `esphome/core/hal.h` | 硬件抽象层分发 |
