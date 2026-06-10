@@ -22,6 +22,13 @@ author: 'synodriver'
 - [8. 平台(Platform)与 EntityComponent 编排](#8-平台platform与-entitycomponent-编排)
 - [9. 集成实现完整示例：Hue](#9-集成实现完整示例hue)
 - [10. 如何实现自己的集成](#10-如何实现自己的集成)
+  - [10.1 最小集成结构](#101-最小集成结构)
+  - [10.2 manifest.json](#102-manifestjson)
+  - [10.3 `__init__.py` — 集成入口](#103-__init__py--集成入口)
+  - [10.4 `config_flow.py` — 配置流](#104-config_flowpy--配置流)
+  - [10.5 `sensor.py` — 向 sensor 域提供实体](#105-sensorpy--向-sensor-域提供实体)
+  - [10.6 从 YAML 配置加载集成](#106-从-yaml-配置加载集成)
+  - [10.7 关键实现要点](#107-关键实现要点)
 - [11. 关键设计模式总结](#11-关键设计模式总结)
 
 ---
@@ -719,6 +726,28 @@ class MyConfigFlow(ConfigFlow, domain="my_integration"):
         return MyOptionsFlow(config_entry)
 ```
 
+### 10.7 关键实现要点
+
+1. **runtime_data 模式**：使用 `ConfigEntry[MyData]` 泛型，在 `async_setup_entry` 中设置 `entry.runtime_data`，平台通过 `config_entry.runtime_data` 获取，类型安全。
+
+2. **ConfigEntryNotReady**：连接失败时抛出此异常，HA 会自动重试设置。
+
+3. **async_forward_entry_setups**：在集成入口的 `async_setup_entry` 中调用，将配置条目转发到各平台。
+
+4. **async_unload_platforms**：在 `async_unload_entry` 中调用，卸载所有平台。
+
+5. **async_on_unload**：注册卸载时的清理回调，如取消订阅、关闭连接。
+
+6. **DataUpdateCoordinator**：轮询式更新的推荐方式，自动处理轮询间隔、错误重试、状态更新。
+
+7. **CoordinatorEntity**：与 Coordinator 配合的实体基类，自动在 Coordinator 刷新时更新状态。
+
+8. **EntityDescription**：将实体属性从子类移到描述对象，支持一个实体类多个实例。
+
+9. **should_poll**：事件驱动集成的实体应设 `_attr_should_poll = False`，通过 `async_write_ha_state()` 主动推送更新。
+
+10. **YAML 与 ConfigFlow 共存**：通过 `SOURCE_IMPORT` 将 YAML 配置导入为 ConfigEntry，统一由 `async_setup_entry` 处理，避免维护两套逻辑。
+
 ---
 
 ## 6. 实体(Entity)体系
@@ -904,6 +933,28 @@ class MyEntity(CoordinatorEntity, LightEntity):
     # CoordinatorEntity 自动在 coordinator 刷新时调用 async_write_ha_state()
 ```
 
+### 10.7 关键实现要点
+
+1. **runtime_data 模式**：使用 `ConfigEntry[MyData]` 泛型，在 `async_setup_entry` 中设置 `entry.runtime_data`，平台通过 `config_entry.runtime_data` 获取，类型安全。
+
+2. **ConfigEntryNotReady**：连接失败时抛出此异常，HA 会自动重试设置。
+
+3. **async_forward_entry_setups**：在集成入口的 `async_setup_entry` 中调用，将配置条目转发到各平台。
+
+4. **async_unload_platforms**：在 `async_unload_entry` 中调用，卸载所有平台。
+
+5. **async_on_unload**：注册卸载时的清理回调，如取消订阅、关闭连接。
+
+6. **DataUpdateCoordinator**：轮询式更新的推荐方式，自动处理轮询间隔、错误重试、状态更新。
+
+7. **CoordinatorEntity**：与 Coordinator 配合的实体基类，自动在 Coordinator 刷新时更新状态。
+
+8. **EntityDescription**：将实体属性从子类移到描述对象，支持一个实体类多个实例。
+
+9. **should_poll**：事件驱动集成的实体应设 `_attr_should_poll = False`，通过 `async_write_ha_state()` 主动推送更新。
+
+10. **YAML 与 ConfigFlow 共存**：通过 `SOURCE_IMPORT` 将 YAML 配置导入为 ConfigEntry，统一由 `async_setup_entry` 处理，避免维护两套逻辑。
+
 ---
 
 ## 7. 服务(Service)机制
@@ -971,6 +1022,28 @@ component.async_register_batched_entity_service(
     async_get_forecasts,  # func(entities, service_call)
 )
 ```
+
+### 10.7 关键实现要点
+
+1. **runtime_data 模式**：使用 `ConfigEntry[MyData]` 泛型，在 `async_setup_entry` 中设置 `entry.runtime_data`，平台通过 `config_entry.runtime_data` 获取，类型安全。
+
+2. **ConfigEntryNotReady**：连接失败时抛出此异常，HA 会自动重试设置。
+
+3. **async_forward_entry_setups**：在集成入口的 `async_setup_entry` 中调用，将配置条目转发到各平台。
+
+4. **async_unload_platforms**：在 `async_unload_entry` 中调用，卸载所有平台。
+
+5. **async_on_unload**：注册卸载时的清理回调，如取消订阅、关闭连接。
+
+6. **DataUpdateCoordinator**：轮询式更新的推荐方式，自动处理轮询间隔、错误重试、状态更新。
+
+7. **CoordinatorEntity**：与 Coordinator 配合的实体基类，自动在 Coordinator 刷新时更新状态。
+
+8. **EntityDescription**：将实体属性从子类移到描述对象，支持一个实体类多个实例。
+
+9. **should_poll**：事件驱动集成的实体应设 `_attr_should_poll = False`，通过 `async_write_ha_state()` 主动推送更新。
+
+10. **YAML 与 ConfigFlow 共存**：通过 `SOURCE_IMPORT` 将 YAML 配置导入为 ConfigEntry，统一由 `async_setup_entry` 处理，避免维护两套逻辑。
 
 ---
 
@@ -1353,6 +1426,28 @@ class HueBaseEntity(Entity):
 └─────────────────────────────────────────────────────────────────┘
 ```
 
+### 10.7 关键实现要点
+
+1. **runtime_data 模式**：使用 `ConfigEntry[MyData]` 泛型，在 `async_setup_entry` 中设置 `entry.runtime_data`，平台通过 `config_entry.runtime_data` 获取，类型安全。
+
+2. **ConfigEntryNotReady**：连接失败时抛出此异常，HA 会自动重试设置。
+
+3. **async_forward_entry_setups**：在集成入口的 `async_setup_entry` 中调用，将配置条目转发到各平台。
+
+4. **async_unload_platforms**：在 `async_unload_entry` 中调用，卸载所有平台。
+
+5. **async_on_unload**：注册卸载时的清理回调，如取消订阅、关闭连接。
+
+6. **DataUpdateCoordinator**：轮询式更新的推荐方式，自动处理轮询间隔、错误重试、状态更新。
+
+7. **CoordinatorEntity**：与 Coordinator 配合的实体基类，自动在 Coordinator 刷新时更新状态。
+
+8. **EntityDescription**：将实体属性从子类移到描述对象，支持一个实体类多个实例。
+
+9. **should_poll**：事件驱动集成的实体应设 `_attr_should_poll = False`，通过 `async_write_ha_state()` 主动推送更新。
+
+10. **YAML 与 ConfigFlow 共存**：通过 `SOURCE_IMPORT` 将 YAML 配置导入为 ConfigEntry，统一由 `async_setup_entry` 处理，避免维护两套逻辑。
+
 ---
 
 ## 10. 如何实现自己的集成
@@ -1581,7 +1676,385 @@ class MySensor(CoordinatorEntity, SensorEntity):
         return self.coordinator.data.get(self.entity_description.key)
 ```
 
-### 10.6 关键实现要点
+### 10.6 从 YAML 配置加载集成
+
+前面展示的集成仅支持 ConfigFlow（UI 配置），但自定义集成也可以支持从 `configuration.yaml` 加载。这种模式下，用户在 YAML 中声明集成配置，HA 解析后调用集成的 `async_setup` 函数。
+
+#### 10.6.1 两种加载路径对比
+
+| 特性 | ConfigFlow 路径 | YAML 路径 |
+|------|-----------------|-----------|
+| 入口函数 | `async_setup_entry(hass, entry)` | `async_setup(hass, config)` |
+| 配置来源 | UI 交互创建的 ConfigEntry | `configuration.yaml` 中的 YAML 配置 |
+| 平台设置方式 | `async_forward_entry_setups(entry, platforms)` | 通过 `EntityComponent.async_setup(config)` 自动遍历 |
+| 卸载函数 | `async_unload_entry(hass, entry)` | 无（HA 停止时自动清理） |
+| 运行时数据 | `entry.runtime_data` | `hass.data[DOMAIN]` |
+| 配置校验 | ConfigFlow 中的 Schema | `CONFIG_SCHEMA` / `PLATFORM_SCHEMA` |
+
+#### 10.6.2 仅 YAML 配置的集成
+
+最简单的方式 — 集成只从 YAML 加载，不需要 ConfigFlow：
+
+```python
+# __init__.py
+import voluptuous as vol
+from homeassistant.core import HomeAssistant
+from homeassistant.const import Platform
+import homeassistant.helpers.config_validation as cv
+
+DOMAIN = "my_integration"
+PLATFORMS = [Platform.SENSOR]
+
+# 定义 YAML 配置 Schema
+CONFIG_SCHEMA = vol.Schema(
+    {
+        DOMAIN: vol.Schema(
+            {
+                vol.Required("host"): str,
+                vol.Required("api_key"): cv.string,
+                vol.Optional("poll_interval", default=30): int,
+            }
+        )
+    },
+    extra=vol.ALLOW_EXTRA,
+)
+
+
+async def async_setup(hass: HomeAssistant, config: dict) -> bool:
+    """从 YAML 配置设置集成。"""
+    conf = config[DOMAIN]
+
+    # 存储配置到 hass.data，供平台文件使用
+    hass.data[DOMAIN] = {
+        "host": conf["host"],
+        "api_key": conf["api_key"],
+        "poll_interval": conf["poll_interval"],
+    }
+
+    # 创建 EntityComponent 并设置平台
+    component = EntityComponent(_LOGGER, DOMAIN, hass)
+    await component.async_setup(config)
+
+    return True
+```
+
+对应的平台文件（`sensor.py`）需要实现 `async_setup_platform`（传统方式）：
+
+```python
+# sensor.py
+from homeassistant.components.sensor import SensorEntity
+from homeassistant.core import HomeAssistant
+
+
+async def async_setup_platform(
+    hass: HomeAssistant,
+    config: dict,            # 平台级 YAML 配置（来自 configuration.yaml 中 my_integration: 下的 platform: sensor 块）
+    async_add_entities,      # 添加实体的回调
+    discovery_info=None,     # 发现信息（如果有）
+) -> None:
+    """从 YAML 配置设置传感器平台。"""
+    data = hass.data[DOMAIN]  # 获取集成级配置
+
+    async_add_entities([
+        MySensor(data["host"], data["api_key"], "temperature"),
+        MySensor(data["host"], data["api_key"], "humidity"),
+    ])
+
+
+class MySensor(SensorEntity):
+    """YAML 模式的传感器。"""
+
+    def __init__(self, host, api_key, sensor_type):
+        self._host = host
+        self._api_key = api_key
+        self._sensor_type = sensor_type
+        self._attr_unique_id = f"{host}_{sensor_type}"
+        self._attr_name = f"My {sensor_type}"
+        self._native_value = None
+
+    @property
+    def native_value(self):
+        return self._native_value
+
+    async def async_update(self):
+        """EntityPlatform 轮询时调用此方法。"""
+        self._native_value = await fetch_value(self._host, self._api_key, self._sensor_type)
+```
+
+对应的 `configuration.yaml`：
+
+```yaml
+my_integration:
+  host: "192.168.1.100"
+  api_key: "abc123"
+  poll_interval: 30
+```
+
+#### 10.6.3 同时支持 YAML 和 ConfigFlow
+
+许多内置集成同时支持两种加载方式。通常的做法是：
+
+- YAML 配置通过 `async_setup` 处理，并在其中将配置导入为 ConfigEntry
+- ConfigFlow 直接创建 ConfigEntry
+- 核心逻辑统一由 `async_setup_entry` 处理
+
+```python
+# __init__.py
+import voluptuous as vol
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.core import HomeAssistant
+from homeassistant.const import Platform
+import homeassistant.helpers.config_validation as cv
+
+DOMAIN = "my_integration"
+PLATFORMS = [Platform.SENSOR]
+
+# YAML 配置 Schema — 使用 config_entry_only_config_schema 可声明仅支持 Config Entry
+# CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)  # 仅 ConfigFlow
+#
+# 同时支持 YAML 和 ConfigFlow 时：
+CONFIG_SCHEMA = vol.Schema(
+    {
+        DOMAIN: vol.Schema(
+            {
+                vol.Required("host"): str,
+                vol.Required("api_key"): cv.string,
+            }
+        )
+    },
+    extra=vol.ALLOW_EXTRA,
+)
+
+
+async def async_setup(hass: HomeAssistant, config: dict) -> bool:
+    """从 YAML 配置设置集成，并将配置导入为 ConfigEntry。"""
+    if DOMAIN not in config:
+        return True  # 没有此集成的 YAML 配置，可能通过 ConfigFlow 配置
+
+    conf = config[DOMAIN]
+
+    # 检查是否已有同配置的 ConfigEntry（避免重复导入）
+    for entry in hass.config_entries.async_entries(DOMAIN):
+        if entry.source == SOURCE_IMPORT and entry.data.get("host") == conf["host"]:
+            return True  # 已导入过
+
+    # 通过 ConfigFlow 导入 YAML 配置
+    # 这是 HA 生产代码中 YAML → ConfigEntry 导入的标准模式
+    # 参见：sleepiq, yeelight, lutron_caseta, sun, thread 等集成
+    hass.async_create_task(
+        hass.config_entries.flow.async_init(
+            DOMAIN,
+            context={"source": SOURCE_IMPORT},
+            data=conf,
+        )
+    )
+
+    return True
+
+
+async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """从 ConfigEntry 设置集成（YAML 导入和 ConfigFlow 统一走此路径）。"""
+    # 1. 初始化运行时数据
+    runtime_data = MyRuntimeData(hass, entry)
+    entry.runtime_data = runtime_data
+
+    # 2. 初始化连接
+    try:
+        await runtime_data.async_connect()
+    except ConnectionError as err:
+        raise ConfigEntryNotReady(f"Connection failed: {err}") from err
+
+    # 3. 转发平台设置
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+    return True
+
+
+async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """卸载 ConfigEntry。"""
+    unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    if unload_ok:
+        await entry.runtime_data.async_disconnect()
+    return unload_ok
+```
+
+对应的 ConfigFlow 中增加 import 步骤：
+
+```python
+# config_flow.py
+class MyConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
+    VERSION = 1
+
+    async def async_step_import(self, import_data):
+        """从 YAML 配置导入。"""
+        host = import_data["host"]
+
+        await self.async_set_unique_id(host)
+        self._abort_if_unique_id_configured()
+
+        return self.async_create_entry(
+            title=f"My Device ({host})",
+            data=import_data,
+        )
+
+    async def async_step_user(self, user_input=None):
+        # ... 用户手动配置步骤（同 10.4 节）
+```
+
+同时，平台文件需要同时实现 `async_setup_platform`（YAML 路径）和 `async_setup_entry`（ConfigEntry 路径）：
+
+```python
+# sensor.py
+from homeassistant.components.sensor import SensorEntity
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.entity_platform import AddEntitiesCallback
+
+
+async def async_setup_entry(
+    hass: HomeAssistant,
+    config_entry: ConfigEntry,
+    async_add_entities: AddEntitiesCallback,
+) -> None:
+    """ConfigEntry 路径设置传感器。"""
+    runtime_data = config_entry.runtime_data
+    async_add_entities([
+        MySensor(runtime_data, "temperature"),
+        MySensor(runtime_data, "humidity"),
+    ])
+
+
+async def async_setup_platform(
+    hass: HomeAssistant,
+    config: dict,
+    async_add_entities: AddEntitiesCallback,
+    discovery_info=None,
+) -> None:
+    """YAML 路径设置传感器（通常不再需要，因为 YAML 会导入为 ConfigEntry）。"""
+    # 如果使用了 YAML → ConfigEntry 导入模式，此函数通常不会被执行
+    # 但保留兼容性时，可以：
+    data = hass.data[DOMAIN]
+    async_add_entities([
+        MySensorLegacy(data["host"], data["api_key"], "temperature"),
+    ])
+```
+
+#### 10.6.4 平台级 YAML 配置（PLATFORM_SCHEMA）
+
+某些集成（特别是 hub 型集成如 `mqtt`、`hue`）支持在 YAML 中为每个平台分别配置：
+
+```yaml
+# configuration.yaml
+light:
+  - platform: my_integration
+    host: "192.168.1.100"
+    name: "Living Room Light"
+
+sensor:
+  - platform: my_integration
+    host: "192.168.1.100"
+    sensor_type: "temperature"
+```
+
+此时平台文件需要定义 `PLATFORM_SCHEMA`：
+
+```python
+# sensor.py
+import voluptuous as vol
+from homeassistant.components.sensor import PLATFORM_SCHEMA, SensorEntity
+from homeassistant.core import HomeAssistant
+
+PLATFORM_SCHEMA = vol.Schema(
+    {
+        vol.Required("host"): str,
+        vol.Required("sensor_type"): str,
+        vol.Optional("name"): str,
+    },
+    extra=vol.ALLOW_EXTRA,
+)
+
+
+async def async_setup_platform(
+    hass: HomeAssistant,
+    config: dict,            # 已经过 PLATFORM_SCHEMA 校验的平台配置
+    async_add_entities,
+    discovery_info=None,
+) -> None:
+    host = config["host"]
+    sensor_type = config["sensor_type"]
+    name = config.get("name", f"My {sensor_type}")
+
+    async_add_entities([MySensor(host, sensor_type, name)])
+```
+
+**注意**：`PLATFORM_SCHEMA` 在 `sensor.py` 等平台文件中定义，而 `CONFIG_SCHEMA` 在 `__init__.py` 中定义。两者的区别：
+
+| Schema | 定义位置 | 校验范围 | 用途 |
+|--------|----------|----------|------|
+| `CONFIG_SCHEMA` | `__init__.py` | 整个集成的 YAML 配置块 | 集成级配置（host, api_key 等） |
+| `PLATFORM_SCHEMA` | 平台文件（`sensor.py` 等） | 每个平台条目的 YAML 配置 | 平台级配置（sensor_type, name 等） |
+
+#### 10.6.5 YAML 加载与 ConfigFlow 加载的内部流程差异
+
+```
+YAML 路径:
+  bootstrap._async_set_up_integrations()
+    → 解析 configuration.yaml
+    → async_setup_component("my_integration", config)
+      → _async_setup_component()
+        → integration.async_get_component()  导入 __init__.py
+        → conf_util.async_process_component_config()  用 CONFIG_SCHEMA 校验
+        → component.async_setup(hass, processed_config)  ← 调用集成的 async_setup
+          → EntityComponent.async_setup(config)
+            → config_per_platform() 遍历各平台配置
+            → async_setup_platform("sensor", platform_config)
+              → 导入 sensor.py
+              → EntityPlatform.async_setup(platform_config)
+                → platform.async_setup_platform(hass, config, async_add_entities)
+
+ConfigFlow 路径:
+  用户在 UI 中添加集成
+    → ConfigEntriesFlowManager.async_init()
+      → ConfigFlow → async_create_entry()
+        → ConfigEntry 创建
+    → _async_setup_component() 阶段 10
+      → entry.async_setup_locked(hass)
+        → component.async_setup_entry(hass, entry)  ← 调用集成的 async_setup_entry
+          → async_forward_entry_setups(entry, ["sensor"])
+            → EntityComponent.async_setup_entry(entry)
+              → 导入 sensor.py
+              → EntityPlatform.async_setup_entry(config_entry)
+                → platform.async_setup_entry(hass, config_entry, async_add_entities)
+```
+
+> **易混淆概念**：`discovery.async_load_platform` vs `hass.config_entries.flow.async_init`
+>
+> | | `hass.config_entries.flow.async_init` | `discovery.async_load_platform` |
+> |---|---|---|
+> | **用途** | 启动 ConfigFlow，创建 ConfigEntry | 平台发现：动态将平台加载到另一个域 |
+> | **YAML 导入** | ✅ 标准做法（66+ 个内置集成使用） | ❌ 不用于 YAML 导入 |
+> | **典型场景** | YAML → ConfigEntry 转换、UI 配置 | 集成动态加载自己的 notify 平台等 |
+> | **是否创建 ConfigEntry** | 是 | 否，完全绕过 ConfigEntry |
+> | **源码实例** | `sleepiq`、`yeelight`、`sun`、`thread` | `html5`（notify）、`template`（多平台） |
+>
+> `async_load_platform` 的工作原理：发送 `EVENT_LOAD_PLATFORM` dispatcher 信号 → `EntityComponent` 监听到信号 → 调用 `_async_component_platform_discovered` → 最终调用 `async_setup_platform`。它是一个**平台发现机制**，与 ConfigEntry 无关。
+
+#### 10.6.6 当前推荐做法
+
+Home Assistant 社区的趋势是**优先使用 ConfigFlow**，YAML 配置正逐步被淘汰。对于新集成：
+
+1. **推荐**：仅支持 ConfigFlow，使用 `cv.config_entry_only_config_schema(DOMAIN)` 声明不支持 YAML
+2. **兼容**：同时支持 YAML 和 ConfigFlow，YAML 配置通过 `async_step_import` 导入为 ConfigEntry
+3. **不推荐**：仅支持 YAML 配置（新集成不应采用）
+
+```python
+# 仅支持 ConfigFlow（推荐）
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
+
+# 不支持 YAML 配置（manifest.json 中设置 "config_flow": true）
+```
+
+### 10.7 关键实现要点
 
 1. **runtime_data 模式**：使用 `ConfigEntry[MyData]` 泛型，在 `async_setup_entry` 中设置 `entry.runtime_data`，平台通过 `config_entry.runtime_data` 获取，类型安全。
 
@@ -1600,6 +2073,8 @@ class MySensor(CoordinatorEntity, SensorEntity):
 8. **EntityDescription**：将实体属性从子类移到描述对象，支持一个实体类多个实例。
 
 9. **should_poll**：事件驱动集成的实体应设 `_attr_should_poll = False`，通过 `async_write_ha_state()` 主动推送更新。
+
+10. **YAML 与 ConfigFlow 共存**：通过 `SOURCE_IMPORT` 将 YAML 配置导入为 ConfigEntry，统一由 `async_setup_entry` 处理，避免维护两套逻辑。
 
 ---
 

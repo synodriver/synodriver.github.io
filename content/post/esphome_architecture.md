@@ -1625,3 +1625,1126 @@ C++ 侧使用 X-macro 技术消除实体类型相关的重复代码（注册方�
 | `esphome/components/esp32/preferences.cpp` | ESP32 NVS 后端实现 |
 | `esphome/components/esp8266/preferences.cpp` | ESP8266 RTC+Flash 后端实现 |
 | `esphome/components/preferences/syncer.h` | IntervalSyncer 定时同步 |
+
+---
+
+## 十二、StateClass 状态类别体系
+
+### 12.1 概述
+
+`StateClass` 是 ESPHome 传感器（`sensor::Sensor`）的核心属性之一，用于告诉 Home Assistant **该传感器数值的本质类型**——是"瞬时测量值"还是"累积总量"，是"只会增长"还是"可增可减"。这一属性直接影响 Home Assistant 的**长期统计（Long-term Statistics）**行为：哪些传感器会被纳入统计、统计的聚合方式（取均值还是求和）、以及如何处理数值重置。
+
+`StateClass` 的定义位于 `esphome/components/sensor/sensor.h`：
+
+```cpp
+enum StateClass : uint8_t {
+  STATE_CLASS_NONE = 0,
+  STATE_CLASS_MEASUREMENT = 1,
+  STATE_CLASS_TOTAL_INCREASING = 2,
+  STATE_CLASS_TOTAL = 3,
+  STATE_CLASS_MEASUREMENT_ANGLE = 4
+};
+constexpr uint8_t STATE_CLASS_LAST = static_cast<uint8_t>(STATE_CLASS_MEASUREMENT_ANGLE);
+```
+
+### 12.2 历史演变：从 last_reset 到 state_class
+
+在 2021.9 版本之前，Home Assistant 使用 `last_reset` 属性来区分累积量的重置时刻。该机制要求传感器在累积值重置时主动发送 `last_reset` 时间戳，但实践中多数传感器无法提供准确的重置时刻，导致统计数据混乱。
+
+ESPHome 的 `api.proto` 中保留了已废弃的 `SensorLastResetType`（API 版本 1.5 后弃用）：
+
+```protobuf
+// Deprecated in API version 1.5
+enum SensorLastResetType {
+  option deprecated = true;
+  LAST_RESET_NONE = 0;
+  LAST_RESET_NEVER = 1;
+  LAST_RESET_AUTO = 2;
+}
+```
+
+`state_class` 取代了 `last_reset`，将"重置检测"的责任从传感器端转移到 Home Assistant 端——HA 根据 `state_class` 的语义自动判断数值是否发生了重置，无需传感器显式报告。
+
+### 12.3 五种 StateClass 详解
+
+#### STATE_CLASS_NONE（值：0）
+
+**含义**：不声明状态类别。传感器不参与 Home Assistant 的长期统计系统。
+
+**适用场景**：
+- 状态值不是数值，或数值含义模糊、不适合统计聚合
+- 仅关注当前值、无需历史趋势的传感器
+- 用户手动覆盖了组件默认的 state_class，设置为空
+
+**Home Assistant 行为**：不生成长期统计数据。HA 的历史图表仅展示实时状态记录（`short-term statistics` 不生成）。
+
+**典型组件**：大多数未明确设置 `state_class` 的传感器默认为 `NONE`。例如一些文本类型的传感器、调试用的诊断传感器等。
+
+#### STATE_CLASS_MEASUREMENT（值：1）
+
+**含义**：**瞬时测量值**。值代表当前时刻的观测读数，每个读数独立且有意义——今天 25°C 和明天 25°C 是两个独立的测量。
+
+**核心特征**：
+- 值**可增可减**，前后两次读数之间没有严格的单调关系
+- 读数的统计聚合方式为**取均值**（mean）——5 分钟统计周期内所有读数的平均值
+- 两次读数之间可能存在较大的波动（如温度从 30°C 降到 15°C，这不是"重置"）
+
+**Home Assistant 统计行为**：
+| 统计指标 | 计算方式 |
+|----------|----------|
+| mean | 5分钟内所有读数的平均值 |
+| min | 5分钟内最小读数 |
+| max | 5分钟内最大读数 |
+| last | 5分钟内最后一个读数 |
+
+**典型 ESPHome 组件**（使用最多）：
+
+| 组件 | 传感器 | 说明 |
+|------|---------|------|
+| dht | 温度、湿度 | 环境温湿度瞬时读数 |
+| bme280 | 温度、湿度、气压 | 环境测量 |
+| adc | 电压 | ADC 采样瞬时值 |
+| ade7953_base | 电流、电压、功率 | 电力测量 |
+| gps | 速度、海拔 | GPS 瞬时速度/高度 |
+| 各类距离传感器 | 超声波/激光测距 | 瞬时距离读数 |
+
+**YAML 示例**：
+```yaml
+sensor:
+  - platform: dht
+    temperature:
+      name: "Temperature"
+      state_class: measurement    # 温度是瞬时测量值
+```
+
+> 在 ESPHome 源码中，`measurement` 是使用最广泛的 state_class——绝大多数传感器组件（温度、湿度、气压、电压、电流、功率、距离、速度等）都默认使用它。搜索源码中 `state_class=STATE_CLASS_MEASUREMENT` 的出现超过数百处。
+
+#### STATE_CLASS_TOTAL_INCREASING（值：2）
+
+**含义**：**单调递增的累积量**。值代表从某个起点开始的总量，只会增加（或重置后重新增加），永远不会减少。
+
+**核心特征**：
+- 值**只会增加或重置归零**，不会自然减少
+- 两次读数之间的**差值**才是有意义的信息（如每小时消耗了多少电量）
+- 如果读数突然变小，Home Assistant **自动判断为重置**（meter reset），并将该值视为新周期的起点，不当作"减少"
+- 统计聚合方式为**求和**（sum）——5 分钟统计周期内所有增量之和
+
+**Home Assistant 统计行为**：
+| 统计指标 | 计算方式 |
+|----------|----------|
+| sum | 5分钟内增量之和 = Σ(next - prev)，遇到重置时仅计入重置后的值 |
+| last | 5分钟内最后一个读数 |
+
+**重置检测逻辑**：当 HA 发现新读数 < 上一读数时，认为发生了重置（如电表换表、固件重启后计数归零），此时：
+- 不将差值计入 sum（避免负数）
+- 将新读数视为新周期起点
+
+**典型 ESPHome 组件**：
+
+| 组件 | 传感器 | 说明 |
+|------|---------|------|
+| cse7766 | 累计电量 | 电量计单方向累计 |
+| bl0942/bl0940/bl0939/bl0910/bl6552 | 累计电量(kWh) | 各型号电量计 |
+| atm90e26/atm90e32 | 累计电量 | ATM90 系列电量计 |
+| ade7880 | 累计电量 | ADE7880 电量计 |
+| dsmr | 累计电量/气量 | 荷兰智能电表协议 |
+| dlms_meter | 累计电量 | DLMS 协议电量计 |
+| duty_time | 累计运行时间 | 设备累计活跃时长 |
+
+**YAML 示例**：
+```yaml
+sensor:
+  - platform: cse7766
+    energy:
+      name: "Total Energy"
+      state_class: total_increasing    # 电量只会增加或重置归零
+```
+
+> `total_increasing` 主要用于**能源计量**场景——电量(kWh)、气量(m³)等。这些值的物理本质是"只会越用越多"的单向累积量。
+
+#### STATE_CLASS_TOTAL（值：3）
+
+**含义**：**可增可减的累积量**。值代表当前净总量，但总量本身可以减少（如电池充电后又放电）。
+
+**核心特征**：
+- 值**可增可减**——总量本身可能上升或下降
+- 值的变化被视为"真实的总量变化"，而非"重置"
+- 如果读数突然变小，Home Assistant **不会自动判断为重置**——它认为是总量真的减少了
+- 统计聚合方式为**求和**（sum），但含义是"净变化量"而非"消耗量"
+
+**Home Assistant 统计行为**：
+| 统计指标 | 计算方式 |
+|----------|----------|
+| sum | 5分钟内净变化量之和 |
+| last | 5分钟内最后一个读数 |
+
+**与 `total_increasing` 的关键区别**：
+```
+total_increasing:  前值=1000 → 新值=50  → HA 判断为重置，不计负差值
+total:             前值=1000 → 新值=50  → HA 认为总量真的减少了，差值 -950 计入统计
+```
+
+这意味着 `total` 不适合用于"只会增加"的消耗量——如果传感器重启后归零，HA 会将归零视为真实减少，统计数据会出现大幅负值。
+
+**典型 ESPHome 组件**：
+
+| 组件 | 传感器 | 说明 |
+|------|---------|------|
+| duty_time | 上次运行时长(last_time) | 上次激活的持续时间，可被重置 |
+
+**YAML 示例**（duty_time 组件）：
+```yaml
+sensor:
+  - platform: duty_time
+    id: my_duty_time
+    last_time:          # 上次运行时长 — 可被 reset 清零
+      name: "Last Duty Time"
+      state_class: total      # total: 值可增可减，重置不是"归零重计"
+```
+
+> 注意：同一个 duty_time 组件中，**累计运行时间**使用 `total_increasing`（只会增加），而**上次运行时长**使用 `total`（可以被 reset 动作清零后重新计时）。这完美展示了两种 state_class 的语义区别。
+
+> `total` 在 ESPHome 组件中的使用极其罕见——整个源码中仅有 `duty_time` 的 `last_time` 子传感器使用了它。大多数"只会增加"的累积量应该使用 `total_increasing`，而非 `total`。
+
+#### STATE_CLASS_MEASUREMENT_ANGLE（值：4）
+
+**含义**：**角度瞬时测量值**。与 `measurement` 语义相同（瞬时读数），但专门标注为角度值。
+
+**核心特征**：
+- 值是**角度/方位**的瞬时读数（如航向角、经度）
+- 统计聚合方式为**取均值**（mean），与 `measurement` 相同
+- Home Assistant 在处理长期统计时，对角度值采用**环绕均值**（circular mean）算法——例如 350° 和 10° 的均值不是 180°，而是 0°（360°）
+- 当前仅支持**度（degrees）**单位
+
+**Home Assistant 统计行为**：
+| 统计指标 | 计算方式 |
+|----------|----------|
+| mean | 环绕均值（考虑角度的周期性） |
+| min | 5分钟内最小角度 |
+| max | 5分钟内最大角度 |
+
+**环绕均值示意**：
+```
+普通均值:  avg(350°, 10°) = (350 + 10) / 2 = 180°  ← 错误！
+环绕均值: avg(350°, 10°) = 0°                       ← 正确！角度跨越了 360° 周期
+```
+
+**典型 ESPHome 组件**：
+
+| 组件 | 传感器 | 说明 |
+|------|---------|------|
+| gps | 经度(latitude)、航向(course) | GPS 方位/航向角度值 |
+
+**YAML 示例**：
+```yaml
+sensor:
+  - platform: gps
+    latitude:
+      name: "Latitude"
+      state_class: measurement_angle    # 经度是角度测量值
+    course:
+      name: "Course"
+      state_class: measurement_angle    # 航向角是角度测量值
+```
+
+> `measurement_angle` 是 ESPHome 中使用最少的 state_class——仅 `gps` 组件使用了它。这是因为角度值具有周期性（0° = 360°），普通均值会产生荒谬结果，HA 专门为此设计了环绕均值算法。
+
+### 12.4 StateClass 的传输链路
+
+StateClass 从 ESPHome YAML 配置到 Home Assistant 的完整传输路径：
+
+```
+YAML 配置                     Python 侧                      C++ 侧                    API 传输                    Home Assistant
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+state_class: measurement  →  STATE_CLASSES映射              →  Sensor::state_class_    →  SensorStateClass枚举       →  SensorStateClass.MEASUREMENT
+                              "" → NONE                        (uint8_t)                  (Protobuf field 10)          → 长期统计: 取均值
+                              "measurement" → 1                                           → ListEntitiesSensorResponse
+                              "total_increasing" → 2                                       → APIConnection::list_entities
+                              "total" → 3
+                              "measurement_angle" → 4
+```
+
+**Python 侧注册链路**（`sensor/__init__.py`）：
+
+```python
+# YAML → Python 枚举映射
+STATE_CLASSES = {
+    "": StateClasses.STATE_CLASS_NONE,
+    "measurement": StateClasses.STATE_CLASS_MEASUREMENT,
+    "total_increasing": StateClasses.STATE_CLASS_TOTAL_INCREASING,
+    "total": StateClasses.STATE_CLASS_TOTAL,
+    "measurement_angle": StateClasses.STATE_CLASS_MEASUREMENT_ANGLE,
+}
+
+# sensor_schema() 中设置默认 state_class
+def sensor_schema(class_, *, state_class=...):
+    schema[cv.Optional(CONF_STATE_CLASS, default=default)] = validate_state_class
+
+# setup_sensor_core_() 中生成代码
+if (state_class := config.get(CONF_STATE_CLASS)) is not None:
+    cg.add(var.set_state_class(state_class))  # → C++: sensor->set_state_class(STATE_CLASS_MEASUREMENT)
+```
+
+**C++ 侧存储**（`sensor.h`）：
+
+```cpp
+class Sensor : public EntityBase {
+  StateClass state_class_{STATE_CLASS_NONE};  // 默认未设置
+  struct SensorFlags {
+    uint8_t has_state_class_override : 1;     // 位域标记：是否有手动覆盖
+    ...
+  } sensor_flags_{};
+};
+
+// get_state_class()：有覆盖则返回覆盖值，否则返回 NONE
+StateClass Sensor::get_state_class() {
+  if (this->sensor_flags_.has_state_class_override)
+    return this->state_class_;
+  return StateClass::STATE_CLASS_NONE;
+}
+```
+
+**API 传输**（`api_connection.cpp`）：
+
+```cpp
+// 实体发现时将 state_class 编码为 Protobuf 枚举
+msg.state_class = static_cast<enums::SensorStateClass>(sensor->get_state_class());
+```
+
+Protobuf 定义（`api.proto`）：
+
+```protobuf
+enum SensorStateClass {
+  STATE_CLASS_NONE = 0;
+  STATE_CLASS_MEASUREMENT = 1;
+  STATE_CLASS_TOTAL_INCREASING = 2;
+  STATE_CLASS_TOTAL = 3;
+  STATE_CLASS_MEASUREMENT_ANGLE = 4;
+}
+
+message ListEntitiesSensorResponse {
+  ...
+  SensorStateClass state_class = 10;
+  SensorLastResetType legacy_last_reset_type = 11 [deprecated=true];  // API 1.5 后弃用
+  ...
+}
+```
+
+**MQTT 传输**（`mqtt_sensor.cpp`）：
+
+```cpp
+// MQTT 发现消息中包含 state_class 属性
+if (this->sensor_->get_state_class() != STATE_CLASS_NONE) {
+  root[MQTT_STATE_CLASS] = state_class_to_string(this->sensor_->get_state_class());
+}
+```
+
+### 12.5 选择指南：如何为传感器选择正确的 StateClass
+
+```
+                    该传感器的值是什么性质？
+                           │
+                ┌──────────┴──────────┐
+                │                     │
+          瞬时测量值？            累积总量？
+                │                     │
+          ┌─────┴─────┐        ┌─────┴─────┐
+          │           │        │           │
+       一般测量     角度测量   单调递增     可增可减
+          │           │        │           │
+    measurement   measurement_angle  total_increasing   total
+          │           │        │           │
+          │           │        │           │
+      温度/湿度     经度/航向  电量(kWh)   净能量(充-放)
+      气压/电压     方位角     气量(m³)    上次时长
+      电流/功率               水量(L)      (可被reset)
+      距离/速度               运行时间
+```
+
+**决策清单**：
+
+| 问题 | 如果"是" → | 如果"否" → |
+|------|------------|------------|
+| 值代表某个时间点的瞬时读数？ | `measurement` 或 `measurement_angle` | 继续判断 |
+| 值有周期性（0°=360°）？ | `measurement_angle` | `measurement` |
+| 值代表从起点开始的累积量？ | `total_increasing` 或 `total` | `measurement` |
+| 累积量只会增加（或重置归零）？ | `total_increasing` | `total` |
+| 累积量可能自然减少（非重置）？ | `total` | `total_increasing` |
+| 不关心长期统计？ | `none` | 根据以上判断 |
+
+> **常见错误**：将"只会增加"的累积量设为 `total` 而非 `total_increasing`。这会导致传感器重启归零时，HA 将归零视为真实减少，统计数据出现大幅负值。**绝大多数电表、气表等消耗量应该使用 `total_increasing`**。
+
+### 12.6 组件开发中的 StateClass 使用模式
+
+ESPHome 组件开发中，`state_class` 通常通过 `sensor_schema()` 的默认值参数设置，而非要求用户在 YAML 中手动指定：
+
+```python
+# 组件定义传感器 schema 时预设 state_class
+CONFIG_SCHEMA = cv.All(
+    sensor.sensor_schema(
+        DutyTimeSensor,
+        state_class=STATE_CLASS_TOTAL_INCREASING,   # 默认值
+        unit_of_measurement=UNIT_SECOND,
+        device_class=DEVICE_CLASS_DURATION,
+    )
+    .extend(cv.polling_component_schema("60s"))
+)
+```
+
+这遵循了 ESPHome 的设计哲学：**组件开发者根据传感器物理含义设置合理的默认 state_class**，用户通常不需要手动指定。如果用户需要覆盖，YAML 中 `state_class` 是 `Optional` 字段：
+
+```yaml
+sensor:
+  - platform: dht
+    temperature:
+      name: "Room Temperature"
+      state_class: measurement    # 通常无需指定，组件已设默认值
+```
+
+### 12.7 StateClass 在 Home Assistant 中的影响总结
+
+| StateClass | 长期统计 | 聚合方式 | 重置检测 | 适用数值性质 |
+|------------|---------|----------|----------|-------------|
+| NONE | ❌ 不生成 | — | — | 无需统计 |
+| MEASUREMENT | ✅ 生成 | mean/min/max | 无（值的变化都是真实的） | 瞬时测量值 |
+| TOTAL_INCREASING | ✅ 生成 | sum/last | ✅ 自动（值变小=重置） | 单调递增累积量 |
+| TOTAL | ✅ 生成 | sum/last | ❌ 不检测（值的变化都是真实的） | 可增可减累积量 |
+| MEASUREMENT_ANGLE | ✅ 生成 | 环绕mean/min/max | 无 | 角度瞬时测量值 |
+
+### 12.8 关键文件索引
+
+| 文件 | 作用 |
+|------|------|
+| `esphome/components/sensor/sensor.h` | StateClass 枚举定义 + Sensor 类 state_class_ 成员 |
+| `esphome/components/sensor/sensor.cpp` | state_class_to_string() + get/set_state_class() 实现 |
+| `esphome/components/sensor/__init__.py` | STATE_CLASSES 映射表 + validate_state_class + sensor_schema() |
+| `esphome/components/api/api.proto` | SensorStateClass Protobuf 枚举 + ListEntitiesSensorResponse 中的 state_class 字段 |
+| `esphome/components/api/api_connection.cpp` | 实体发现时 state_class 编码传输 |
+| `esphome/components/mqtt/mqtt_sensor.cpp` | MQTT 发现消息中 state_class 属性 |
+| `esphome/components/duty_time/sensor.py` | 唯一使用 STATE_CLASS_TOTAL 的组件（与 TOTAL_INCREASING 对比） |
+| `esphome/components/gps/__init__.py` | 唯一使用 STATE_CLASS_MEASUREMENT_ANGLE 的组件 |
+| `esphome/const.py` | STATE_CLASS_* 常量字符串定义 |
+
+---
+
+## 十三、Dashboard Web UI 架构
+
+### 13.1 概述
+
+ESPHome Dashboard 是一个基于 Tornado 的 Web 服务器，提供图形化的设备管理界面。用户可以通过浏览器完成设备的创建、编辑、编译、上传、日志查看等全流程操作，无需手动在终端执行 CLI 命令。
+
+Dashboard 的核心设计思想是：**Web UI 本身不执行编译/上传等核心逻辑，而是通过子进程调用 `esphome` CLI 命令**。这使得 Web 层和核心编译层完全解耦——Dashboard 负责 HTTP/WebSocket 交互和设备状态展示，CLI 负责实际的配置验证、代码生成和编译。
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                        浏览器                                    │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐           │
+│  │ 设备列表     │  │ YAML编辑器   │  │ 编译/上传    │           │
+│  │ (devices)    │  │ (ace/vscode) │  │ (WebSocket)  │           │
+│  └──────────────┘  └──────────────┘  └──────────────┘           │
+└───────────────────────────────┬──────────────────────────────────┘
+                                │ HTTP / WebSocket
+                                ▼
+┌──────────────────────────────────────────────────────────────────┐
+│                    Tornado Web Server                            │
+│  ┌────────────────────────────────────────────────────────────┐  │
+│  │  make_app() → tornado.web.Application                     │  │
+│  │  ├── REST API 路由 (30+ 个)                               │  │
+│  │  ├── WebSocket 路由                                       │  │
+│  │  │   ├── EsphomeCommandWebSocket (编译/上传/日志等)       │  │
+│  │  │   └── DashboardEventsWebSocket (实时状态推送)          │  │
+│  │  └── 静态文件 (esphome-dashboard npm 包)                  │  │
+│  └────────────────────────────────────────────────────────────┘  │
+│  ┌────────────────────────────────────────────────────────────┐  │
+│  │  ESPHomeDashboard (全局单例 DASHBOARD)                     │  │
+│  │  ├── DashboardEntries (设备列表管理 + 文件变更检测)       │  │
+│  │  ├── EventBus (事件总线 → WebSocket推送)                  │  │
+│  │  ├── MDNSStatus (mDNS 设备发现)                          │  │
+│  │  ├── PingStatus (ICMP ping 设备在线检测)                 │  │
+│  │  ├── MqttStatusThread (MQTT 设备发现，可选)              │  │
+│  │  ├── DNSCache (DNS 解析缓存)                             │  │
+│  │  └── DashboardSettings (认证/配置目录/模式)              │  │
+│  └────────────────────────────────────────────────────────────┘  │
+└───────────────────────────────┬──────────────────────────────────┘
+                                │ subprocess.Popen / tornado.process.Subprocess
+                                ▼
+┌──────────────────────────────────────────────────────────────────┐
+│                    esphome CLI 子进程                             │
+│  python -m esphome --dashboard <command> <config> [--device X]  │
+│                                                                  │
+│  典型调用:                                                       │
+│  • compile  → python -m esphome --dashboard compile my.yaml     │
+│  • run      → python -m esphome --dashboard run my.yaml -d OTA  │
+│  • upload   → python -m esphome --dashboard upload my.yaml -d /dev/ttyUSB0 │
+│  • logs     → python -m esphome --dashboard logs my.yaml -d OTA │
+│  • config   → python -m esphome config my.yaml --show-secrets   │
+│  • clean    → python -m esphome --dashboard clean my.yaml       │
+│  • rename   → python -m esphome --dashboard rename my.yaml newname │
+│  • update-all → python -m esphome --dashboard update-all /config/ │
+│  • vscode  → python -m esphome -q vscode dummy                  │
+│  • vscode --ace → python -m esphome -q vscode --ace /config/    │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+### 13.2 启动流程
+
+Dashboard 的启动入口在 `__main__.py` 的 `command_dashboard()` 函数，最终调用 `dashboard/dashboard.py` 的 `start_dashboard()`：
+
+```
+用户执行: esphome dashboard /path/to/configs/
+    ↓
+__main__.py → command_dashboard(args)
+    ↓
+dashboard/dashboard.py → start_dashboard(args)
+    ↓  1. settings.parse_args(args) — 解析认证/端口/地址等参数
+    ↓  2. 加载 cookie_secret（认证时从 EsphomeStorageJSON 读取）
+    ↓  3. asyncio.set_event_loop_policy(DashboardEventLoopPolicy)
+    ↓
+async_start(args)
+    ↓  1. DASHBOARD.async_setup() — 初始化 DashboardEntries、加载 ignored_devices
+    ↓  2. start_web_server(make_app(), sock, addr, port, config_dir)
+    ↓  3. 可选: webbrowser.open() — 自动打开浏览器
+    ↓
+DASHBOARD.async_run() — 持续运行直到 KeyboardInterrupt
+    ↓  1. entries.async_update_entries() — 首次加载所有 YAML 设备
+    ↓  2. MDNSStatus.async_setup() → mDNS 初始化
+    ↓  3. asyncio.create_task(mdns_status.async_run()) — 启动 mDNS 发现循环
+    ↓  4. 7.5秒后启动 PingStatus — 等 mDNS bootstrap 完成
+    ↓  5. 可选: MqttStatusThread.start() — MQTT 发现线程
+    ↓  6. await asyncio.Event().wait() — 阻塞直到关机信号
+```
+
+**DashboardEventLoopPolicy** 是一个自定义的 asyncio 事件循环策略，灵感来自 Home Assistant：
+- 使用 `PidfdChildWatcher`（Linux）或 `ThreadedChildWatcher`（其他平台）监控子进程
+- `ThreadPoolExecutor` 限制最大 48 个工作线程（`MAX_EXECUTOR_WORKERS`）
+- `loop.time` 直接绑定 `time.monotonic`，减少方法调用开销（此方法是事件循环中调用最频繁的）
+- 自定义异常处理器 `_async_loop_exception_handler`
+
+### 13.3 REST API 路由总览
+
+Dashboard 的所有路由定义在 `make_app()` 函数中（`web_server.py:1570`），以 Tornado 的路由表形式注册。所有路径前缀可通过 `ESPHOME_DASHBOARD_RELATIVE_URL` 环境变量自定义（默认 `/`）。
+
+#### 13.3.1 页面路由
+
+| 路径 | Handler | 方法 | 说明 |
+|------|---------|------|------|
+| `/` | MainRequestHandler | GET | 主页面，渲染 `index.template.html` |
+| `/login` | LoginHandler | GET/POST | 登录页面（认证时） |
+| `/logout` | LogoutHandler | GET | 登出，清除认证 cookie |
+
+#### 13.3.2 设备管理 API
+
+| 路径 | Handler | 方法 | 说明 |
+|------|---------|------|------|
+| `/devices` | ListDevicesHandler | GET | 返回所有已配置和可导入设备的 JSON 列表 |
+| `/info` | InfoRequestHandler | GET | 返回指定设备的 StorageJSON 信息（配置、版本等） |
+| `/edit` | EditRequestHandler | GET/POST | GET：读取 YAML 文件内容；POST：写入 YAML 文件内容 |
+| `/delete` / `/archive` | ArchiveRequestHandler | POST | 将设备配置移至 archive 目录 |
+| `/undo-delete` / `/unarchive` | UnArchiveRequestHandler | POST | 从 archive 目录恢复设备配置 |
+| `/rename` | EsphomeRenameHandler | WS | 重命名设备（修改 YAML + 重新编译上传） |
+| `/wizard` | WizardRequestHandler | POST | 创建新设备配置（basic/upload/empty 三种模式） |
+| `/import` | ImportRequestHandler | POST | 导入发现的设备（从 mDNS 或项目链接） |
+| `/ignore-device` | IgnoreDeviceRequestHandler | POST | 忽略/取消忽略可导入设备 |
+
+#### 13.3.3 编译与上传 WebSocket
+
+| 路径 | Handler | 类型 | 实际 CLI 命令 |
+|------|---------|------|---------------|
+| `/compile` | EsphomeCompileHandler | WS | `esphome --dashboard compile <yaml>` |
+| `/upload` | EsphomeUploadHandler | WS | `esphome --dashboard upload <yaml> --device <port>` |
+| `/run` | EsphomeRunHandler | WS | `esphome --dashboard run <yaml> --device <port>` |
+| `/logs` | EsphomeLogsHandler | WS | `esphome --dashboard logs <yaml> --device <port>` |
+| `/validate` | EsphomeValidateHandler | WS | `esphome config <yaml> [--show-secrets]` |
+| `/clean` | EsphomeCleanHandler | WS | `esphome --dashboard clean <yaml>` |
+| `/clean-mqtt` | EsphomeCleanMqttHandler | WS | `esphome --dashboard clean-mqtt <yaml>` |
+| `/clean-all` | EsphomeCleanAllHandler | WS | `esphome --dashboard clean-all [config_dir]` |
+| `/update-all` | EsphomeUpdateAllHandler | WS | `esphome --dashboard update-all <config_dir>` |
+| `/vscode` | EsphomeVscodeHandler | WS | `esphome -q vscode dummy` |
+| `/ace` | EsphomeAceEditorHandler | WS | `esphome -q vscode --ace <config_dir>` |
+
+> `/vscode` 和 `/ace` 两个端点并非真正的 VSCode 启动，而是调用 `esphome vscode` 命令生成**验证/补全数据**——前端 Ace Editor 或 VSCode 使用这些数据提供 YAML 语法验证和自动补全。
+
+#### 13.3.4 下载与查询 API
+
+| 路径 | Handler | 方法 | 说明 |
+|------|---------|------|------|
+| `/downloads` | DownloadListRequestHandler | GET | 获取指定设备的可下载文件类型列表（固件、分区表等） |
+| `/download.bin` | DownloadBinaryRequestHandler | GET | 下载指定设备的固件/分区表等二进制文件，支持 gzip 压缩 |
+| `/serial-ports` | SerialPortRequestHandler | GET | 返回可用串口列表（含 OTA 虚拟端口） |
+| `/ping` | PingRequestHandler | GET | 触发 ping 检查，返回各设备在线状态 |
+| `/version` | EsphomeVersionHandler | GET | 返回 ESPHome 版本号 |
+| `/secret_keys` | SecretKeysRequestHandler | GET | 返回 secrets.yaml 中定义的密钥名列表 |
+| `/json-config` | JsonConfigRequestHandler | GET | 调用 CLI 解析 YAML 并返回 JSON 格式配置 |
+| `/boards/<platform>` | BoardsRequestHandler | GET | 返回指定平台（esp32/esp8266/rp2040 等）的开发板列表 |
+| `/prometheus-sd` | PrometheusServiceDiscoveryHandler | GET | 返回 Prometheus 服务发现格式的设备列表 |
+| `/events` | DashboardEventsWebSocket | WS | 实时事件推送 WebSocket |
+
+#### 13.3.5 静态资源
+
+| 路径 | Handler | 说明 |
+|------|---------|------|
+| `/static/(.*)` | StaticFileHandler | 前端静态文件（JS/CSS/图标），来自 `esphome-dashboard` npm 包 |
+
+> 前端静态文件由独立 npm 包 `esphome-dashboard`（版本 `20260425.0`）提供。Dashboard 通过 `import esphome_dashboard; esphome_dashboard.where()` 获取包路径。开发模式下通过 `ESPHOME_DASHBOARD_DEV` 环境变量指向本地前端项目。
+
+### 13.4 WebSocket 通信机制
+
+Dashboard 使用两种 WebSocket 机制：**命令型 WebSocket** 和 **事件型 WebSocket**。
+
+#### 13.4.1 命令型 WebSocket — EsphomeCommandWebSocket
+
+所有编译/上传/日志等操作都通过命令型 WebSocket 完成。核心设计是 **子进程 stdout 实时流式转发到浏览器**：
+
+```
+浏览器                         Dashboard                     CLI 子进程
+─────────────────────────────────────────────────────────────────────
+1. 连接 WebSocket
+   ws://host/compile
+                                      ↓
+2. 发送 JSON: {"type":"spawn",       ↓
+   "configuration":"my.yaml"}        ↓
+                                      ↓  build_command() 构造命令
+                                      ↓  ["python", "-m", "esphome",
+                                      ↓   "--dashboard", "compile",
+                                      ↓   "my.yaml"]
+                                      ↓
+                                      ↓  subprocess.Popen() 或
+                                      ↓  tornado.process.Subprocess()
+                                      ↓
+3. 接收 stdout 行:                    ↓  子进程输出 stdout ──────→ _redirect_stdout()
+   {"event":"line",                   ↓                          ↓ 解码
+    "data":"Compiling...\n"}          ↓                          ↓ write_message()
+                                      ↓                          ↓
+4. 接收更多行...                      ↓                          ↓ (持续流式转发)
+                                      ↓                          ↓
+5. 可选: 发送 stdin                   ↓                          ↓
+   {"type":"stdin",                   ↓                          ↓ → proc.stdin.write()
+    "data":"yes\n"}                   ↓                          ↓   (交互式命令如 OTA 确认)
+                                      ↓                          ↓
+6. 接收退出:                          ↓                          ↓
+   {"event":"exit",                   ↓  _proc_on_exit(returncode)
+    "code":0}                         ↓  → write_message() → close()
+                                      ↓
+7. WebSocket 关闭                     ↓  terminate() 子进程
+```
+
+**关键设计细节**：
+
+1. **双模式子进程**：Windows 使用 `subprocess.Popen` + 读取线程（因 Windows 不支持非阻塞管道），Linux/macOS 使用 `tornado.process.Subprocess`（异步 I/O）
+
+```python
+# Windows: Popen + 独立线程逐字节读取 stdout
+if self._use_popen:  # os.name == "nt"
+    self._proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    stdout_thread = threading.Thread(target=self._stdout_thread)
+    stdout_thread.daemon = True
+    stdout_thread.start()
+
+# Linux/macOS: Tornado 异步 Subprocess
+else:
+    self._proc = tornado.process.Subprocess(command, stdout=Subprocess.STREAM, stderr=subprocess.STDOUT)
+    self._proc.set_exit_callback(self._proc_on_exit)
+```
+
+2. **stdout 线性转发**：使用 `read_until_regex(b"[\n\r]")` 逐行读取，每读到一行就立即 `write_message({"event":"line","data":text})` 发送给浏览器
+
+3. **set_nodelay(True)**：WebSocket 连接建立时立即启用 TCP_NODELAY，避免 200-500ms 的发送延迟
+
+4. **stdin 交互**：浏览器可通过 `{"type":"stdin","data":"text"}` 发送数据到子进程 stdin，用于交互式确认（如 OTA 时的 Yes/No 提示）
+
+5. **`--dashboard` 标志**：所有通过 Dashboard 调用的 CLI 命令都附加 `--dashboard` 参数。这影响 `__main__.py` 中的行为：设置 `CORE.dashboard = True`，在设备地址无法解析时提供不同提示信息
+
+#### 13.4.2 设备端口命令 — EsphomePortCommandWebSocket
+
+`logs`、`upload`、`run` 三个端点继承 `EsphomePortCommandWebSocket`，需要额外的 `--device <port>` 参数。这类命令还实现了**地址缓存传递**机制：
+
+```python
+class EsphomePortCommandWebSocket(EsphomeCommandWebSocket):
+    async def build_device_command(self, args, json_message):
+        configuration = json_message["configuration"]
+        port = json_message["port"]
+
+        # 仅 OTA 模式 + 设备有 api 集成时，传递地址缓存
+        cache_args = []
+        if port == "OTA" and entry and "api" in entry.loaded_integrations:
+            cache_args = build_cache_arguments(entry, dashboard, time.monotonic())
+
+        # 缓存参数必须放在子命令之前
+        cmd = [*DASHBOARD_COMMAND, *cache_args, *args, config_file, "--device", port]
+        return cmd
+```
+
+`build_cache_arguments()` 将 Dashboard 已知的 mDNS/DNS 解析结果作为 CLI 参数传递：
+
+```bash
+# 示例：传递 mDNS 缓存地址
+python -m esphome --dashboard --mdns-address-cache mydevice.local=192.168.1.100 upload my.yaml --device OTA
+```
+
+这解决了 Dashboard 环境中 mDNS 解析可能延迟的问题——Dashboard 已经通过 mDNS/DNS 发现了设备 IP，直接传递给 CLI 子进程，避免 CLI 重新做 mDNS 发现。
+
+#### 13.4.3 事件型 WebSocket — DashboardEventsWebSocket
+
+`/events` WebSocket 提供**实时设备状态推送**，采用订阅-发布模式：
+
+```
+浏览器                         Dashboard                     后台检测
+─────────────────────────────────────────────────────────────────────
+1. 连接 ws://host/events
+                                      ↓
+                                      ↓  await entries.async_request_update_entries()
+                                      ↓  _send_initial_state()
+                                      ↓
+2. 接收初始状态:                      ↓
+   {"event":"initial_state",          ↓
+    "data":{"devices":[...],          ↓  ← build_device_list_response()
+           "ping":{"my.yaml":true}}}  ↓  ← entry_state_to_bool()
+                                      ↓
+                                      ↓  _subscribe_to_events()
+                                      ↓  注册6个事件监听器
+                                      ↓  DASHBOARD_SUBSCRIBER.subscribe(self)
+                                      ↓
+                                      ↓  DashboardSubscriber._event_loop()
+                                      ↓  每2秒:
+                                      ↓    dashboard.ping_request.set() → PingStatus
+                                      ↓    每10秒: entries.async_request_update_entries()
+                                      ↓
+3. 接收状态变更:                      ↓  PingStatus → entry.state = ONLINE
+   {"event":"entry_state_changed",    ↓  → bus.async_fire(ENTRY_STATE_CHANGED)
+    "data":{"filename":"my.yaml",     ↓  → WebSocket write_message()
+    "name":"mydevice",                ↓
+    "state":true}}                    ↓
+                                      ↓
+4. 接收设备添加:                      ↓  文件系统出现新 YAML →
+   {"event":"entry_added",            ↓  entries.async_update_entries()
+    "data":{"device":{...}}}          ↓  → bus.async_fire(ENTRY_ADDED)
+                                      ↓
+5. 客户端发送心跳:                    ↓
+   {"event":"ping"}                   ↓  → 响应 {"event":"pong"}
+                                      ↓
+6. 客户端请求刷新:                    ↓
+   {"event":"refresh"}                ↓  → DASHBOARD_SUBSCRIBER.request_refresh()
+                                      ↓  → 立即触发下一次轮询
+```
+
+**DashboardSubscriber 生命周期管理**：
+
+```python
+class DashboardSubscriber:
+    _subscribers: set[DashboardEventsWebSocket] = set()
+    _event_loop_task: asyncio.Task | None = None
+
+    def subscribe(self, subscriber):
+        self._subscribers.add(subscriber)
+        if not self._event_loop_task or self._event_loop_task.done():
+            # 第一个订阅者加入时启动轮询循环
+            self._event_loop_task = asyncio.create_task(self._event_loop())
+        return partial(self._unsubscribe, subscriber)
+
+    def _unsubscribe(self, subscriber):
+        self._subscribers.discard(subscriber)
+        if not self._subscribers and self._event_loop_task:
+            # 所有订阅者离开时停止轮询循环
+            self._event_loop_task.cancel()
+```
+
+这种设计实现了**按需轮询**——只有浏览器打开时才执行 ping/mDNS 检查，浏览器关闭后自动停止，节省系统资源。
+
+**事件类型**（定义在 `const.py:DashboardEvent`）：
+
+| 事件方向 | 事件名 | 说明 |
+|----------|--------|------|
+| Server → Client | `initial_state` | 连接时发送完整设备列表和在线状态 |
+| Server → Client | `entry_state_changed` | 设备在线状态变更 |
+| Server → Client | `entry_added` | 新设备配置文件被发现 |
+| Server → Client | `entry_removed` | 设备配置文件被删除 |
+| Server → Client | `entry_updated` | 设备配置文件被修改 |
+| Server → Client | `importable_device_added` | 发现可导入的新设备（mDNS 发现） |
+| Server → Client | `importable_device_removed` | 可导入设备消失 |
+| Server → Client | `pong` | 心跳响应 |
+| Client → Server | `ping` | 心跳请求 |
+| Client → Server | `refresh` | 请求立即刷新设备状态 |
+
+### 13.5 设备发现与在线检测
+
+Dashboard 通过**三级优先级**检测设备是否在线：
+
+```
+优先级（从高到低）:
+  ┌─────────────────────────────────────────────────────────┐
+  │  1. mDNS (MDNSStatus)                                   │
+  │     最快且最准确 — 监听 _esphomelib._tcp.local 服务     │
+  │     如果 mDNS 发现设备在线 → 直接设为 ONLINE            │
+  │     如果 mDNS 发现设备离线 → 仅在来源为 mDNS 时更新     │
+  ├─────────────────────────────────────────────────────────┤
+  │  2. MQTT (MqttStatusThread, 可选)                        │
+  │     通过 esphome/discover/# topic 发现设备               │
+  │     优先级低于 mDNS — 不覆盖 mDNS 的在线判定            │
+  │     可覆盖 mDNS 的离线判定（如果 MQTT 发现设备在线）    │
+  ├─────────────────────────────────────────────────────────┤
+  │  3. ICMP Ping (PingStatus)                              │
+  │     最底层 — 用 icmplib 发送 ICMP ping                   │
+  │     如果 ping 成功 → 设为 ONLINE（覆盖任何来源）        │
+  │     如果 ping 失败 → 仅在来源为 ping/unknown 时设离线   │
+  │     DNS 解析失败 → 标记为 DNS_FAILURE                    │
+  └─────────────────────────────────────────────────────────┘
+
+状态来源标记 (EntryStateSource):
+  MDNS  → mDNS 发现
+  PING  → ICMP ping
+  MQTT  → MQTT 发现
+  UNKNOWN → 初始状态
+
+可达状态 (ReachableState):
+  ONLINE        → 设备在线
+  OFFLINE       → 设备离线
+  DNS_FAILURE   → DNS 解析失败（地址无法解析为 IP）
+  UNKNOWN       → 初始/未知状态
+```
+
+**mDNS 发现服务**（`MDNSStatus`）：
+- 使用 `zeroconf` 库监听 `_esphomelib._tcp.local` 服务
+- `DashboardBrowser` 同时注册两个回调：`DashboardStatus`（设备在线/离线）和 `DashboardImportDiscovery`（发现可导入设备）
+- 可导入设备信息包含 `project_name`、`package_import_url` 等，前端据此生成"Adopt"按钮
+
+**ICMP Ping 检测**（`PingStatus`）：
+- 使用 `icmplib.async_ping()` 异步 ping
+- 优先尝试 `privileged=True`（原始 socket），失败后回退 `privileged=False`
+- 按批次 ping（`GROUP_SIZE = MAX_EXECUTOR_WORKERS / 2 = 24`），避免并发过大
+- 最低 ping 间隔 5 秒（`MIN_PING_INTERVAL`）
+- ping 失败 + DNS 解析失败 → `DNS_FAILURE` 状态（区分"真的离线"和"域名解析不了"）
+
+**DNS 缓存**（`DNSCache`）：
+- TTL 120 秒
+- 对 `.local` 地址解析失败时，尝试去掉 `.local` 后缀作为回退（某些系统 mDNS 不工作但单播 DNS 可工作）
+
+**设备导入发现**：
+
+mDNS 服务发现的可导入设备包含项目信息（如 ESPHome 项目模板链接），前端可以一键"Adopt"导入：
+
+```python
+# DiscoveredImport 数据结构
+@dataclass
+class DiscoveredImport:
+    device_name: str
+    friendly_name: str
+    package_import_url: str    # 项目模板 URL
+    project_name: str          # 如 "esphome.bluetooth-proxy"
+    project_version: str
+    network: str               # wifi / ethernet
+```
+
+### 13.6 认证机制
+
+Dashboard 支持三种认证模式：
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  1. 无认证 (默认)                                               │
+│     --username 和 --password 均空                              │
+│     is_authenticated() 直接返回 True                           │
+│     清除 _xsrf cookie（不需要 CSRF 保护）                      │
+├─────────────────────────────────────────────────────────────────┤
+│  2. 本地认证 (--username/--password)                           │
+│     密码使用 PBKDF2-HMAC-SHA512 哈希存储                       │
+│     cookie_secret 从 EsphomeStorageJSON 自动加载              │
+│     支持 Basic Auth (Authorization header) 和 Cookie 认证     │
+│     hmac.compare_digest() 防止时序攻击                        │
+│     XSRF cookie 保护 POST 请求                                │
+├─────────────────────────────────────────────────────────────────┤
+│  3. Home Assistant Addon 认证 (--ha-addon)                     │
+│     X-HA-Ingress: YES 头 → 自动认证（HA ingress 端口）       │
+│     非 ingress 端口 → 调用 Supervisor /auth API               │
+│     可通过 DISABLE_HA_AUTHENTICATION 环境变量禁用 HA 认证     │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+`authenticated` 装饰器和 `is_authenticated()` 函数的工作流程：
+
+```python
+def is_authenticated(handler):
+    # HA Addon ingress: X-HA-Ingress == "YES" → 直接通过
+    if settings.on_ha_addon:
+        header = handler.request.headers.get("X-HA-Ingress", "NO")
+        if str(header) == "YES":
+            return True
+
+    # 认证模式: 检查 Basic Auth 或 Cookie
+    if settings.using_auth:
+        if auth_header := handler.request.headers.get("Authorization"):
+            # Basic Auth: base64(username:password)
+            return settings.check_password(username, password)
+        # Cookie: AUTH_COOKIE_NAME == "yes"
+        return handler.get_secure_cookie(AUTH_COOKIE_NAME) == COOKIE_AUTHENTICATED_YES
+
+    # 无认证模式: 直接通过
+    return True
+```
+
+### 13.7 设备列表管理 — DashboardEntries
+
+`DashboardEntries` 是设备列表的核心管理类，负责从配置目录扫描 YAML 文件并维护设备状态：
+
+```python
+class DashboardEntries:
+    _entries: dict[Path, DashboardEntry]  # 文件路径 → 设备条目
+    _name_to_entry: dict[str, set[DashboardEntry]]  # 设备名 → 条目（支持重名）
+    _update_lock: asyncio.Lock  # 防止并发更新
+
+    async def async_update_entries(self):
+        async with self._update_lock:
+            # 1. 扫描配置目录中所有 .yaml/.yml 文件
+            path_to_cache_key = self._get_path_to_cache_key()
+
+            # 2. 计算 cache_key = (inode, device, mtime, size)
+            #    仅 stat() 调用，不读取文件内容 → 大多数情况下缓存命中
+
+            # 3. 比较新旧 cache_key，判断增/删/改
+            #    cache_key 变化 → 调用 entry.load_from_disk() 从 StorageJSON 加载
+
+            # 4. 触发事件: ENTRY_ADDED / ENTRY_REMOVED / ENTRY_UPDATED
+            bus.async_fire(DashboardEvent.ENTRY_ADDED, {"entry": entry})
+```
+
+**缓存键设计**：
+
+```python
+def _get_path_to_cache_key(self):
+    for file in util.list_yaml_files([self._config_dir]):
+        # 优先从 StorageJSON 文件获取 stat（比 YAML 更准确）
+        stat = ext_storage_path(file.name).stat()
+        # cache_key = (inode, device, mtime, size)
+        # inode+device 保证文件身份，mtime+size 保证内容变化
+        path_to_cache_key[file] = (stat.st_ino, stat.st_dev, stat.st_mtime, stat.st_size)
+```
+
+这种设计避免每次轮询都读取 YAML 文件内容——仅通过 `stat()` 检查文件是否变化，在绝大多数情况下（文件未修改）是缓存命中，零 I/O 开销。
+
+**DashboardEntry** 数据结构：
+
+```python
+@dataclass
+class DashboardEntry:
+    path: Path                    # YAML 文件完整路径
+    filename: str                 # 如 "mydevice.yaml"
+    storage: StorageJSON | None   # 从 StorageJSON 加载的元数据
+    state: EntryState             # 设备在线状态 (ONLINE/OFFLINE/DNS_FAILURE/UNKNOWN)
+
+    # 从 storage 派生的属性:
+    name: str                     # 设备名 (如 "mydevice")
+    friendly_name: str            # 用户友好名
+    address: str | None           # 设备地址 (IP/mDNS)
+    target_platform: str | None   # 目标平台 (ESP32/ESP8266/RP2040 等)
+    loaded_integrations: set[str] # 已加载的集成列表
+    update_available: bool        # 是否有可用更新 (部署版本 ≠ 当前版本)
+```
+
+### 13.8 YAML 编辑机制
+
+Dashboard 支持两种 YAML 编辑模式：
+
+#### Ace Editor（内嵌编辑器）
+
+```
+浏览器 → /ace WebSocket
+         → EsphomeAceEditorHandler
+         → esphome -q vscode --ace <config_dir>
+         → CLI 生成验证/补全数据 (stdin/stdout JSON 协议)
+         → 实时流式返回验证结果和自动补全建议
+```
+
+Ace Editor 的验证和补全数据通过 `esphome vscode --ace` 命令生成。该命令在 `__main__.py` 中以 stdin/stdout JSON 协议运行，为前端提供：
+- YAML schema 验证（标记错误位置）
+- 自动补全建议（可用组件、选项名等）
+
+#### VSCode 编辑器（外部）
+
+```
+浏览器 → /vscode WebSocket
+         → EsphomeVscodeHandler
+         → esphome -q vscode dummy
+         → CLI 生成 IDE 数据
+```
+
+此端点用于生成 VSCode 集成所需的配置数据（`idedata`），并非真正启动 VSCode。
+
+#### 文件读写 API
+
+```
+读取: GET /edit?configuration=my.yaml → 返回 YAML 文件原始文本
+写入: POST /edit?configuration=my.yaml → 写入浏览器提交的 YAML 内容
+      → write_file(filename, request.body)
+      → DASHBOARD.entries.async_schedule_storage_json_update(filename)
+        → 后台任务: esphome compile --only-generate <filename>
+```
+
+写入 YAML 后，Dashboard 自动调度一个后台任务执行 `esphome compile --only-generate`，更新 StorageJSON（设备元数据缓存），确保设备列表显示的信息（平台、集成列表等）是最新的。
+
+### 13.9 设备创建 — Wizard 与 Import
+
+#### Wizard（配置向导）
+
+`/wizard` POST 端点支持三种创建模式：
+
+| 模式 | 说明 | 生成的配置 |
+|------|------|------------|
+| `basic` | 传统 4 步向导 | 基础 WiFi + OTA + API 配置，自动生成 OTA 密码和 Noise PSK |
+| `upload` | 上传已有 YAML | 用户上传的 YAML 文件内容（Base64 编码） |
+| `empty` | 空配置 | 仅包含 `esphome:` 和 `name:` 的空壳 |
+
+```python
+# basic 模式自动生成的安全凭据
+kwargs["ota_password"] = secrets.token_hex(16)           # 32字符随机 OTA 密码
+noise_psk = secrets.token_bytes(32)                       # 32字节 Noise PSK
+kwargs["api_encryption_key"] = base64.b64encode(noise_psk).decode()  # Base64 编码
+```
+
+#### Import（设备导入）
+
+`/import` POST 端点用于导入 mDNS 发现的可导入设备（Adopt 功能）：
+
+```python
+# 导入流程
+1. 从 dashboard.import_result 查找发现的设备信息
+2. 获取 project_name 和 package_import_url（如 GitHub 上的模板 YAML）
+3. import_config() 生成配置文件，包含:
+   - 基础设备配置
+   - external_components 引用（指向项目模板 URL）
+   - WiFi 配置（从 mDNS 发现的网络类型推导）
+4. dashboard.ping_request.set() → 立即检查设备在线状态
+```
+
+### 13.10 固件下载机制
+
+#### 下载类型列表 — `/downloads`
+
+返回设备可下载的文件类型（不同平台提供不同类型）：
+
+```python
+# ESP32 平台的下载类型 (示例)
+[
+  {"type": "firmware", "name": "firmware.bin"},
+  {"type": "factory", "name": "firmware.factory.bin"},
+  {"type": "ota", "name": "firmware.ota.bin"},
+  {"type": "partition_table", "name": "partition-table.bin"},
+  {"type": "bootloader", "name": "bootloader.bin"},
+]
+```
+
+每个平台通过 `get_download_types(storage_json)` 函数提供自己的下载类型列表。
+
+#### 二进制文件下载 — `/download.bin`
+
+```python
+# 请求参数
+?type=firmware       # 下载类型（旧参数名，兼容）
+&file=firmware.bin   # 文件名（新参数名，优先）
+&download=mydevice-firmware  # 下载时文件名
+&compressed=1        # gzip 压缩（减少传输大小）
+
+# 工作流程
+1. 加载 StorageJSON → 获取 firmware_bin_path（构建目录）
+2. 在构建目录中查找请求的文件
+3. 如果文件不在构建目录 → 调用 esphome idedata 获取分区表路径
+4. 路径安全检查: path.relative_to(base_dir) → 防止目录穿越攻击
+5. 读取文件内容，可选 gzip 压缩
+6. 设置 Content-Disposition: attachment; filename="..."
+```
+
+### 13.11 Prometheus 服务发现
+
+`/prometheus-sd` 端点提供 Prometheus HTTP Service Discovery 格式的设备列表：
+
+```json
+[
+  {
+    "targets": ["192.168.1.100:80"],
+    "labels": {
+      "__meta_name": "mydevice",
+      "__meta_esp_platform": "ESP32",
+      "__meta_esphome_version": "2026.6.0",
+      "__meta_integration_api": "true",
+      "__meta_integration_wifi": "true"
+    }
+  }
+]
+```
+
+仅包含配置了 Web Server（`entry.web_port` 不为 None）的设备。
+
+### 13.12 前端架构
+
+前端由独立 npm 包 `esphome-dashboard` 提供（版本 `20260425.0`），打包为静态资源：
+
+```
+esphome_dashboard/
+├── static/
+│   ├── js/esphome/
+│   │   ├── index.js          # 入口文件（生产环境使用带 hash 的文件名）
+│   │   └── ...               # 其他 JS 模块
+│   ├── css/                  # 样式文件
+│   └── fonts/                # 字体/图标
+├── index.template.html       # 主页面模板
+└── login.template.html       # 登录页面模板
+```
+
+**静态文件 URL 生成**：
+
+```python
+# 生产环境: 文件名 + MD5 hash → 缓存控制
+def get_static_file_url(name):
+    base = f"./static/{name}"
+    path = get_static_path(name)
+    hash_ = hashlib.md5(path.read_bytes()).hexdigest()[:8]
+    return f"{base}?hash={hash_}"    # 如 ./static/js/esphome/index-abc12345.js?hash=deadbeef
+
+# 开发环境: 直接引用原始文件名，无缓存
+if ENV_DEV in os.environ:
+    return base                      # 如 ./static/js/esphome/index.js
+```
+
+Tornado 的 `StaticFileHandler` 自定义了缓存策略：
+- 开发模式：缓存时间 0（每次重新加载）
+- 生产模式：含 `hash` 参数或 JavaScript 文件 → `CACHE_MAX_AGE`（长期缓存）；其他 → 默认缓存时间
+
+### 13.13 设计亮点总结
+
+1. **Web 层零核心逻辑**：Dashboard 不包含任何编译/代码生成逻辑，全部委托给 CLI 子进程。Web 层仅处理 HTTP 交互和状态展示，核心功能保持 CLI 可用
+
+2. **子进程 stdout 流式转发**：编译/上传/日志等操作的输出通过 WebSocket 实时逐行转发到浏览器，用户体验接近终端
+
+3. **三级设备发现优先级**：mDNS（最快最准） > MQTT（可选） > Ping（兜底），各级之间不互相覆盖在线判定
+
+4. **按需轮询**：DashboardSubscriber 仅在有浏览器连接时才执行 ping/mDNS 检查，无连接时自动停止
+
+5. **缓存键 stat() 而非 read()**：设备列表更新仅检查文件 stat 信息（inode/mtime/size），避免每次轮询读取 YAML 内容
+
+6. **地址缓存传递**：Dashboard 已知的 mDNS/DNS 地址直接作为 CLI 参数传递，避免 CLI 子进程重复做 mDNS 发现
+
+7. **stdin 交互**：浏览器可通过 WebSocket stdin 消息与 CLI 子进程交互（如 OTA 确认），实现终端级交互体验
+
+8. **Windows 兼容**：Windows 使用 `subprocess.Popen` + 独立读取线程代替 Tornado 异步 Subprocess（因 Windows 不支持非阻塞管道）
+
+9. **路径安全**：`settings.rel_path()` 严格检查路径必须在配置目录内，`DownloadBinaryRequestHandler` 检查下载路径必须在构建目录内
+
+10. **两种 YAML 编辑模式**：内嵌 Ace Editor（通过 `vscode --ace` 获取验证/补全数据）和文件读写 API（直接 GET/POST YAML 内容）
+
+### 13.14 关键文件索引
+
+| 文件 | 作用 |
+|------|------|
+| `esphome/dashboard/dashboard.py` | Dashboard 启动入口、事件循环策略 |
+| `esphome/dashboard/web_server.py` | Tornado 路由定义、所有 Handler 实现（1646行，核心文件） |
+| `esphome/dashboard/core.py` | ESPHomeDashboard 全局单例、EventBus |
+| `esphome/dashboard/entries.py` | DashboardEntries 设备列表管理、DashboardEntry 数据结构 |
+| `esphome/dashboard/const.py` | DashboardEvent 枚举、DASHBOARD_COMMAND 常量 |
+| `esphome/dashboard/settings.py` | DashboardSettings（认证、配置目录、模式） |
+| `esphome/dashboard/models.py` | 数据模型（DeviceListResponse、ImportableDeviceDict） |
+| `esphome/dashboard/dns.py` | DNSCache（TTL 120秒、.local 回退解析） |
+| `esphome/dashboard/status/mdns.py` | MDNSStatus（zeroconf mDNS 发现） |
+| `esphome/dashboard/status/ping.py` | PingStatus（icmplib ICMP ping 检测） |
+| `esphome/dashboard/status/mqtt.py` | MqttStatusThread（MQTT 设备发现） |
+| `esphome/dashboard/util/subprocess.py` | async_run_system_command（异步 CLI 调用） |
+| `esphome/dashboard/util/password.py` | password_hash（PBKDF2-HMAC-SHA512） |
+| `esphome/__main__.py` | CLI dashboard 命令定义、--dashboard 参数处理 |
+| `esphome/storage_json.py` | StorageJSON 设备元数据存储格式 |
