@@ -3056,7 +3056,10 @@ async def to_code(config):
 #pragma once
 
 #include "esphome/core/component.h"
+#include "esphome/core/defines.h"
+#ifdef USE_SENSOR
 #include "esphome/components/sensor/sensor.h"
+#endif
 #include "esphome/components/uart/uart.h"
 
 namespace esphome::my_sensor {
@@ -3240,16 +3243,22 @@ async def to_code(config):
 ```cpp
 #pragma once
 #include "esphome/core/component.h"
+#include "esphome/core/defines.h"
 #include "esphome/core/hal.h"
+#ifdef USE_SENSOR
 #include "esphome/components/sensor/sensor.h"
+#endif
 
 namespace esphome::my_env_sensor {
 
 class MyEnvSensorComponent : public PollingComponent {
+#ifdef USE_SENSOR
+  SUB_SENSOR(temperature)    // ← 替代手动编写的成员指针 + setter
+  SUB_SENSOR(humidity)       // ← 替代手动编写的成员指针 + setter
+#endif
+
  public:
   void set_pin(InternalGPIOPin *pin) { pin_ = pin; }
-  void set_temperature_sensor(sensor::Sensor *sens) { temperature_sensor_ = sens; }
-  void set_humidity_sensor(sensor::Sensor *sens) { humidity_sensor_ = sens; }
 
   void setup() override;
   void update() override;
@@ -3257,8 +3266,7 @@ class MyEnvSensorComponent : public PollingComponent {
 
  protected:
   InternalGPIOPin *pin_;
-  sensor::Sensor *temperature_sensor_{nullptr};   // ← 子传感器指针
-  sensor::Sensor *humidity_sensor_{nullptr};       // ← 子传感器指针
+  bool read_sensor_(float *temperature, float *humidity);
 };
 
 }  // namespace esphome::my_env_sensor
@@ -3283,7 +3291,7 @@ void MyEnvSensorComponent::update() {
   }
   this->status_clear_warning();
 
-  // ← 通过子传感器指针发布数据
+  // ← 通过 SUB_SENSOR 生成的成员名访问子实体
   if (temperature_sensor_ != nullptr)
     temperature_sensor_->publish_state(temperature);
   if (humidity_sensor_ != nullptr)
@@ -3314,14 +3322,6 @@ sensor:
 > **模式 B 的关键区别**：主组件类**不继承** `sensor::Sensor`。它是一个纯粹的 `Component`（或 `PollingComponent`），通过 `sensor::Sensor *` 指针持有子传感器。子传感器由 `sensor.new_sensor()` 创建并注册，主组件只负责硬件通信和数据分发。
 
 > **为什么 `__init__.py` 留空**：ESPHome 的 `loader.py` 加载组件时首先导入 `esphome.components.xxx`（即 `__init__.py`）。如果 `__init__.py` 不定义 `CONFIG_SCHEMA`，ESPHome 会查找子模块（如 `sensor.py`）。这种设计允许将不同实体类型的 schema 分散到各自的子模块中，保持文件职责清晰。
-
-**源码中的真实示例**：
-
-| 组件 | `__init__.py` | `sensor.py` | 子传感器数量 |
-|------|--------------|-------------|-------------|
-| DHT | 仅 `CODEOWNERS` | `cv.GenerateID(): cv.declare_id(DHT)` + temperature/humidity 子传感器 | 2 |
-| BME680 | 仅 `CODEOWNERS` | temperature/pressure/humidity/gas_resistance 子传感器 | 4 |
-| CSE7766 | 仅 `CODEOWNERS` | voltage/current/power/energy 等 7 个子传感器 | 7 |
 
 ##### 模式 C：多平台组件
 
@@ -3453,25 +3453,29 @@ async def to_code(config):
 ```cpp
 #pragma once
 #include "esphome/core/component.h"
+#include "esphome/core/defines.h"
+#ifdef USE_SENSOR
 #include "esphome/components/sensor/sensor.h"
+#endif
+#ifdef USE_BINARY_SENSOR
 #include "esphome/components/binary_sensor/binary_sensor.h"
+#endif
 #include "esphome/components/uart/uart.h"
 
 namespace esphome::my_radar {
 
 class MyRadarComponent : public Component, public uart::UARTDevice {
+#ifdef USE_SENSOR
+  SUB_SENSOR(target_count)         // ← 替代手动编写的成员指针 + setter
+#endif
+#ifdef USE_BINARY_SENSOR
+  SUB_BINARY_SENSOR(target)        // ← 替代手动编写的成员指针 + setter
+#endif
+
  public:
   void setup() override;
   void loop() override;
   void dump_config() override;
-
-  // ← 子实体指针
-  void set_target_count_sensor(sensor::Sensor *sens) { target_count_sensor_ = sens; }
-  void set_target_binary_sensor(binary_sensor::BinarySensor *sens) { target_binary_sensor_ = sens; }
-
- protected:
-  sensor::Sensor *target_count_sensor_{nullptr};
-  binary_sensor::BinarySensor *target_binary_sensor_{nullptr};
 };
 
 }  // namespace esphome::my_radar
@@ -3578,7 +3582,311 @@ parent->register_child(var);   // 主组件持有子组件引用，便于生命�
 │   → 从模式 A 开始，需要更多子实体时升级到 B 或 C
 ```
 
-#### 14.5.5 代码生成核心 API
+#### 14.5.5 C++ 侧辅助宏与条件编译
+
+上面三种模式的 C++ 示例中使用了 `SUB_*`、`LOG_*` 等宏以及 `#ifdef USE_*` 条件编译保护。这些是 ESPHome 源码中的标准实践，本节详细说明。
+
+##### SUB_* 宏 — 子实体声明语法糖
+
+模式 B 和 C 中，主组件需要持有子实体的指针成员和对应的 setter 方法。ESPHome 为每种实体类型提供了 `SUB_*` 宏，一行声明即可自动生成成员变量和 setter 方法：
+
+```cpp
+// 手动编写（模式 B / C 的原始写法）
+ public:
+  void set_temperature_sensor(sensor::Sensor *sens) { temperature_sensor_ = sens; }
+  void set_humidity_sensor(sensor::Sensor *sens) { humidity_sensor_ = sens; }
+ protected:
+  sensor::Sensor *temperature_sensor_{nullptr};
+  sensor::Sensor *humidity_sensor_{nullptr};
+
+// 使用 SUB_* 宏（等价写法，更简洁）
+#ifdef USE_SENSOR
+  SUB_SENSOR(temperature)     // 生成: protected sensor::Sensor *temperature_sensor_{nullptr};
+  SUB_SENSOR(humidity)        //      + public void set_temperature_sensor(sensor::Sensor *)
+#endif
+```
+
+每种 `SUB_*` 宏的展开规则遵循固定模式：`SUB_ETYPE(name)` → `protected: etype::EType *name##_etype_{nullptr}` + `public: void set_##name##_etype(etype::EType *)`。
+
+完整的 `SUB_*` 宏列表：
+
+| 宏 | 生成的成员变量类型 | 生成的 setter 方法名 | 定义位置 |
+|-----|-------------------|---------------------|---------|
+| `SUB_SENSOR(name)` | `sensor::Sensor *name##_sensor_` | `set_##name##_sensor(sensor::Sensor *)` | `sensor/sensor.h` |
+| `SUB_BINARY_SENSOR(name)` | `binary_sensor::BinarySensor *name##_binary_sensor_` | `set_##name##_binary_sensor(binary_sensor::BinarySensor *)` | `binary_sensor/binary_sensor.h` |
+| `SUB_SWITCH(name)` | `switch_::Switch *name##_switch_` | `set_##name##_switch(switch_::Switch *)` | `switch/switch.h` |
+| `SUB_TEXT_SENSOR(name)` | `text_sensor::TextSensor *name##_text_sensor_` | `set_##name##_text_sensor(text_sensor::TextSensor *)` | `text_sensor/text_sensor.h` |
+| `SUB_NUMBER(name)` | `number::Number *name##_number_` | `set_##name##_number(number::Number *)` | `number/number.h` |
+| `SUB_SELECT(name)` | `select::Select *name##_select_` | `set_##name##_select(select::Select *)` | `select/select.h` |
+| `SUB_BUTTON(name)` | `button::Button *name##_button_` | `set_##name##_button(button::Button *)` | `button/button.h` |
+
+> 注意 `SUB_SWITCH` 的 setter 参数类型是 `switch_::Switch *s`（简写 `s` 而非 `switch`），因为 `switch` 是 C++ 关键字。
+
+**宏的完整展开**（以 `SUB_SENSOR` 为例）：
+
+```cpp
+#define SUB_SENSOR(name) \
+ protected: \
+  sensor::Sensor *name##_sensor_{nullptr}; \
+\
+ public: \
+  void set_##name##_sensor(sensor::Sensor *sensor) { this->name##_sensor_ = sensor; }
+```
+
+其中 `##` 是 C 预处理器的 token 粘贴运算符，将 `name` 与固定后缀拼接。例如 `SUB_SENSOR(temperature)` 展开：
+
+```cpp
+protected:
+  sensor::Sensor *temperature_sensor_{nullptr};    // name##_sensor_ → temperature_sensor_
+
+public:
+  void set_temperature_sensor(sensor::Sensor *sensor) { this->temperature_sensor_ = sensor; }
+                                           // set_##name##_sensor → set_temperature_sensor
+```
+
+**Python 侧的对应调用**不变——`SUB_*` 宏生成的 setter 方法名与手动编写的一致，因此 Python 的 `cg.add(var.set_temperature_sensor(sens))` 调用方式完全相同：
+
+```python
+# Python 侧的 to_code() — SUB_* 宏不影响 Python 端代码
+sens = await sensor.new_sensor(config[CONF_TEMPERATURE])
+cg.add(var.set_temperature_sensor(sens))    # ← 无论 C++ 端使用 SUB_SENSOR 还是手动编写，调用方式相同
+```
+
+**源码中的真实使用示例**：
+
+| 组件 | 实体类型 | `SUB_*` 宏使用 |
+|------|---------|---------------|
+| APDS9960 | sensor + binary_sensor | `SUB_SENSOR(red)`, `SUB_SENSOR(green)`, `SUB_SENSOR(blue)`, `SUB_SENSOR(clear)`, `SUB_SENSOR(proximity)` + `SUB_BINARY_SENSOR(up_direction)` 等 4 个方向 |
+| BL0906 | sensor | `SUB_SENSOR(voltage)` + 6×`SUB_SENSOR(current)` + 6×`SUB_SENSOR(power)` + `SUB_SENSOR(energy)` |
+| LD2450 | binary_sensor + sensor | `SUB_BINARY_SENSOR(has_target)` + `SUB_SENSOR(x)` / `SUB_SENSOR(y)` 等 |
+| AS3935 | sensor + binary_sensor | `SUB_SENSOR(distance)` + `SUB_SENSOR(energy)` + `SUB_BINARY_SENSOR(thunder_alert)` |
+| Daly BMS | binary_sensor + sensor | `SUB_BINARY_SENSOR(charging_mos_enabled)` 等 + `SUB_SENSOR(voltage)` 等 |
+| GPIO Switch | switch | `SUB_SWITCH(output)` |
+
+**`SUB_*` 宏的使用注意事项**：
+
+1. **宏本身包含 `protected:` 和 `public:` 标签**——每个 `SUB_*` 宏展开后自带 `protected:` 成员段和 `public:` setter段。因此宏应放在类体的**最前面**（在第一个显式访问修饰符之前），而非在已有的 `protected:` 区域内。在已有的 `protected:` 内调用 `SUB_*` 会产生 `protected:` → `protected:` → `public:` 的交替切换，虽能编译但不够清晰
+
+2. **宏应受 `#ifdef USE_*` 保护**——与 `#include` 一样，`SUB_*` 宏应放在对应的 `#ifdef USE_SENSOR` / `#ifdef USE_BINARY_SENSOR` 等条件编译块内。这样当 YAML 中没有该实体类型时，宏完全不展开，类中不存在对应的成员和方法
+
+3. **成员变量名遵循固定模式 `name##_sensor_`**——访问子实体时使用 `this->temperature_sensor_`，而非 `this->temperature`
+
+4. **setter 方法名遵循 `set_##name##_sensor`**——Python 侧调用 `cg.add(var.set_temperature_sensor(sens))`
+
+5. **不能用于自身即是实体的模式 A**——模式 A 中组件类继承 `Sensor`，自身就是实体，不需要子实体指针。`SUB_*` 仅用于模式 B/C 中主组件持有子实体指针的场景
+
+6. **`SUB_SENSOR_WITH_DEDUP` 是 LD24XX 系列的专用变体**——它不生成普通 `Sensor *` 指针，而是生成 `ld24xx::SensorWithDedup<T>` 对象，提供去重发布功能。这是组件特定的扩展宏，不属于通用 `SUB_*` 系列
+
+##### LOG_* 宏 — dump_config 中的实体日志
+
+与 `SUB_*` 宏配套使用的还有 `LOG_*` 实体日志宏，用于在 `dump_config()` 中统一输出实体信息：
+
+```cpp
+void MyEnvSensorComponent::dump_config() {
+  ESP_LOGCONFIG(TAG, "MyEnvSensor:");
+  LOG_SENSOR("  ", "Temperature", this->temperature_sensor_);
+  LOG_SENSOR("  ", "Humidity", this->humidity_sensor_);
+}
+```
+
+`LOG_SENSOR(prefix, type, obj)` 的展开：
+
+```cpp
+// 展开为:
+log_sensor(TAG, "  ", LOG_STR_LITERAL("Temperature"), this->temperature_sensor_);
+
+// log_sensor() 实际输出（当 obj != nullptr 时）:
+//   [I][my_env_sensor:042]:   Temperature: 'Room Temperature'
+//     Unit of measurement: '°C'
+//     Accuracy decimals: 1
+//     State class: 'measurement'
+//     Device class: 'temperature'
+```
+
+当 `obj == nullptr` 时，`log_sensor()` 输出 `Not connected!` 而非崩溃。
+
+完整的 `LOG_*` 实体日志宏列表：
+
+| 宏 | 输出内容 | 定义位置 |
+|-----|---------|---------|
+| `LOG_SENSOR(prefix, type, obj)` | 名称、单位、精度、状态类、设备类 | `sensor/sensor.h` |
+| `LOG_BINARY_SENSOR(prefix, type, obj)` | 名称、设备类 | `binary_sensor/binary_sensor.h` |
+| `LOG_SWITCH(prefix, type, obj)` | 名称、设备类 | `switch/switch.h` |
+| `LOG_NUMBER(prefix, type, obj)` | 名称、步长、范围、单位 | `number/number.h` |
+| `LOG_SELECT(prefix, type, obj)` | 名称、选项列表 | `select/select.h` |
+| `LOG_BUTTON(prefix, type, obj)` | 名称 | `button/button.h` |
+| `LOG_TEXT_SENSOR(prefix, type, obj)` | 名称、设备类 | `text_sensor/text_sensor.h` |
+| `LOG_COVER(prefix, type, obj)` | 名称、设备类 | `cover/cover.h` |
+| `LOG_CLIMATE(prefix, type, obj)` | 名称、设备类、视觉配置 | `climate/climate.h` |
+| `LOG_FAN(prefix, type, obj)` | 名称、速度、方向 | `fan/fan.h` |
+| `LOG_LIGHT(prefix, type, obj)` | 名称、效果、亮度 | `light/light.h` |
+| `LOG_LOCK(prefix, type, obj)` | 名称 | `lock/lock.h` |
+
+此外还有硬件相关的日志宏：
+
+| 宏 | 输出内容 | 定义位置 |
+|-----|---------|---------|
+| `LOG_PIN(prefix, pin)` | 引脚编号和模式 | `core/gpio.h` |
+| `LOG_I2C_DEVICE(this)` | I2C 地址 | `i2c/i2c.h` |
+| `LOG_SPI_DEVICE(this)` | SPI CS 引脚 | `spi/spi.h` |
+| `LOG_ONE_WIRE_DEVICE(this)` | 1-Wire 地址 | `one_wire/one_wire.h` |
+| `LOG_UPDATE_INTERVAL(this)` | 更新间隔 | `core/component.h` |
+
+`LOG_ENTITY_ICON`、`LOG_ENTITY_DEVICE_CLASS`、`LOG_ENTITY_UNIT_OF_MEASUREMENT` 这三个宏受条件编译控制——仅在设置了对应属性时才输出：
+
+```cpp
+// entity_base.h 中条件编译控制的 LOG 宏
+#ifdef USE_ENTITY_ICON
+#define LOG_ENTITY_ICON(tag, prefix, obj) log_entity_icon(tag, prefix, obj)
+#else
+#define LOG_ENTITY_ICON(tag, prefix, obj) ((void) 0)       // ← 编译为空操作
+#endif
+
+#ifdef USE_ENTITY_DEVICE_CLASS
+#define LOG_ENTITY_DEVICE_CLASS(tag, prefix, obj) log_entity_device_class(tag, prefix, obj)
+#endif
+
+#ifdef USE_ENTITY_UNIT_OF_MEASUREMENT
+#define LOG_ENTITY_UNIT_OF_MEASUREMENT(tag, prefix, obj) log_entity_unit_of_measurement(tag, prefix, obj)
+#endif
+```
+
+这些 `USE_ENTITY_*` 宏不是实体类型宏，而是由 `entity_helpers.py` 在 `setup_device_class()` / `setup_unit_of_measurement()` / `setup_entity()` 中动态添加——只有 YAML 中实际设置了 `device_class`、`unit_of_measurement` 或 `icon` 的实体才会触发对应的 `USE_ENTITY_*` define。这使得未设置这些属性的实体不会输出冗余日志行，同时节省 Flash（`log_entity_icon()` 等函数不被编译）。
+
+##### USE_* 条件编译宏体系
+
+ESPHome 的条件编译宏体系分为三个层次：**平台实体类型宏**、**功能子特性宏**、**实体属性宏**。
+
+**层次 1：平台实体类型宏 `USE_<PLATFORM>`**
+
+这是最基础的条件编译层——当 YAML 配置中存在某实体类型的实体时，Python 代码生成器自动添加对应的 `USE_*` define：
+
+```
+YAML 配置中有 sensor → register_sensor() → CORE.platform_counts["sensor"] += 1
+                                                    ↓
+                    _add_platform_defines() (FINAL 优先级协程)
+                    ↓
+                    cg.add_define("USE_SENSOR")
+                    cg.add_define("ESPHOME_ENTITY_SENSOR_COUNT", count)
+```
+
+`_add_platform_defines()` 在 `core/config.py` 中以 `CoroPriority.FINAL` 优先级运行，确保在所有组件 `to_code()` 完成后才统计实体数量。完整的实体类型宏映射：
+
+| YAML 实体平台 | 自动添加的 define | 实体数量 define |
+|---------------|------------------|----------------|
+| sensor | `USE_SENSOR` | `ESPHOME_ENTITY_SENSOR_COUNT` |
+| binary_sensor | `USE_BINARY_SENSOR` | `ESPHOME_ENTITY_BINARY_SENSOR_COUNT` |
+| switch | `USE_SWITCH` | `ESPHOME_ENTITY_SWITCH_COUNT` |
+| button | `USE_BUTTON` | `ESPHOME_ENTITY_BUTTON_COUNT` |
+| number | `USE_NUMBER` | `ESPHOME_ENTITY_NUMBER_COUNT` |
+| select | `USE_SELECT` | `ESPHOME_ENTITY_SELECT_COUNT` |
+| text_sensor | `USE_TEXT_SENSOR` | `ESPHOME_ENTITY_TEXT_SENSOR_COUNT` |
+| cover | `USE_COVER` | `ESPHOME_ENTITY_COVER_COUNT` |
+| fan | `USE_FAN` | `ESPHOME_ENTITY_FAN_COUNT` |
+| light | `USE_LIGHT` | `ESPHOME_ENTITY_LIGHT_COUNT` |
+| climate | `USE_CLIMATE` | `ESPHOME_ENTITY_CLIMATE_COUNT` |
+| lock | `USE_LOCK` | `ESPHOME_ENTITY_LOCK_COUNT` |
+| valve | `USE_VALVE` | `ESPHOME_ENTITY_VALVE_COUNT` |
+| alarm_control_panel | `USE_ALARM_CONTROL_PANEL` | `ESPHOME_ENTITY_ALARM_CONTROL_PANEL_COUNT` |
+| water_heater | `USE_WATER_HEATER` | `ESPHOME_ENTITY_WATER_HEATER_COUNT` |
+| media_player | `USE_MEDIA_PLAYER` | `ESPHOME_ENTITY_MEDIA_PLAYER_COUNT` |
+| event | `USE_EVENT` | `ESPHOME_ENTITY_EVENT_COUNT` |
+| update | `USE_UPDATE` | `ESPHOME_ENTITY_UPDATE_COUNT` |
+| infrared | `USE_INFRARED` | `ESPHOME_ENTITY_INFRARED_COUNT` |
+| radio_frequency | `USE_RADIO_FREQUENCY` | `ESPHOME_ENTITY_RADIO_FREQUENCY_COUNT` |
+| datetime(date) | `USE_DATETIME_DATE` | `ESPHOME_ENTITY_DATE_COUNT` |
+| datetime(time) | `USE_DATETIME_TIME` | `ESPHOME_ENTITY_TIME_COUNT` |
+| datetime(datetime) | `USE_DATETIME_DATETIME` | `ESPHOME_ENTITY_DATETIME_COUNT` |
+| text | `USE_TEXT` | `ESPHOME_ENTITY_TEXT_COUNT` |
+
+这些 define 控制了 `entity_types.h` 中 X-macro 的条件展开——未使用的实体类型完全不编译，对应的类、方法、注册函数、Controller 回调等零 Flash/RAM 开销：
+
+```cpp
+// entity_types.h — #ifdef USE_SENSOR 决定了 sensor 相关的所有代码是否编译
+#ifdef USE_SENSOR
+ENTITY_CONTROLLER_TYPE_(sensor::Sensor, sensor, sensors, ESPHOME_ENTITY_SENSOR_COUNT, SENSOR, sensor_update)
+#endif
+// ↑ 如果 YAML 中没有 sensor 实体，USE_SENSOR 不会被定义
+//   → sensor::Sensor 类不编译 → App.register_sensor() 不生成 → Controller::on_sensor_update() 不生成
+```
+
+**层次 2：功能子特性宏**
+
+某些实体类型有可选的子功能，仅在用户配置了特定选项时才添加对应的 define：
+
+| 宏 | 触发条件 | 定义位置（Python） | C++ 作用 |
+|-----|---------|-------------------|---------|
+| `USE_SENSOR_FILTER` | YAML 配置了 `filters` | `sensor/__init__.py:962` | 编译 `Filter` 类链 + `Sensor::add_filter()` 等方法 |
+| `USE_BINARY_SENSOR_FILTER` | YAML 配置了 `filters` | `binary_sensor/__init__.py:602` | 编译 `BinarySensorFilter` 类链 |
+| `USE_TEXT_SENSOR_FILTER` | YAML 配置了 `filters` | `text_sensor/__init__.py:208` | 编译 `TextSensorFilter` 类链 |
+| `USE_LIGHT_GAMMA_LUT` | YAML 配置了非默认 `gamma_correct` | `light/__init__.py:408` | 编译 gamma 校正查找表 |
+| `USE_OUTPUT` | YAML 中有 `output` 组件（如 rtttl） | `output/__init__.py:159` / `rtttl/__init__.py:88` | 编译 `FloatOutput` / `BinaryOutput` 基类 |
+| `USE_OUTPUT_FLOAT_POWER_SCALING` | YAML 配置了 `max_power`/`min_power`/`zero_means_zero` | `output/__init__.py:57,60,66,130,150` | 编译功率缩放逻辑 |
+| `USE_CLIMATE_VISUAL_OVERRIDES` | YAML 配置了自定义视觉参数（min_temp 等） | `climate/__init__.py:279,282,285,293,296` | 编译视觉配置覆盖 |
+| `USE_API_USER_DEFINED_ACTIONS` | YAML 配置了 `api.actions` | `api/__init__.py:362` | 编译用户自定义 API 服务 |
+| `USE_API_CUSTOM_SERVICES` | YAML 有 `api.custom_services` | `api/__init__.py:366` | 编译外部组件动态服务注册 |
+| `USE_API_HOMEASSISTANT_SERVICES` | YAML 有 `api.homeassistant_services` | `api/__init__.py:369` | 编译 HA 服务调用 |
+| `USE_API_HOMEASSISTANT_STATES` | YAML 有 `api.homeassistant_states` | `api/__init__.py:372` | 编译 HA 状态同步 |
+| `USE_API_NOISE_PSK_FROM_YAML` | YAML 配置了 `api.encryption.key` | `api/__init__.py:468` | 编译 Noise PSK 预加载 |
+| `USE_API_CLIENT_CONNECTED_TRIGGER` | YAML 配置了 `api.on_client_connected` | `api/__init__.py:449` | 编译客户端连接触发器 |
+| `USE_API_CLIENT_DISCONNECTED_TRIGGER` | YAML 配置了 `api.on_client_disconnected` | `api/__init__.py:457` | 编译客户端断开触发器 |
+
+**层次 3：实体属性宏**
+
+这些宏由 `entity_helpers.py` 在设置实体属性时动态添加：
+
+| 宏 | 触发条件 | C++ 作用 |
+|-----|---------|---------|
+| `USE_ENTITY_ICON` | YAML 配置了 `icon` | 编译 `log_entity_icon()`、icon 查找表 |
+| `USE_ENTITY_DEVICE_CLASS` | YAML 配置了 `device_class` | 编译 `log_entity_device_class()`、device_class 查找表 |
+| `USE_ENTITY_UNIT_OF_MEASUREMENT` | YAML 配置了 `unit_of_measurement` | 编译 `log_entity_unit_of_measurement()`、uom 查找表 |
+
+**条件编译宏对外部组件开发的影响**：
+
+1. **头文件 `#include` 受 `USE_*` 保护**——实体类型的 `#include` 和 `SUB_*` 宏都应放在对应的 `#ifdef USE_SENSOR` 等条件编译块内，参考 ESPHome 源码中的标准实践（如 `apds9960.h`、`as3935.h`）
+
+2. **外部组件不需要手动添加 `USE_*` define**——实体类型宏由 `CORE.platform_counts` → `_add_platform_defines()` 自动处理。当外部组件的 `to_code()` 调用 `sensor.register_sensor()` 时，`register_sensor()` 内部会调用 `CORE.register_platform_component("sensor")`，自动增加计数，最终触发 `USE_SENSOR` define
+
+3. **外部组件可以添加自定义 define**——如果外部组件需要 C++ 端的条件编译控制，可以在 Python 端手动 `cg.add_define("USE_MY_FEATURE")`，然后在 C++ 端用 `#ifdef USE_MY_FEATURE` 裁剪
+
+```python
+# 外部组件 Python 侧
+if config.get(CONF_ADVANCED_MODE):
+    cg.add_define("USE_MY_SENSOR_ADVANCED")
+
+# 外部组件 C++ 侧
+#ifdef USE_MY_SENSOR_ADVANCED
+  void advanced_feature();
+#endif
+```
+
+**条件编译宏的生成时序**：
+
+```
+1. YAML 配置验证阶段:
+   各组件 __init__.py 的 CONFIG_SCHEMA 验证 → 加载组件模块
+
+2. 代码生成阶段:
+   各组件 to_code() → register_sensor() / register_binary_sensor() 等
+                    → CORE.register_platform_component("sensor")
+                    → CORE.platform_counts["sensor"] += 1
+   特定功能 → cg.add_define("USE_SENSOR_FILTER") 等子特性宏
+   实体属性 → setup_device_class() → cg.add_define("USE_ENTITY_DEVICE_CLASS") 等属性宏
+
+3. FINAL 优先级阶段（所有 to_code() 完成后）:
+   _add_platform_defines() → 遍历 CORE.platform_counts
+                            → cg.add_define("USE_SENSOR", count)
+                            → cg.add_define("ESPHOME_ENTITY_SENSOR_COUNT", 3)
+   _add_controller_registry_define() → USE_CONTROLLER_REGISTRY
+   _generate_tables_job() → entity string pool → PROGMEM 查找表
+
+4. 写入阶段:
+   writer.py → CORE.defines → 写入 defines.h
+```
+
+这个时序保证了一个关键特性：**同一 YAML 配置永远产生相同的 defines.h**——因为 `platform_counts` 和子特性宏的数量和值完全取决于配置内容，而 `_add_platform_defines()` 在所有代码生成完成后才执行统计，不存在时序依赖问题。
+
+#### 14.5.6 代码生成核心 API
 
 外部组件的 `to_code()` 函数使用以下核心 API：
 
@@ -3611,7 +3919,7 @@ parent->register_child(var);   // 主组件持有子组件引用，便于生命�
 | select | `select.new_select(config)` | 选择器 |
 | button | `button.new_button(config)` | 按钮 |
 
-#### 14.5.6 FINAL_VALIDATE_SCHEMA — 跨组件验证
+#### 14.5.7 FINAL_VALIDATE_SCHEMA — 跨组件验证
 
 `FINAL_VALIDATE_SCHEMA` 在所有组件验证完成后执行，可以检查跨组件约束。典型用例是 UART 设备验证波特率：
 
