@@ -2748,3 +2748,1085 @@ Tornado 的 `StaticFileHandler` 自定义了缓存策略：
 | `esphome/dashboard/util/password.py` | password_hash（PBKDF2-HMAC-SHA512） |
 | `esphome/__main__.py` | CLI dashboard 命令定义、--dashboard 参数处理 |
 | `esphome/storage_json.py` | StorageJSON 设备元数据存储格式 |
+
+---
+
+## 十四、External Components 外部组件开发
+
+### 14.1 概述
+
+ESPHome 的核心组件库覆盖了数百种硬件，但仍有许多专用硬件未被收录。**External Components** 机制允许用户编写自己的组件，存放于独立的 Git 仓库或本地目录，通过 YAML 配置中的 `external_components` 声明引用，无需修改 ESPHome 主仓库源码即可使用。
+
+外部组件与内置组件共享完全相同的开发接口——`CONFIG_SCHEMA`、`to_code()`、`DEPENDENCIES` 等所有模块级属性和函数都可以正常使用。ESPHome 通过 `ComponentMetaFinder`（自定义的 Python `sys.meta_path` finder）将外部组件的路径动态注入到模块搜索路径中，使 `importlib.import_module("esphome.components.my_component")` 能找到外部仓库中的组件代码。
+
+### 14.2 引用外部组件
+
+`external_components` 的配置 schema（`esphome/components/external_components/__init__.py`）：
+
+```yaml
+external_components:
+  - source:
+      type: git
+      url: https://github.com/user/my-esphome-components.git
+      ref: main              # 可选：分支/标签/commit
+      username: user         # 可选：私有仓库认证
+      password: pass         # 可选：私有仓库认证
+      path: components       # 可选：组件目录子路径
+    components: [my_sensor, my_switch]  # 指定要加载的组件，或 "all"
+    refresh: 1d              # Git 仓库刷新间隔（默认1天）
+
+  - source:
+      type: local
+      path: /home/user/my-components    # 本地目录
+    components: [my_sensor]
+
+  # 简写形式（最常用）
+  - source: github://user/my-esphome-components@main
+    components: [my_sensor]
+```
+
+#### Source 类型
+
+| 类型 | Schema | 说明 |
+|------|--------|------|
+| `git` | `{type: git, url: ..., ref?: ..., username?: ..., password?: ..., path?: ...}` | 从 Git 仓库克隆 |
+| `local` | `{type: local, path: ...}` | 从本地目录加载 |
+
+#### 简写格式
+
+ESPHome 支持 GitHub/Codeberg/GitLab 的简写 URL，在 `config_validation.py:validate_source_shorthand()` 中解析：
+
+```
+github://owner/repo[@ref]         → https://github.com/owner/repo.git
+github://pr#1234                  → https://github.com/esphome/esphome.git, ref=pull/1234/head
+codeberg://owner/repo[@ref]       → https://codeberg.org/owner/repo.git
+gitlab://owner/repo[@ref]         → https://gitlab.org/owner/repo.git
+```
+
+#### 组件目录查找顺序
+
+当未指定 `path` 时，ESPHome 按以下顺序查找组件目录：
+
+```
+1. <repo_dir>/esphome/components/   ← 推荐：与内置组件同级路径
+2. <repo_dir>/components/           ← 兼容旧格式
+3. 报错：Could not find components folder
+```
+
+指定 `path` 时直接在 `<repo_dir>/<path>/` 下查找，必须是一个目录。
+
+#### `components` 过滤
+
+```yaml
+components: all          # 加载仓库中所有组件（默认）
+components: [my_sensor]  # 仅加载指定组件
+```
+
+安全机制：当选择 `all` 时，如果仓库中的组件数量超过 100 个，ESPHome 会拒绝加载——这防止了用户不小心引用了整个 ESPHome fork 仓库（包含所有内置组件）的情况：
+
+```python
+if config[CONF_COMPONENTS] == "all":
+    num_components = len(list(components_dir.glob("*/__init__.py")))
+    if num_components > 100:
+        raise cv.Invalid(
+            "This source is an ESPHome fork or branch. "
+            "Please manually specify the components you want to import using the 'components' key"
+        )
+```
+
+指定 `components` 列表时，ESPHome 会验证每个组件是否存在 `__init__.py` 文件：
+
+```python
+for name in config[CONF_COMPONENTS]:
+    expected = components_dir / name / "__init__.py"
+    if not expected.is_file():
+        raise cv.Invalid(f"Could not find __init__.py file for component {name}")
+```
+
+#### Git 仓库缓存与刷新
+
+ESPHome 使用 SHA256 哈希的前 8 位作为缓存目录名（`git.py:_compute_destination_path()`）：
+
+```python
+def _compute_destination_path(key, domain):
+    base_dir = Path(CORE.data_dir) / domain    # 如 .esphome/external_components/
+    h = hashlib.new("sha256")
+    h.update(key.encode())                      # key = "url@ref"
+    return base_dir / h.hexdigest()[:8]          # 如 .esphome/external_components/a1b2c3d4
+```
+
+克隆和更新策略：
+
+```
+首次克隆:
+  git clone --depth=1 <url> <dest>
+  如果指定了 ref:
+    git fetch --depth=1 origin <ref>
+    git reset --hard FETCH_HEAD
+
+后续更新（超过 refresh 间隔时）:
+  git stash push --include-untracked   # 保存可能的本地修改
+  git fetch --depth=1 origin [ref]     # 浅克隆更新
+  git reset --hard FETCH_HEAD          # 重置到最新
+  返回 revert 回调（允许回退到旧版本）
+
+损坏恢复:
+  如果仓库状态损坏 → 删除整个目录 → 重新克隆（仅尝试一次，防止无限递归）
+```
+
+### 14.3 加载机制 — ComponentMetaFinder
+
+外部组件的加载核心是 `loader.py:ComponentMetaFinder`，一个自定义的 Python `sys.meta_path` finder：
+
+```python
+class ComponentMetaFinder(importlib.abc.MetaPathFinder):
+    def __init__(self, components_path, allowed_components=None):
+        self._allowed_components = allowed_components
+        self._finders = []
+        for hook in sys.path_hooks:
+            try:
+                finder = hook(str(components_path))  # 将外部组件目录注册为 Python 路径
+            except ImportError:
+                continue
+            self._finders.append(finder)
+
+    def find_spec(self, fullname, path=None, target=None):
+        if not fullname.startswith("esphome.components."):
+            return None
+        parts = fullname.split(".")
+        if len(parts) != 3:  # 仅处理直接组件（esphome.components.xxx），不处理平台
+            return None
+        component = parts[2]
+        if self._allowed_components is not None and component not in self._allowed_components:
+            return None  # 白名单过滤
+        for finder in self._finders:
+            spec = finder.find_spec(fullname, target=target)
+            if spec is not None:
+                return spec
+        return None
+```
+
+**工作原理**：
+
+```
+1. _process_single_config() 解析 source 和 components 过滤
+2. 确定组件目录路径（Git 克隆目录或本地路径）
+3. loader.install_meta_finder(components_dir, allowed_components)
+   → sys.meta_path.insert(0, ComponentMetaFinder(components_dir, allowed_components))
+
+4. 当 ESPHome 配置验证需要加载组件时：
+   importlib.import_module("esphome.components.my_sensor")
+   → Python 遍历 sys.meta_path
+   → ComponentMetaFinder.find_spec("esphome.components.my_sensor")
+   → 在外部组件目录中查找 my_sensor/__init__.py
+   → 返回 ModuleSpec → 正常导入
+```
+
+**关键设计细节**：
+
+- `ComponentMetaFinder` 插入到 `sys.meta_path[0]`（最前面），优先于内置组件查找。这意味着**同名外部组件会覆盖内置组件**
+- 仅处理 `esphome.components.xxx`（3段路径），平台（如 `esphome.components.dht.sensor`）通过父组件自动加载
+- `allowed_components` 白名单确保仅加载用户指定的组件，避免意外引入无关组件
+
+### 14.4 配置处理流程
+
+`external_components` 在配置验证流程中的位置非常关键——它是**第一步**（step 1.3），在所有其他组件验证之前执行：
+
+```
+config.py:full_config()
+  Step 1.1: 加载 substitutions
+  Step 1.2: 解析 !extend / !remove
+  Step 1.3: 加载 external_components ← 此时注册 ComponentMetaFinder
+  Step 1.4+: 组件验证（此时外部组件已经可被 importlib 发现）
+```
+
+`do_external_components_pass()` 的完整流程：
+
+```python
+def do_external_components_pass(config):
+    conf = config.get(CONF_EXTERNAL_COMPONENTS)
+    if conf is None:
+        return
+    conf = CONFIG_SCHEMA(conf)            # 验证 external_components schema
+    for c in conf:
+        _process_single_config(c)         # 处理每个 source 条目
+        # → Git: clone_or_update() → install_meta_finder()
+        # → Local: install_meta_finder(local_path)
+```
+
+### 14.5 编写外部组件
+
+#### 14.5.1 组件仓库结构
+
+一个外部组件仓库的推荐结构：
+
+```
+my-esphome-components/
+├── esphome/
+│   └── components/
+│       ├── my_sensor/
+│       │   ├── __init__.py        # Python: CONFIG_SCHEMA + to_code()
+│       │   ├── my_sensor.h        # C++: 头文件
+│       │   └── my_sensor.cpp      # C++: 实现文件
+│       ├── my_switch/
+│       │   ├── __init__.py
+│       │   ├── my_switch.h
+│       │   └── my_switch.cpp
+│       └── my_sensor/             # 平台子组件
+│           └── some_platform/
+│               ├── __init__.py     # 平台的 CONFIG_SCHEMA + to_code()
+│               ├── some_platform.h
+│               └── some_platform.cpp
+└── README.md
+```
+
+> `esphome/components/` 是推荐路径——ESPHome 的 `_process_git_config()` 首先查找此路径。如果使用 `components/` 路径，需要在 YAML 中显式指定 `path: components`。
+
+#### 14.5.2 组件模块级属性
+
+每个组件的 `__init__.py` 可以声明以下模块级属性，ESPHome 通过 `ComponentManifest`（`loader.py`）读取：
+
+| 属性 | 类型 | 说明 | 示例 |
+|------|------|------|------|
+| `CONFIG_SCHEMA` | `cv.Schema` | YAML 配置验证 schema（必须） | 见下文 |
+| `to_code` | `async def` | 代码生成函数（必须） | 见下文 |
+| `DEPENDENCIES` | `list[str]` | 依赖的其他组件 | `["uart", "spi"]` |
+| `AUTO_LOAD` | `list[str]` 或 `Callable` | 自动加载的组件 | `["sensor"]` |
+| `CONFLICTS_WITH` | `list[str]` | 冲突的组件 | `["wifi"]` |
+| `MULTI_CONF` | `bool` | 允许同一组件多次配置 | `True` |
+| `MULTI_CONF_NO_DEFAULT` | `bool` | 多次配置但不自动生成 ID | `True` |
+| `IS_PLATFORM_COMPONENT` | `bool` | 标记为平台组件（如 sensor/output） | `True` |
+| `IS_TARGET_PLATFORM` | `bool` | 标记为目标平台（如 esp32） | `True` |
+| `CODEOWNERS` | `list[str]` | 代码维护者 GitHub 用户名 | `["@myuser"]` |
+| `FINAL_VALIDATE_SCHEMA` | `Callable` | 跨组件最终验证函数 | 见下文 |
+
+#### 14.5.3 最简传感器组件示例
+
+以下是一个完整的最简外部传感器组件，读取一个自定义 UART 传感器：
+
+**`my_sensor/__init__.py`**（Python 侧）：
+
+```python
+import esphome.codegen as cg
+from esphome.components import sensor, uart
+import esphome.config_validation as cv
+from esphome.const import (
+    CONF_ID,
+    CONF_UART_ID,
+    DEVICE_CLASS_TEMPERATURE,
+    STATE_CLASS_MEASUREMENT,
+    UNIT_CELSIUS,
+)
+
+DEPENDENCIES = ["uart"]                    # 依赖 UART 组件
+AUTO_LOAD = ["sensor"]                    # 自动加载 sensor 基类
+CODEOWNERS = ["@myuser"]
+
+my_sensor_ns = cg.esphome_ns.namespace("my_sensor")
+MySensorComponent = my_sensor_ns.class_(
+    "MySensorComponent", cg.PollingComponent, uart.UARTDevice, sensor.Sensor
+)
+
+CONFIG_SCHEMA = (
+    sensor.sensor_schema(
+        MySensorComponent,
+        unit_of_measurement=UNIT_CELSIUS,
+        accuracy_decimals=1,
+        device_class=DEVICE_CLASS_TEMPERATURE,
+        state_class=STATE_CLASS_MEASUREMENT,
+    )
+    .extend(uart.UART_DEVICE_SCHEMA)       # 继承 UART 设备 schema
+    .extend(cv.polling_component_schema("60s"))  # 继承轮询组件 schema
+)
+
+FINAL_VALIDATE_SCHEMA = uart.final_validate_device_schema(
+    "my_sensor", baud_rate=9600, require_rx=True, require_tx=False
+)
+
+
+async def to_code(config):
+    var = await sensor.new_sensor(config)    # 创建 sensor Pvariable
+    await cg.register_component(var, config) # 注册为 Component
+    await uart.register_uart_device(var, config)  # 注册为 UARTDevice
+```
+
+**`my_sensor/my_sensor.h`**（C++ 侧）：
+
+```cpp
+#pragma once
+
+#include "esphome/core/component.h"
+#include "esphome/components/sensor/sensor.h"
+#include "esphome/components/uart/uart.h"
+
+namespace esphome::my_sensor {
+
+class MySensorComponent : public PollingComponent, public uart::UARTDevice, public sensor::Sensor {
+ public:
+  void update() override;    // PollingComponent: 定期调用
+  void dump_config() override;
+};
+
+}  // namespace esphome::my_sensor
+```
+
+**`my_sensor/my_sensor.cpp`**（C++ 侧）：
+
+```cpp
+#include "my_sensor.h"
+#include "esphome/core/log.h"
+
+namespace esphome::my_sensor {
+
+static const char *const TAG = "my_sensor";
+
+void MySensorComponent::update() {
+  uint8_t data[4];
+  if (!this->read_array(data, 4)) {
+    ESP_LOGW(TAG, "Read failed!");
+    this->status_set_warning();
+    return;
+  }
+  this->status_clear_warning();
+
+  float temperature = (data[0] + data[1] * 256.0f) / 10.0f;
+  this->publish_state(temperature);
+}
+
+void MySensorComponent::dump_config() {
+  LOG_SENSOR("", "MySensor", this);
+  ESP_LOGCONFIG(TAG, "  UART baud_rate: %d", this->get_baud_rate());
+}
+
+}  // namespace esphome::my_sensor
+```
+
+#### 14.5.4 三种组件架构模式
+
+ESPHome 的组件有三种架构模式，从简单到复杂递进。选择哪种取决于组件的功能需求——单个实体还是多个实体、单一类型还是跨多种实体类型。
+
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│  模式 A: 单实体组件                                                     │
+│  组件类 = 实体类 (如 Sensor)                                             │
+│  CONFIG_SCHEMA 使用 sensor.sensor_schema(MyClass)                       │
+│  一个 YAML 块 → 一个实体                                                 │
+│  示例: CSE7766, BME680, DHT                                             │
+├──────────────────────────────────────────────────────────────────────────┤
+│  模式 B: 单平台多子实体组件                                              │
+│  __init__.py 定义主组件类 (cv.declare_id)                                │
+│  sensor.py 中 cv.GenerateID(): cv.declare_id + cv.Optional 子传感器     │
+│  一个 YAML 块 → 一个主组件 + 多个子传感器                                 │
+│  示例: DHT, BME680 (在 sensor.py 中定义 schema)                         │
+├──────────────────────────────────────────────────────────────────────────┤
+│  模式 C: 多平台组件                                                      │
+│  __init__.py 定义主组件类 (cv.declare_id + CONF_XXX_ID)                  │
+│  sensor.py/binary_sensor.py 等使用 cv.use_id(XXXComponent)              │
+│  to_code() 以 cg.get_variable(config[CONF_XXX_ID]) 开头                │
+│  多个 YAML 块 → 各自独立，通过 use_id 关联到同一主组件                    │
+│  示例: LD2450, ADS1115, ADE7953                                         │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+##### 模式 A：单实体组件
+
+组件类本身就是一个实体（如 `Sensor`），一个 YAML 配置块对应一个实体。这是最简单的写法，也是上面 14.5.3 中展示的模式。
+
+**典型特征**：
+- `CONFIG_SCHEMA` 使用 `sensor.sensor_schema(MyClass)` —— 组件类同时是实体类
+- `to_code()` 中使用 `sensor.new_sensor(config)` 创建变量
+- C++ 类同时继承 `PollingComponent` 和 `sensor::Sensor`
+- YAML 中直接定义在 `sensor:` 下
+
+**YAML 使用方式**：
+
+```yaml
+sensor:
+  - platform: my_sensor           # ← 直接在 sensor: 下，platform 指定组件
+    name: "My Temperature"
+```
+
+**适用场景**：组件只提供单一传感器读数（如一个温度传感器、一个电流传感器）。
+
+> 上面的 14.5.3 示例（MySensorComponent 继承 PollingComponent + UARTDevice + Sensor）就是典型的模式 A，此处不再重复代码。
+
+##### 模式 B：单平台多子实体组件
+
+一个硬件芯片通常提供多个测量值（如 DHT 同时输出温度和湿度，BME680 同时输出温度、湿度、气压、气体电阻）。此时需要一个主组件管理硬件通信，多个子传感器分别发布各自的数据。
+
+**典型特征**：
+- `__init__.py` 通常留空（或仅声明 `CODEOWNERS`/`DEPENDENCIES`）
+- `sensor.py` 中定义主 `CONFIG_SCHEMA`，使用 `cv.GenerateID(): cv.declare_id(MainComponent)` 声明主组件
+- `sensor.py` 中用 `cv.Optional(CONF_TEMPERATURE): sensor.sensor_schema(...)` 定义子传感器
+- `to_code()` 先创建主组件 `cg.new_Pvariable(config[CONF_ID])`，再创建各子传感器 `sensor.new_sensor(config[CONF_TEMPERATURE])`
+- C++ 主组件持有子传感器指针 (`sensor::Sensor *temperature_sensor_`)
+- 子传感器**不继承 `Component`**，只是纯粹的 `Sensor` 实体
+
+**完整示例**：自定义环境传感器（温度+湿度）
+
+**`my_env_sensor/__init__.py`**（几乎为空）：
+
+```python
+CODEOWNERS = ["@myuser"]
+```
+
+**`my_env_sensor/sensor.py`**（所有逻辑在此）：
+
+```python
+from esphome import pins
+import esphome.codegen as cg
+from esphome.components import sensor
+import esphome.config_validation as cv
+from esphome.const import (
+    CONF_HUMIDITY,
+    CONF_ID,
+    CONF_PIN,
+    CONF_TEMPERATURE,
+    DEVICE_CLASS_HUMIDITY,
+    DEVICE_CLASS_TEMPERATURE,
+    STATE_CLASS_MEASUREMENT,
+    UNIT_CELSIUS,
+    UNIT_PERCENT,
+)
+from esphome.cpp_helpers import gpio_pin_expression
+
+DEPENDENCIES = ["uart"]                     # 或其他依赖
+AUTO_LOAD = ["sensor"]
+
+my_env_sensor_ns = cg.esphome_ns.namespace("my_env_sensor")
+MyEnvSensorComponent = my_env_sensor_ns.class_(
+    "MyEnvSensorComponent", cg.PollingComponent
+)
+
+CONFIG_SCHEMA = cv.Schema(
+    {
+        cv.GenerateID(): cv.declare_id(MyEnvSensorComponent),  # ← 主组件 ID
+        cv.Required(CONF_PIN): pins.internal_gpio_input_pullup_pin_schema,
+        cv.Optional(CONF_TEMPERATURE): sensor.sensor_schema(   # ← 子传感器（可选）
+            unit_of_measurement=UNIT_CELSIUS,
+            accuracy_decimals=1,
+            device_class=DEVICE_CLASS_TEMPERATURE,
+            state_class=STATE_CLASS_MEASUREMENT,
+        ),
+        cv.Optional(CONF_HUMIDITY): sensor.sensor_schema(     # ← 子传感器（可选）
+            unit_of_measurement=UNIT_PERCENT,
+            accuracy_decimals=0,
+            device_class=DEVICE_CLASS_HUMIDITY,
+            state_class=STATE_CLASS_MEASUREMENT,
+        ),
+    }
+).extend(cv.polling_component_schema("60s"))
+
+
+async def to_code(config):
+    # 1. 创建主组件
+    var = cg.new_Pvariable(config[CONF_ID])
+    await cg.register_component(var, config)
+
+    pin = await gpio_pin_expression(config[CONF_PIN])
+    cg.add(var.set_pin(pin))
+
+    # 2. 创建子传感器并注入到主组件
+    if CONF_TEMPERATURE in config:
+        sens = await sensor.new_sensor(config[CONF_TEMPERATURE])
+        cg.add(var.set_temperature_sensor(sens))
+    if CONF_HUMIDITY in config:
+        sens = await sensor.new_sensor(config[CONF_HUMIDITY])
+        cg.add(var.set_humidity_sensor(sens))
+```
+
+**`my_env_sensor/my_env_sensor.h`**：
+
+```cpp
+#pragma once
+#include "esphome/core/component.h"
+#include "esphome/core/hal.h"
+#include "esphome/components/sensor/sensor.h"
+
+namespace esphome::my_env_sensor {
+
+class MyEnvSensorComponent : public PollingComponent {
+ public:
+  void set_pin(InternalGPIOPin *pin) { pin_ = pin; }
+  void set_temperature_sensor(sensor::Sensor *sens) { temperature_sensor_ = sens; }
+  void set_humidity_sensor(sensor::Sensor *sens) { humidity_sensor_ = sens; }
+
+  void setup() override;
+  void update() override;
+  void dump_config() override;
+
+ protected:
+  InternalGPIOPin *pin_;
+  sensor::Sensor *temperature_sensor_{nullptr};   // ← 子传感器指针
+  sensor::Sensor *humidity_sensor_{nullptr};       // ← 子传感器指针
+};
+
+}  // namespace esphome::my_env_sensor
+```
+
+**`my_env_sensor/my_env_sensor.cpp`**：
+
+```cpp
+#include "my_env_sensor.h"
+#include "esphome/core/log.h"
+
+namespace esphome::my_env_sensor {
+
+static const char *const TAG = "my_env_sensor";
+
+void MyEnvSensorComponent::update() {
+  float temperature, humidity;
+  if (!read_sensor_(&temperature, &humidity)) {
+    ESP_LOGW(TAG, "Read failed!");
+    this->status_set_warning();
+    return;
+  }
+  this->status_clear_warning();
+
+  // ← 通过子传感器指针发布数据
+  if (temperature_sensor_ != nullptr)
+    temperature_sensor_->publish_state(temperature);
+  if (humidity_sensor_ != nullptr)
+    humidity_sensor_->publish_state(humidity);
+}
+
+void MyEnvSensorComponent::dump_config() {
+  ESP_LOGCONFIG(TAG, "MyEnvSensor:");
+  LOG_SENSOR("  ", "Temperature", this->temperature_sensor_);
+  LOG_SENSOR("  ", "Humidity", this->humidity_sensor_);
+}
+
+}  // namespace esphome::my_env_sensor
+```
+
+**YAML 使用方式**：
+
+```yaml
+sensor:
+  - platform: my_env_sensor
+    pin: GPIO4
+    temperature:
+      name: "Room Temperature"
+    humidity:
+      name: "Room Humidity"
+```
+
+> **模式 B 的关键区别**：主组件类**不继承** `sensor::Sensor`。它是一个纯粹的 `Component`（或 `PollingComponent`），通过 `sensor::Sensor *` 指针持有子传感器。子传感器由 `sensor.new_sensor()` 创建并注册，主组件只负责硬件通信和数据分发。
+
+> **为什么 `__init__.py` 留空**：ESPHome 的 `loader.py` 加载组件时首先导入 `esphome.components.xxx`（即 `__init__.py`）。如果 `__init__.py` 不定义 `CONFIG_SCHEMA`，ESPHome 会查找子模块（如 `sensor.py`）。这种设计允许将不同实体类型的 schema 分散到各自的子模块中，保持文件职责清晰。
+
+**源码中的真实示例**：
+
+| 组件 | `__init__.py` | `sensor.py` | 子传感器数量 |
+|------|--------------|-------------|-------------|
+| DHT | 仅 `CODEOWNERS` | `cv.GenerateID(): cv.declare_id(DHT)` + temperature/humidity 子传感器 | 2 |
+| BME680 | 仅 `CODEOWNERS` | temperature/pressure/humidity/gas_resistance 子传感器 | 4 |
+| CSE7766 | 仅 `CODEOWNERS` | voltage/current/power/energy 等 7 个子传感器 | 7 |
+
+##### 模式 C：多平台组件
+
+复杂组件提供多种实体类型（sensor + binary_sensor + switch + number 等），每种类型在独立的子模块中定义。各子模块通过 `cv.use_id()` 引用主组件，通过 `cg.get_variable()` 获取主组件变量。
+
+**典型特征**：
+- `__init__.py` 定义主组件：`cv.GenerateID(): cv.declare_id(MainComponent)` + `CONF_XXX_ID = "xxx_id"` + `XXXBaseSchema`
+- 各平台子模块（`sensor.py`、`binary_sensor.py` 等）使用 `cv.GenerateID(CONF_XXX_ID): cv.use_id(MainComponent)` 引用主组件
+- `to_code()` 以 `parent = await cg.get_variable(config[CONF_XXX_ID])` 开头获取主组件变量
+- `DEPENDENCIES = ["xxx"]` — 各子模块声明依赖主组件模块
+- 主组件 `MULTI_CONF = True` — 允许多实例（如多个 ADS1115 芯片）
+
+**完整示例**：自定义毫米波雷达组件（主组件 + sensor + binary_sensor）
+
+**`my_radar/__init__.py`**（定义主组件）：
+
+```python
+import esphome.codegen as cg
+from esphome.components import uart
+import esphome.config_validation as cv
+from esphome.const import CONF_ID
+
+AUTO_LOAD = ["sensor", "binary_sensor"]    # ← 自动加载所有子平台
+DEPENDENCIES = ["uart"]
+CODEOWNERS = ["@myuser"]
+MULTI_CONF = True                          # ← 允许多个雷达实例
+
+my_radar_ns = cg.esphome_ns.namespace("my_radar")
+MyRadarComponent = my_radar_ns.class_(
+    "MyRadarComponent", cg.Component, uart.UARTDevice
+)
+
+CONF_MY_RADAR_ID = "my_radar_id"           # ← 子模块引用主组件的 ID key
+
+CONFIG_SCHEMA = cv.Schema(
+    {
+        cv.GenerateID(): cv.declare_id(MyRadarComponent),  # ← 主组件 ID
+    }
+).extend(uart.UART_DEVICE_SCHEMA).extend(cv.COMPONENT_SCHEMA)
+
+# ← 子模块共享的基础 schema，包含 use_id 声明
+MyRadarBaseSchema = cv.Schema(
+    {
+        cv.GenerateID(CONF_MY_RADAR_ID): cv.use_id(MyRadarComponent),
+    },
+)
+
+FINAL_VALIDATE_SCHEMA = uart.final_validate_device_schema(
+    "my_radar", baud_rate=256000, require_rx=True, require_tx=True
+)
+
+
+async def to_code(config):
+    var = cg.new_Pvariable(config[CONF_ID])     # ← 创建主组件
+    await cg.register_component(var, config)
+    await uart.register_uart_device(var, config)
+```
+
+**`my_radar/sensor.py`**（子传感器模块）：
+
+```python
+import esphome.codegen as cg
+from esphome.components import sensor
+import esphome.config_validation as cv
+from esphome.const import CONF_ID, DEVICE_CLASS_DISTANCE, UNIT_MILLIMETER
+
+from . import CONF_MY_RADAR_ID, MyRadarComponent     # ← 从父模块导入
+
+DEPENDENCIES = ["my_radar"]                           # ← 依赖主组件
+
+CONF_TARGET_COUNT = "target_count"
+
+CONFIG_SCHEMA = cv.Schema(
+    {
+        cv.GenerateID(CONF_MY_RADAR_ID): cv.use_id(MyRadarComponent),  # ← 引用主组件
+        cv.Optional(CONF_TARGET_COUNT): sensor.sensor_schema(
+            accuracy_decimals=0,
+            device_class=DEVICE_CLASS_DISTANCE,
+            unit_of_measurement=UNIT_MILLIMETER,
+        ),
+    }
+)
+
+
+async def to_code(config):
+    # ← 关键: 先获取主组件变量
+    radar = await cg.get_variable(config[CONF_MY_RADAR_ID])
+
+    if target_count_config := config.get(CONF_TARGET_COUNT):
+        sens = await sensor.new_sensor(target_count_config)
+        cg.add(radar.set_target_count_sensor(sens))   # ← 注入到主组件
+```
+
+**`my_radar/binary_sensor.py`**（子二值传感器模块）：
+
+```python
+import esphome.codegen as cg
+from esphome.components import binary_sensor
+import esphome.config_validation as cv
+from esphome.const import CONF_ID, DEVICE_CLASS_OCCUPANCY
+
+from . import CONF_MY_RADAR_ID, MyRadarComponent
+
+DEPENDENCIES = ["my_radar"]
+
+CONF_HAS_TARGET = "has_target"
+
+CONFIG_SCHEMA = cv.Schema(
+    {
+        cv.GenerateID(CONF_MY_RADAR_ID): cv.use_id(MyRadarComponent),  # ← 引用主组件
+        cv.Optional(CONF_HAS_TARGET): binary_sensor.binary_sensor_schema(
+            device_class=DEVICE_CLASS_OCCUPANCY,
+        ),
+    }
+)
+
+
+async def to_code(config):
+    # ← 同样先获取主组件变量
+    radar = await cg.get_variable(config[CONF_MY_RADAR_ID])
+
+    if has_target_config := config.get(CONF_HAS_TARGET):
+        sens = await binary_sensor.new_binary_sensor(has_target_config)
+        cg.add(radar.set_target_binary_sensor(sens))  # ← 注入到主组件
+```
+
+**`my_radar/my_radar.h`**（C++ 主组件）：
+
+```cpp
+#pragma once
+#include "esphome/core/component.h"
+#include "esphome/components/sensor/sensor.h"
+#include "esphome/components/binary_sensor/binary_sensor.h"
+#include "esphome/components/uart/uart.h"
+
+namespace esphome::my_radar {
+
+class MyRadarComponent : public Component, public uart::UARTDevice {
+ public:
+  void setup() override;
+  void loop() override;
+  void dump_config() override;
+
+  // ← 子实体指针
+  void set_target_count_sensor(sensor::Sensor *sens) { target_count_sensor_ = sens; }
+  void set_target_binary_sensor(binary_sensor::BinarySensor *sens) { target_binary_sensor_ = sens; }
+
+ protected:
+  sensor::Sensor *target_count_sensor_{nullptr};
+  binary_sensor::BinarySensor *target_binary_sensor_{nullptr};
+};
+
+}  // namespace esphome::my_radar
+```
+
+**YAML 使用方式**：
+
+```yaml
+# 主组件定义
+my_radar:                                 # ← 独立的 YAML 顶级块
+  id: my_radar_1                          # ← 显式 ID，子模块引用此 ID
+  uart_id: uart_bus
+
+# 各子实体定义（独立的 YAML 块，各自引用主组件 ID）
+sensor:
+  - platform: my_radar                    # ← sensor 的 platform 指向 my_radar 子模块
+    my_radar_id: my_radar_1               # ← 引用主组件 ID
+    target_count:
+      name: "Target Count"
+
+binary_sensor:
+  - platform: my_radar                    # ← binary_sensor 的 platform
+    my_radar_id: my_radar_1               # ← 同一引用
+    has_target:
+      name: "Has Target"
+```
+
+> **模式 C 的关键区别**：主组件和子实体各自是独立的 YAML 配置块。子实体通过 `my_radar_id` 显式引用主组件 ID。在 `to_code()` 中通过 `cg.get_variable(config[CONF_MY_RADAR_ID])` 获取主组件变量——这是**协程依赖解析**机制的核心应用：如果主组件尚未注册，`get_variable()` 会 yield 回调度器等待。
+
+**`cv.declare_id` vs `cv.use_id` 的区别**：
+
+| 函数 | 作用 | 创建变量？ | 使用时机 |
+|------|------|-----------|---------|
+| `cv.declare_id(XXXClass)` | 声明一个新的组件变量，将 ID 绑定到该类 | ✅ 是（`cg.new_Pvariable`） | 主组件定义处 |
+| `cv.use_id(XXXClass)` | 引用一个已存在的组件变量，不创建新变量 | ❌ 否（`cg.get_variable`） | 子模块引用主组件处 |
+
+对应的代码生成调用：
+
+```
+cv.declare_id → cg.new_Pvariable(config[CONF_ID])     # 创建新对象
+cv.use_id    → cg.get_variable(config[CONF_XXX_ID])    # 获取已注册对象（等待依赖）
+```
+
+**`register_parented` 机制**：
+
+某些模式 C 的子组件（如 ADS1115 的传感器）使用 `cg.register_parented()` 将子实体自动注册到主组件：
+
+```python
+# ADS1115 sensor.py 的 to_code()
+var = cg.new_Pvariable(config[CONF_ID])
+await sensor.register_sensor(var, config)
+await cg.register_component(var, config)
+await cg.register_parented(var, config[CONF_ADS1115_ID])   # ← 自动调用 parent->register_child(var)
+```
+
+`register_parented()` 生成的 C++ 代码：
+
+```cpp
+parent->register_child(var);   // 主组件持有子组件引用，便于生命周期管理
+```
+
+**源码中的真实示例**：
+
+| 组件 | `__init__.py` | `sensor.py` | `binary_sensor.py` | 其他子模块 |
+|------|--------------|-------------|--------------------|-----------|
+| LD2450 | 主组件 + CONF_LD2450_ID + BaseSchema | use_id + 多子传感器 | use_id + 3 子传感器 | number/select/switch/button/text_sensor |
+| ADS1115 | 主组件 + CONF_ADS1115_ID + MULTI_CONF | use_id + register_parented | — | — |
+| ADE7953_base | 主组件类定义 | — | — | 由 ade7953_i2c/spi 子组件继承 |
+| BL0942 | 仅 CODEOWNERS | sensor.py 中 cv.GenerateID + use_id | — | — |
+
+##### 三种模式的对比总结
+
+| 特征 | 模式 A | 模式 B | 模式 C |
+|------|--------|--------|--------|
+| 主组件类继承 | Component + Sensor | 仅 Component | 仅 Component |
+| 实体类 | 主组件即是实体 | 子 Sensor 指针 | 子 Sensor/BinarySensor 指针 |
+| CONFIG_SCHEMA 位置 | `__init__.py` | `sensor.py` | `__init__.py` + 各子模块 |
+| cv.GenerateID | sensor_schema 内自动 | `cv.declare_id(MainComp)` | `__init__.py`: declare_id; 子模块: use_id |
+| YAML 结构 | `sensor:` 下的单一块 | `sensor:` 下的单一块（含子键） | 多个顶级块，子块用 xxx_id 关联 |
+| `to_code()` 开头 | `sensor.new_sensor()` | `cg.new_Pvariable(CONF_ID)` | `cg.get_variable(CONF_XXX_ID)` |
+| 多实体类型 | ❌ 仅 1 种 | ❌ 仅 sensor | ✅ sensor + binary_sensor + ... |
+| 文件结构 | `__init__.py` + `.h/.cpp` | `__init__.py`(空) + `sensor.py` + `.h/.cpp` | `__init__.py` + `sensor.py` + `binary_sensor.py` + `.h/.cpp` |
+| 适用场景 | 单一读数的简单传感器 | 一芯片多测量值 | 一芯片多种实体类型 |
+
+##### 模式选择决策树
+
+```
+你的组件需要提供什么？
+│
+├── 仅一个传感器读数？
+│   → 模式 A（单实体组件）
+│   例: 一个温度传感器、一个 ADC 电压读数
+│
+├── 一个芯片多个同类测量值？
+│   → 模式 B（单平台多子实体）
+│   例: DHT(温度+湿度)、BME680(温度+气压+湿度+气体)、电量计(电压+电流+功率+电量)
+│
+├── 一个芯片多种实体类型？
+│   → 模式 C（多平台组件）
+│   例: LD2450(sensor+binary_sensor+number+select+switch)、
+│       ADS1115(主组件+sensor平台)
+│
+└── 不确定？
+│   → 从模式 A 开始，需要更多子实体时升级到 B 或 C
+```
+
+#### 14.5.5 代码生成核心 API
+
+外部组件的 `to_code()` 函数使用以下核心 API：
+
+| API | 说明 | 示例 |
+|-----|------|------|
+| `cg.new_Pvariable(id, args)` | 创建 `new Type(args)` 表达式 | `var = cg.new_Pvariable(config[CONF_ID])` |
+| `cg.Pvariable(id, var)` | 创建 placement new 变量（避免堆碎片） | `var = cg.Pvariable(config[CONF_ID], var)` |
+| `cg.add(expression)` | 生成一条 C++ 语句 | `cg.add(var.set_name("foo"))` |
+| `cg.add_define("USE_xxx")` | 添加条件编译宏 | `cg.add_define("USE_MY_SENSOR")` |
+| `cg.register_component(var, config)` | 注册为 Component（自动 setup/loop） | `await cg.register_component(var, config)` |
+| `sensor.new_sensor(config)` | 创建并注册 sensor Pvariable | `var = await sensor.new_sensor(config)` |
+| `sensor.register_sensor(var, config)` | 注册 sensor 实体 | `await register_sensor(var, config)` |
+| `cg.get_variable(id)` | 获取已注册的变量（等待依赖） | `uart_var = await cg.get_variable(config[CONF_UART_ID])` |
+| `cg.esphome_ns.namespace("xxx")` | 创建 C++ 命名空间 | `ns = cg.esphome_ns.namespace("my_sensor")` |
+| `ns.class_("Xxx", bases)` | 声明 C++ 类（继承基类） | `MySensor = ns.class_("MySensor", cg.PollingComponent)` |
+
+**实体注册函数**（各实体类型提供）：
+
+| 实体类型 | 注册函数 | 说明 |
+|----------|----------|------|
+| sensor | `sensor.new_sensor(config)` / `sensor.register_sensor(var, config)` | 数值传感器 |
+| binary_sensor | `binary_sensor.new_binary_sensor(config)` | 二值传感器 |
+| switch | `switch.new_switch(config)` | 开关 |
+| light | `light.new_light(config)` | 灯光 |
+| output | `output.register_output(var, config)` | 输出平台 |
+| fan | `fan.new_fan(config)` | 风扇 |
+| cover | `cover.new_cover(config)` | 窗帘/门 |
+| text_sensor | `text_sensor.new_text_sensor(config)` | 文本传感器 |
+| number | `number.new_number(config)` | 数值输入 |
+| select | `select.new_select(config)` | 选择器 |
+| button | `button.new_button(config)` | 按钮 |
+
+#### 14.5.6 FINAL_VALIDATE_SCHEMA — 跨组件验证
+
+`FINAL_VALIDATE_SCHEMA` 在所有组件验证完成后执行，可以检查跨组件约束。典型用例是 UART 设备验证波特率：
+
+```python
+# 验证 UART 波特率是否符合设备要求
+FINAL_VALIDATE_SCHEMA = uart.final_validate_device_schema(
+    "my_sensor",
+    baud_rate=9600,           # 要求的波特率
+    require_rx=True,          # 需要 RX 引脚
+    require_tx=False,         # 不需要 TX 引脚
+    data_bits=8,              # 数据位
+    parity="NONE",            # 校验位
+)
+```
+
+自定义跨组件验证：
+
+```python
+def _final_validate(config):
+    full_config = fv.full_config.get()        # 获取完整配置
+    # 例如：检查该组件是否与 wifi 共存
+    if "wifi" in full_config and "my_sensor" in full_config:
+        raise cv.Invalid("my_sensor conflicts with wifi")
+
+FINAL_VALIDATE_SCHEMA = _final_validate
+```
+
+### 14.6 实战分析：dashboard_import 组件
+
+`dashboard_import` 是一个特殊的组件，展示了一些高级模式：
+
+```python
+# esphome/components/dashboard_import/__init__.py
+
+DEPENDENCIES = ["api"]                # 依赖 API（因为 mDNS 发现只在 API 启用时工作）
+CODEOWNERS = ["@esphome/core"]
+
+CONFIG_SCHEMA = cv.All(
+    cv.Schema({
+        cv.Required("package_import_url"): validate_import_url,
+        cv.Optional("import_full_config", default=False): cv.boolean,
+    }),
+    validate_full_url,               # 跨字段验证
+)
+
+FINAL_VALIDATE_SCHEMA = _final_validate  # 要求 esphome.project 信息
+
+async def to_code(config):
+    cg.add_define("USE_DASHBOARD_IMPORT")
+    url = config["package_import_url"]
+    cg.add(dashboard_import_ns.set_package_import_url(url))   # 将 URL 传递给 C++ 代码
+```
+
+此组件在设备被"Adopt"导入时使用，`import_config()` 函数生成设备的 YAML 配置文件：
+
+```python
+def import_config(path, name, friendly_name, project_name, import_url, network, encryption):
+    # 生成配置文件
+    config = {
+        "substitutions": {"name": name},
+        "packages": {project_name: import_url},    # 使用 packages 引用项目模板
+        "esphome": {"name": "${name}", "name_add_mac_suffix": False},
+    }
+    if encryption:
+        key = base64.b64encode(secrets.token_bytes(32)).decode()
+        config["api"] = {"encryption": {"key": key}}   # 自动生成加密密钥
+```
+
+### 14.7 packages 配置引用
+
+外部组件仓库中通常包含项目模板 YAML，用户通过 `packages` 配置引用：
+
+```yaml
+# 用户的设备配置
+substitutions:
+  name: my-bluetooth-proxy
+
+packages:
+  bluetooth-proxy: github://esphome/bluetooth-proxy@main   # 引用项目模板
+
+esphome:
+  name: ${name}
+  name_add_mac_suffix: false
+```
+
+`packages` 组件（`esphome/components/packages/__init__.py`）负责：
+1. 解析简写 URL（与 `external_components` 相同的 `validate_source_shorthand()`）
+2. 从 Git 仓库下载 YAML 文件
+3. 将下载的配置与用户本地配置合并（`merge_config()`）
+4. 支持 substitutions 变量传递（`CONF_VARS` / `CONF_SUBSTITUTIONS`）
+5. 递归 include 深度限制：`MAX_INCLUDE_DEPTH = 20`
+
+### 14.8 C++ 头文件包含规则
+
+外部组件的 C++ 文件必须正确 include ESPHome 的头文件。关键规则：
+
+```cpp
+// 1. 总是先 include 自己的头文件（防止隐式依赖）
+#include "my_sensor.h"
+
+// 2. include ESPHome 核心头文件
+#include "esphome/core/component.h"
+#include "esphome/core/log.h"
+#include "esphome/core/hal.h"
+
+// 3. include 依赖组件的头文件（与 DEPENDENCIES 对应）
+#include "esphome/components/uart/uart.h"
+#include "esphome/components/sensor/sensor.h"
+
+// 4. 不要 include 不需要的头文件（条件编译会裁剪未使用的组件）
+```
+
+ESPHome 的 `writer.py` 会自动生成 `esphome.h` 超级头文件，include 所有用到的组件头文件。生成的 `main.cpp` 中 `#include "esphome.h"` 即可访问所有组件。
+
+### 14.9 组件开发注意事项
+
+#### 避免的常见错误
+
+| 问题 | 说明 | 正确做法 |
+|------|------|---------|
+| 组件目录名与内置组件同名 | 外部组件优先于内置组件，同名会覆盖内置组件 | 使用独特的组件名（如 `my_` 前缀） |
+| 忘记声明 `DEPENDENCIES` | 组件间依赖无法解析，`cg.get_variable()` 会失败 | 列出所有依赖组件 |
+| 直接使用 `CONFIG_SCHEMA = cv.Schema({...})` | sensor 等实体需要使用 `sensor.sensor_schema()` | 使用对应实体类型的 schema 构造器 |
+| 忘记 `await cg.register_component()` | 组件不会被注册到 `App`，`setup()`/`loop()` 不执行 | 所有 Component 子类必须注册 |
+| `to_code()` 不是 async def | 代码生成器期望协程函数 | 使用 `async def to_code(config)` |
+| 在 C++ 中使用 `std::string` 而非 `std::string` | ESPHome 使用 `StringRef` 和 `LogString` 节省 RAM | 使用 `const char *` 或 `LogString` |
+
+#### 组件注册流程
+
+```
+to_code(config)
+  │
+  ├── 1. cg.new_Pvariable(config[CONF_ID], ...) → 创建 C++ 对象
+  │     等价于: auto *var = new MySensorComponent(...)
+  │
+  ├── 2. await cg.register_component(var, config) → 注册到 App
+  │     等价于: App.register_component(var)
+  │     → 自动注册 setup/loop
+  │
+  ├── 3. await entity_type.new_entity(config) → 注册实体
+  │     等价于: App.register_sensor(var)
+  │     → 自动设置 name/hash/属性
+  │
+  ├── 4. cg.add(var.set_xxx(value)) → 设置属性
+  │     等价于: var->set_xxx(value)
+  │
+  └── 5. await cg.get_variable(dependency_id) → 获取依赖变量
+        如果未注册 → yield 回调度器等待
+        已注册 → 立即返回变量引用
+```
+
+#### 组件命名规范
+
+```
+C++ 命名空间:  esphome::my_sensor         (与目录名一致)
+C++ 类名:      MySensorComponent          (PascalCase + Component)
+C++ TAG:       "my_sensor"                (与命名空间一致)
+Python 命名空间: my_sensor_ns = cg.esphome_ns.namespace("my_sensor")
+Python 类:     MySensorComponent = my_sensor_ns.class_("MySensorComponent", ...)
+```
+
+### 14.10 发布与分发
+
+#### Git 仓库发布
+
+1. 在 GitHub/Codeberg/GitLab 创建仓库
+2. 按 `esphome/components/` 结构放置组件
+3. 用户通过 `github://owner/repo@branch` 引用
+
+#### 项目模板发布（Adopt 模式）
+
+ESPHome 支持通过 mDNS 发现的"可导入设备"一键 Adopt：
+
+1. 设备固件中声明 `dashboard_import` 和 `project` 信息：
+
+```yaml
+esphome:
+  project:
+    name: "myorg.my-device"
+    version: "1.0.0"
+
+dashboard_import:
+  package_import_url: github://myorg/my-device-firmware@main
+  import_full_config: false    # false: 使用 packages 引用; true: 下载完整 YAML
+```
+
+2. 设备在 mDNS 发现中广播项目信息
+3. Dashboard 的 `DashboardImportDiscovery` 捕获广播
+4. 用户在 Dashboard 中点击 "Adopt" → 自动生成配置文件
+
+**两种导入模式**：
+
+| 模式 | `import_full_config` | 生成的配置 |
+|------|---------------------|------------|
+| packages 引用（推荐） | `false` | 仅包含 `substitutions` + `packages` + `esphome` + `wifi`，引用远程项目模板 |
+| 完整配置下载 | `true` | 下载整个 YAML 文件到本地，完全独立 |
+
+#### 分发最佳实践
+
+1. **使用 `packages` 引用而非完整 YAML**：让设备配置保持最小化，更新通过 Git 仓库推送
+2. **在 `packages` 中使用 `ref` 指定稳定版本**：避免 `@main` 导致的不稳定更新
+3. **声明 `DEPENDENCIES`**：让 ESPHome 自动加载依赖组件
+4. **使用 `FINAL_VALIDATE_SCHEMA`**：验证 UART 波特率等跨组件约束
+5. **提供 `CODEOWNERS`**：方便社区协作和维护
+
+### 14.11 关键文件索引
+
+| 文件 | 作用 |
+|------|------|
+| `esphome/components/external_components/__init__.py` | CONFIG_SCHEMA、Git/本地 source 处理、install_meta_finder |
+| `esphome/loader.py` | ComponentManifest、ComponentMetaFinder、组件加载与缓存 |
+| `esphome/git.py` | clone_or_update（Git 仓库克隆/刷新/损坏恢复）、GitFile 简写解析 |
+| `esphome/config_validation.py` | SOURCE_SCHEMA（Git/Local schema）、validate_source_shorthand |
+| `esphome/config.py` | full_config() 中的 external_components 加载步骤（step 1.3） |
+| `esphome/core/entity_helpers.py` | setup_entity() 实体属性设置（device_class/unit/icon/name） |
+| `esphome/components/dashboard_import/__init__.py` | dashboard_import 组件 + import_config() 生成配置 |
+| `esphome/components/packages/__init__.py` | packages 配置引用与合并 |
+| `esphome/const.py` | TYPE_GIT/TYPE_LOCAL/CONF_EXTERNAL_COMPONENTS 等常量 |
