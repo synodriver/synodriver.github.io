@@ -4137,4 +4137,1065 @@ dashboard_import:
 | `esphome/core/entity_helpers.py` | setup_entity() 实体属性设置（device_class/unit/icon/name） |
 | `esphome/components/dashboard_import/__init__.py` | dashboard_import 组件 + import_config() 生成配置 |
 | `esphome/components/packages/__init__.py` | packages 配置引用与合并 |
+
+---
+
+## 十五、Sensor Filter 过滤器链架构
+
+### 15.1 概述
+
+ESPHome 的传感器过滤器（Filter）是一套**链式处理系统**，位于传感器原始读数与最终发布值之间。当传感器通过 `publish_state()` 发布新值时，该值不是直接传递给回调函数和 Controller，而是先经过一个**单向链表**形式的过滤器链——每个 Filter 可以修改值、丢弃值、延迟发送，或基于窗口统计计算新值。
+
+过滤器的存在使得传感器数据在 MCU 端就能完成去噪、平滑、采样控制等预处理，减轻 Home Assistant 侧的处理负担。整个过滤器系统通过条件编译宏 `USE_SENSOR_FILTER` 裁剪——只有 YAML 中配置了 `filters:` 的传感器才编译过滤器相关代码。
+
+```
+传感器硬件读数
+    ↓ publish_state(raw_value)
+    ↓ raw_callback_.call(raw_value)  ← on_raw_value 触发器收到原始值
+    ↓
+┌───┴─────────────────────────────────────────────────────────┐
+│  Filter 链 (单向链表)                                        │
+│                                                              │
+│  filter_list_ ──→ Filter1 ──next_──→ Filter2 ──next_──→ ... │
+│                                                              │
+│  每个 Filter:                                                │
+│    input(value) → new_value(value) → optional<float>        │
+│      • 有值 → output(value) → next_->input(value)           │
+│      • 空值 → 链终止，值被丢弃                              │
+│                                                              │
+│  链尾 (next_ == nullptr):                                    │
+│    output(value) → parent_->internal_send_state_to_frontend │
+└──────────────────────────────────────────────────────────────┘
+    ↓
+callback_.call(filtered_value)  ← on_value 触发器收到过滤后值
+    ↓
+ControllerRegistry::notify_sensor_update(this)  ← APIServer/WebServer 收到
+```
+
+### 15.2 Filter 链的核心机制
+
+#### 链的构建
+
+Filter 链在代码生成阶段通过 `Sensor::add_filters()` 构建，形成单向链表：
+
+```cpp
+void Sensor::add_filter(Filter *filter) {
+  if (this->filter_list_ == nullptr) {
+    this->filter_list_ = filter;   // 第一个 filter 成为链头
+  } else {
+    Filter *last = this->filter_list_;
+    while (last->next_ != nullptr)
+      last = last->next_;
+    last->initialize(this, filter); // 将新 filter 链到末尾
+  }
+  filter->initialize(this, nullptr); // 新 filter 的 next_ 暂为 nullptr
+}
+```
+
+每个 Filter 持有两个指针：
+
+```cpp
+class Filter {
+ protected:
+  Filter *next_{nullptr};     // 链中下一个 Filter
+  Sensor *parent_{nullptr};   // 所属 Sensor（链尾时用于回调）
+};
+```
+
+#### 值的流转
+
+核心流转通过两个方法实现：
+
+```cpp
+void Filter::input(float value) {
+  optional<float> out = this->new_value(value);  // 子类实现过滤逻辑
+  if (out.has_value())
+    this->output(*out);    // 有值 → 继续传递
+  // 空值 → 链终止，值被丢弃
+}
+
+void Filter::output(float value) {
+  if (this->next_ == nullptr) {
+    this->parent_->internal_send_state_to_frontend(value); // 链尾 → 发布
+  } else {
+    this->next_->input(value);  // 链中 → 传递给下一个
+  }
+}
+```
+
+**关键语义**：`new_value()` 返回 `optional<float>`：
+- **有值**：继续在链中传递（值可能被修改）
+- **空值**（`nullopt`）：值被丢弃，链中断，**后续 Filter 和回调都不会收到该值**
+
+#### publish_state() 的完整路径
+
+```cpp
+void Sensor::publish_state(float state) {
+  this->raw_state = state;                     // 保存原始值（deprecated 属性）
+  this->raw_callback_.call(state);             // on_raw_value 触发器（始终收到原始值）
+
+  if (this->filter_list_ == nullptr) {
+    this->internal_send_state_to_frontend(state); // 无过滤器 → 直接发布
+  } else {
+    this->filter_list_->input(state);             // 有过滤器 → 进入链
+  }
+}
+
+void Sensor::internal_send_state_to_frontend(float state) {
+  this->set_has_state(true);
+  this->state = state;                         // 更新最终状态
+  this->callback_.call(state);                 // on_value 触发器
+  ControllerRegistry::notify_sensor_update(this); // 推送到 APIServer 等
+}
+```
+
+> **原始值 vs 过滤后值**：`on_raw_value` 回调始终收到未经任何过滤的原始值，`on_value` 回调仅收到过滤链最终输出的值。这使得自动化系统可以在两个层面分别响应。
+
+### 15.3 过滤器分类体系
+
+ESPHome 的过滤器按功能分为六大类：
+
+```
+Filter (基类)
+│
+├── 数值变换类 — 修改值的数值
+│   ├── OffsetFilter              偏移: x → x + offset
+│   ├── MultiplyFilter            缩放: x → x * multiplier
+│   ├── CalibrateLinearFilter     线性校准: x → k*x + b (分段)
+│   ├── CalibratePolynomialFilter 多项式校准: x → Σ a_i * x^i
+│   ├── ToNTCResistanceFilter     NTC温度→电阻 (Steinhart-Hart逆)
+│   ├── ToNTCTemperatureFilter    NTC电阻→温度 (Steinhart-Hart正)
+│   ├── ClampFilter               限幅: x → clamp(x, min, max)
+│   ├── RoundFilter               精度取整: x → round(x, N位小数)
+│   ├── RoundMultipleFilter       倍数取整: x → round(x, multiple)
+│   ├── RoundSignificantDigitsFilter 有效数字取整
+│   └── LambdaFilter / StatelessLambdaFilter 自定义Lambda: x → f(x)
+│
+├── 窗口统计类 — 基于滑动窗口计算统计量
+│   ├── SlidingWindowFilter (基类, ring buffer)
+│   │   ├── SlidingWindowMovingAverageFilter  滑动窗口均值
+│   │   ├── MinFilter                          窗口最小值
+│   │   ├── MaxFilter                          窗口最大值
+│   │   └── SortedWindowFilter (排序窗口基类)
+│   │       ├── MedianFilter                   中位数
+│   │       └── QuantileFilter                 分位数
+│   ├── ExponentialMovingAverageFilter  指数移动均值 (无需窗口)
+│   └── StreamingFilter (批量窗口基类, O(1)内存)
+│       ├── StreamingMinFilter           批量最小值
+│       ├── StreamingMaxFilter           批量最大值
+│       └── StreamingMovingAverageFilter 批量均值
+│
+├── 采样控制类 — 控制值的发送频率
+│   ├── ThrottleFilter              限流: 两次发送最小间隔
+│   ├── ThrottleWithPriorityFilter  优先限流: 特定值立即发送
+│   ├── ThrottleWithPriorityNanFilter NaN优先限流 (特化版)
+│   ├── ThrottleAverageFilter       限流均值: 时间段内取均值后发送
+│   ├── DebounceFilter              去抖: 延迟发送, 新值覆盖旧定时器
+│   ├── HeartbeatFilter             心跳: 周期性重发最后值
+│   ├── TimeoutFilterBase (Component+Filter)
+│   │   ├── TimeoutFilterLast       超时发最后值
+│   │   └── TimeoutFilterConfigured 超时发配置值
+│   ├── SkipInitialFilter           跳过前N个值
+│   └── DeltaFilter                 差值过滤: 仅在变化超阈值时发送
+│
+├── 值筛选类 — 根据值的内容决定是否转发
+│   ├── FilterOutValueFilter<N>     过滤掉特定值
+│   └── OrFilter<N>                 多个过滤器的逻辑OR
+│
+└── 未分类
+    └── RoundSignificantDigitsFilter<Digits>  有效数字取整 (模板类)
+```
+
+### 15.4 数值变换类过滤器
+
+#### OffsetFilter — 偏移
+
+最简单的变换过滤器，将输入值加上固定偏移量：
+
+```cpp
+optional<float> new_value(float value) override {
+  return value + this->offset_.value();   // TemplatableFn<float>, 可为常量或lambda
+}
+```
+
+**YAML 示例**：
+```yaml
+filters:
+  - offset: 2.0          # 温度 +2°C 校准
+  - offset: !lambda "return x * 0.5;"  # 动态偏移
+```
+
+#### MultiplyFilter — 缩放
+
+将输入值乘以固定系数：
+
+```cpp
+optional<float> new_value(float value) override {
+  return value * this->multiplier_.value();
+}
+```
+
+**YAML 示例**：
+```yaml
+filters:
+  - multiply: 1.8        # °C → °F 的缩放因子
+```
+
+> Offset + Multiply 组合可以实现简单的线性校准，如 `multiply: 1.8; offset: 32` 即 °C → °F 转换。但对于多点校准，应使用 `calibrate_linear`。
+
+#### CalibrateLinearFilter — 分段线性校准
+
+最常用的校准过滤器，支持两种方法：
+
+| 方法 | 说明 | 计算方式 |
+|------|------|----------|
+| `least_squares` | 最小二乘拟合（默认） | 所有点拟合一条直线 y = kx + b |
+| `exact` | 精确分段映射 | 每对相邻点之间独立线性插值 |
+
+**最小二乘法**：所有校准点拟合为单一线性函数 `y = kx + b`，Python 侧使用 `fit_linear()` 计算系数，生成的 C++ 代码仅存储一对 `[k, b, NaN]`：
+
+```cpp
+// least_squares: 2个校准点 → 1个线性函数
+// 如 0.0 -> 0.0, 100.0 -> 105.0 → k=1.05, b=0
+optional<float> new_value(float value) override {
+  return calibrate_linear_compute(this->linear_functions_.data(), N, value);
+}
+// calibrate_linear_compute: 找到 value < functions[i][2] 的段(或最后段)
+// → (value * functions[i][0]) + functions[i][1]
+```
+
+**精确分段法**：每对校准点 `(x_i, y_i)` 和 `(x_i+1, y_i+1)` 之间计算独立的斜率和截距，Python 侧使用 `map_linear()` 生成多段 `[k, b, x_max]`，C++ 侧按 `x_max` 分段查找：
+
+```cpp
+// exact: 3个校准点 → 2个线性函数段
+// 如 0->0, 50->52, 100->105 → [[1.04, 0, 50], [1.06, -3, NaN]]
+// 0≤x<50: y = 1.04*x + 0
+// x≥50:   y = 1.06*x - 3
+```
+
+**YAML 示例**：
+```yaml
+filters:
+  - calibrate_linear:
+      datapoints:
+        - 0.0 -> 0.0
+        - 50.0 -> 52.0
+        - 100.0 -> 105.0
+      method: exact           # 或 least_squares (默认)
+```
+
+> `CalibrateLinearFilter` 是模板类 `CalibrateLinearFilter<N>`，`N` 在代码生成时确定，等于校准段数。所有系数存储在 `std::array<std::array<float, 3>, N>` 中，零堆分配。
+
+#### CalibratePolynomialFilter — 多项式校准
+
+高阶校准过滤器，使用多项式 `y = Σ a_i * x^i` 映射输入值：
+
+```cpp
+optional<float> new_value(float value) override {
+  return calibrate_polynomial_compute(this->coefficients_.data(), N, value);
+}
+// 实现: res = 0, x = 1; for i in 0..N-1: res += x * coefficients[i]; x *= value;
+```
+
+Python 侧通过 `_lstsq()` 求解最小二乘拟合系数。用户指定 `datapoints`（校准点）和 `degree`（多项式阶数），要求 `degree < len(datapoints)`。
+
+**YAML 示例**：
+```yaml
+filters:
+  - calibrate_polynomial:
+      datapoints:
+        - 0.0 -> 0.0
+        - 10.0 -> 10.5
+        - 20.0 -> 21.2
+      degree: 2              # 二阶多项式，需要至少3个校准点
+```
+
+#### ToNTCResistanceFilter / ToNTCTemperatureFilter — NTC 热敏电阻校准
+
+这两个过滤器实现了 **Steinhart-Hart 方程**的正向和逆向计算：
+
+- **`to_ntc_resistance`**：温度 → 电阻（逆向 Steinhart-Hart）
+- **`to_ntc_temperature`**：电阻 → 温度（正向 Steinhart-Hart，最常用）
+
+Steinhart-Hart 方程：`1/T = a + b·ln(R) + c·ln(R)³`
+
+校准参数支持三种输入方式：
+
+| 输入方式 | 说明 | 适用场景 |
+|----------|------|----------|
+| 三组 `(温度, 电阻)` | 自动计算 a、b、c | 最精确，需要3个校准点 |
+| `{b_constant, reference_temperature, reference_resistance}` | B常数法，c=0 | 简化模型，仅2个参数 |
+| `{a, b, c}` | 直接提供系数 | 已知 Steinhart-Hart 系数 |
+
+**YAML 示例**（最常见的电阻→温度转换）：
+```yaml
+filters:
+  - to_ntc_temperature:
+      calibration:
+        - 25°C -> 10000Ω     # 三点 Steinhart-Hart 校准
+        - 0°C -> 32550Ω
+        - 100°C -> 58Ω
+```
+
+#### ClampFilter — 限幅
+
+将值限制在 `[min, max]` 范围内，超范围值有两种处理方式：
+
+```cpp
+optional<float> new_value(float value) override {
+  if (value < min_) {
+    return ignore_out_of_range_ ? {} : min_;  // 丢弃 或 截断到最小值
+  }
+  if (value > max_) {
+    return ignore_out_of_range_ ? {} : max_;  // 丢弃 或 截断到最大值
+  }
+  return value;  // 在范围内，正常传递
+}
+```
+
+**YAML 示例**：
+```yaml
+filters:
+  - clamp:
+      min_value: 0
+      max_value: 100
+      ignore_out_of_range: false  # true=丢弃, false=截断(默认)
+```
+
+#### RoundFilter / RoundMultipleFilter / RoundSignificantDigitsFilter — 取整
+
+三种不同的取整策略：
+
+| 过滤器 | 算法 | YAML 关键字 |
+|--------|------|-------------|
+| `RoundFilter` | `round(10^N * x) / 10^N`，保留 N 位小数 | `round: 2` |
+| `RoundMultipleFilter` | `x - remainder(x, multiple)`，取整到倍数 | `round_to_multiple_of: 0.5` |
+| `RoundSignificantDigitsFilter<Digits>` | `round(x * 10^(Digits-1-log10(x))) / 10^(...)`，保留 D 位有效数字 | `round_to_significant_digits: 3` |
+
+`RoundSignificantDigitsFilter` 是模板类 `<uint8_t Digits>`，在编译期确定精度位数，范围 1-6。
+
+#### LambdaFilter / StatelessLambdaFilter — 自定义 Lambda
+
+最灵活的过滤器，用户通过 Lambda 表达式定义任意变换逻辑：
+
+```cpp
+// LambdaFilter — 使用 std::function，32字节
+optional<float> new_value(float value) override {
+  return this->lambda_filter_(value);  // float → optional<float>
+}
+
+// StatelessLambdaFilter — 仅存储函数指针，4字节
+optional<float> new_value(float value) override {
+  return this->lambda_filter_(value);  // 无捕获的函数指针
+}
+```
+
+**代码生成的优化**：Python 代码生成器在 `new_lambda_pvariable()` 中自动判断 Lambda 是否有捕获变量——无捕获的 Lambda 使用 `StatelessLambdaFilter`（4字节），有捕获的 Lambda 使用 `LambdaFilter`（32字节）。
+
+**YAML 示例**：
+```yaml
+filters:
+  - lambda: "return x * 1.8 + 32;"           # °C → °F（无捕获 → StatelessLambdaFilter）
+  - lambda: "if (x > 100) return {}; return x;"  # 过滤掉 >100 的值
+```
+
+> 返回 `{}`（空 optional）意味着丢弃该值——这是 Lambda 过滤器实现值筛选的唯一方式。
+
+### 15.5 窗口统计类过滤器
+
+窗口统计类过滤器基于最近 N 个读数计算统计量，是传感器去噪的核心工具。
+
+#### SlidingWindowFilter — 滑动窗口基类
+
+所有窗口统计过滤器的基础，使用**环形缓冲区**（`FixedRingBuffer<float>`）维护固定大小的滑动窗口：
+
+```cpp
+class SlidingWindowFilter : public Filter {
+  FixedRingBuffer<float> window_;  // 环形缓冲区，自动覆盖最旧值
+  uint16_t send_every_;            // 每N个输入值发送一次结果
+  uint16_t send_at_;               // 当前计数器
+};
+
+optional<float> new_value(float value) final {
+  this->window_.push_overwrite(value);    // 新值入窗口，最旧值被覆盖
+
+  if (++this->send_at_ >= this->send_every_) {
+    this->send_at_ = 0;
+    return this->compute_result();        // 计算统计量并发送
+  }
+  return {};                              // 未到发送时机，丢弃
+}
+```
+
+**`send_every` 和 `send_first_at` 机制**：
+
+| 参数 | 含义 | 默认值 |
+|------|------|--------|
+| `window_size` | 窗口大小（参与计算的值数量） | 因过滤器而异 |
+| `send_every` | 每多少个输入值发送一次结果 | 默认等于 window_size |
+| `send_first_at` | 首次发送在第几个输入值时 | 默认 1 |
+
+`send_first_at` 的实现巧妙：初始计数器 `send_at_ = send_every_ - send_first_at`，这样第 `send_first_at` 个值时计数器就达到 `send_every_` 触发发送。
+
+**FixedRingBuffer 设计**：
+
+```cpp
+template<typename T, size_t MAX_CAPACITY = 65535> class FixedRingBuffer {
+  // 一次 init(capacity) 分配，后续 push_overwrite 自动覆盖最旧值
+  // 无 pop_front() 开销，无 deque 碎片问题
+  // 支持 range-based for 循环遍历窗口内所有值
+};
+```
+
+对 `trivially_copyable` 类型（如 `float`），使用 `::operator new` 而非 `new T[]` 分配内存，避免不必要的初始化开销。
+
+#### SlidingWindowMovingAverageFilter — 滑动窗口均值
+
+最常用的去噪过滤器，对窗口内所有有效值（跳过 NaN）取平均：
+
+```cpp
+float compute_result() override {
+  float sum = 0;
+  size_t valid_count = 0;
+  for (float v : this->window_) {
+    if (!std::isnan(v)) { sum += v; valid_count++; }
+  }
+  return valid_count ? sum / valid_count : NAN;
+}
+```
+
+**YAML 示例**：
+```yaml
+filters:
+  - sliding_window_moving_average:
+      window_size: 15      # 15个值的滑动窗口
+      send_every: 15       # 每15个值发送一次均值
+      send_first_at: 1     # 第1个值时就开始计算
+```
+
+#### MinFilter / MaxFilter — 窗口最小值/最大值
+
+继承 `MinMaxFilter`（基于 `SlidingWindowFilter`），使用 `find_extremum_<Compare>()` 查找窗口内的极值：
+
+```cpp
+// MinFilter
+float compute_result() override { return this->find_extremum_<std::less<float>>(); }
+// MaxFilter
+float compute_result() override { return this->find_extremum_<std::greater<float>>(); }
+
+// 通用实现：遍历窗口，跳过 NaN，用比较器找极值
+template<typename Compare> float find_extremum_() {
+  float result = NAN;
+  Compare comp;
+  for (float v : this->window_) {
+    if (!std::isnan(v))
+      result = std::isnan(result) ? v : (comp(v, result) ? v : result);
+  }
+  return result;
+}
+```
+
+#### MedianFilter — 中位数
+
+继承 `SortedWindowFilter`，使用 `std::nth_element` 做 O(n) 部分排序而非完整排序：
+
+```cpp
+float compute_result() override {
+  FixedVector<float> values = this->get_window_values_(); // 复制窗口，去除NaN
+  size_t size = values.size();
+  size_t mid = size / 2;
+
+  if (size % 2) {
+    // 奇数个元素：nth_element 找中间元素
+    std::nth_element(values.begin(), values.begin() + mid, values.end());
+    return values[mid];
+  }
+  // 偶数个元素：nth_element 找上半中位数 + max_element 找下半中位数
+  std::nth_element(values.begin(), values.begin() + mid, values.end());
+  float upper = values[mid];
+  float lower = *std::max_element(values.begin(), values.begin() + mid);
+  return (lower + upper) / 2.0f;
+}
+```
+
+> `FixedVector` 是 ESPHome 的固定容量向量（预分配，无增长），在此用于一次性复制窗口数据做排序计算，避免修改环形缓冲区本身。
+
+#### QuantileFilter — 分位数
+
+继承 `SortedWindowFilter`，使用 `std::nth_element` 计算 0-1 范围的分位数：
+
+```cpp
+float compute_result() override {
+  FixedVector<float> values = this->get_window_values_();
+  size_t position = ceilf(values.size() * this->quantile_) - 1;
+  std::nth_element(values.begin(), values.begin() + position, values.end());
+  return values[position];
+}
+```
+
+**YAML 示例**：
+```yaml
+filters:
+  - quantile:
+      window_size: 10
+      send_every: 10
+      quantile: 0.9          # 90%分位数（默认0.9）
+```
+
+#### ExponentialMovingAverageFilter — 指数移动均值
+
+不需要滑动窗口的均值过滤器，使用指数衰减权重：
+
+```cpp
+optional<float> new_value(float value) override {
+  if (!std::isnan(value)) {
+    if (this->first_value_) {
+      this->accumulator_ = value;           // 首值直接作为初始值
+      this->first_value_ = false;
+    } else {
+      // EMA公式: new_avg = α * new_value + (1 - α) * old_avg
+      this->accumulator_ = (this->alpha_ * value) + (1.0f - this->alpha_) * this->accumulator_;
+    }
+  }
+
+  const float average = std::isnan(value) ? value : this->accumulator_;
+  // send_every 计数逻辑（与 SlidingWindowFilter 相同）
+}
+```
+
+**α（alpha）参数的意义**：
+- α 越大（接近 1）→ 越重视最新值，响应快但平滑少
+- α 越小（接近 0）→ 越重视历史均值，响应慢但平滑强
+- 默认 α = 0.1
+
+**与 SlidingWindowMovingAverage 的对比**：
+
+| 特性 | 滑动窗口均值 | 指数移动均值 |
+|------|-------------|-------------|
+| 内存 | O(window_size) | O(1)（仅 accumulator_） |
+| 响应速度 | 窗口大小的延迟 | 由 α 控制 |
+| 计算复杂度 | 每次遍历窗口 | 每次仅1次乘加 |
+| 历史权重 | 窗口内等权 | 指数衰减 |
+| 适用场景 | 短期突发去噪 | 长期趋势平滑 |
+
+**YAML 示例**：
+```yaml
+filters:
+  - exponential_moving_average:
+      alpha: 0.1             # 衰减因子（默认0.1）
+      send_every: 15
+      send_first_at: 1
+```
+
+#### StreamingFilter — 批量窗口优化（O(1) 内存）
+
+当 `window_size == send_every` 时（最常见的配置），滑动窗口不需要保留所有中间值——只需一个统计量（min/max/sum）即可。代码生成器自动选择 `StreamingFilter` 替代 `SlidingWindowFilter`：
+
+```python
+# Python 侧自动优化（__init__.py）
+@FILTER_REGISTRY.register("min", Filter, MIN_SCHEMA)
+async def min_filter_to_code(config, filter_id):
+  window_size = config[CONF_WINDOW_SIZE]
+  send_every = config[CONF_SEND_EVERY]
+
+  if window_size == send_every:
+    # 批量窗口 → 使用 O(1) StreamingMinFilter
+    rhs = StreamingMinFilter.new(window_size, send_first_at)
+    return cg.Pvariable(filter_id, rhs, StreamingMinFilter)
+  # 普通滑动窗口 → 使用 O(n) MinFilter + ring buffer
+  rhs = MinFilter.new(window_size, send_every, send_first_at)
+  return cg.Pvariable(filter_id, rhs, MinFilter)
+```
+
+**内存对比**（`window_size = 5000` 的场景）：
+
+| 过滤器 | 内存占用 | 说明 |
+|--------|---------|------|
+| SlidingWindowFilter (ring buffer) | ~20KB | 5000 × 4字节 float |
+| StreamingFilter | ~4字节 | 仅跟踪 min/max/sum |
+
+节省 99.98% 内存，对 RAM 受限的 MCU 至关重要。
+
+StreamingFilter 的三个子类实现极简：
+
+```cpp
+class StreamingMinFilter : public StreamingFilter {
+  float current_min_{NAN};
+  void process_value(float v) override {
+    if (!std::isnan(v)) current_min_ = std::isnan(current_min_) ? v : std::min(current_min_, v);
+  }
+  float compute_batch_result() override { return current_min_; }
+  void reset_batch() override { current_min_ = NAN; }
+};
+
+class StreamingMaxFilter : public StreamingFilter {  // 类似，用 std::max
+};
+
+class StreamingMovingAverageFilter : public StreamingFilter {
+  float sum_{0.0f}; size_t valid_count_{0};
+  void process_value(float v) override { if (!std::isnan(v)) { sum_ += v; valid_count_++; } }
+  float compute_batch_result() override { return valid_count_ > 0 ? sum_ / valid_count_ : NAN; }
+  void reset_batch() override { sum_ = 0; valid_count_ = 0; }
+};
+```
+
+### 15.6 采样控制类过滤器
+
+采样控制类过滤器不改变值的数值，而是控制值的**发送时机和频率**——丢弃值意味着不发送，而非修改值。
+
+#### ThrottleFilter — 限流
+
+最简单的采样控制：两次发送之间必须间隔至少 `min_time_between_inputs` 毫秒：
+
+```cpp
+optional<float> new_value(float value) override {
+  const uint32_t now = App.get_loop_component_start_time();
+  if (this->last_input_ == 0 || now - this->last_input_ >= min_time_between_inputs_) {
+    this->last_input_ = now;
+    return value;    // 间隔足够 → 发送
+  }
+  return {};          // 间隔不足 → 丢弃
+}
+```
+
+**YAML 示例**：
+```yaml
+filters:
+  - throttle: 10s       # 最少10秒发送一次
+```
+
+#### ThrottleWithPriorityFilter — 优先限流
+
+与 `ThrottleFilter` 相同的限流逻辑，但**特定值立即发送**（不限流）：
+
+```cpp
+// 通用版: value_list_matches_any() 检查值是否在优先列表中
+optional<float> throttle_with_priority_new_value(...) {
+  const uint32_t now = App.get_loop_component_start_time();
+  if (last_input == 0 || now - last_input >= min_time ||
+      value_list_matches_any(parent, value, values, count)) {
+    last_input = now;
+    return value;    // 间隔足够 或 值在优先列表 → 发送
+  }
+  return {};          // 否则 → 丢弃
+}
+```
+
+**ThrottleWithPriorityNanFilter — NaN 优先特化版**：
+
+最常见的优先值是 `NaN`（传感器断连时发布 NaN）。代码生成器自动检测——当 YAML 中的 `value` 全为 NaN 时，使用更轻量的 `ThrottleWithPriorityNanFilter`：
+
+```cpp
+// 特化版: 直接 std::isnan() 检查，无 TemplatableFn 数组开销
+optional<float> new_value(float value) override {
+  const uint32_t now = App.get_loop_component_start_time();
+  if (last_input_ == 0 || now - last_input_ >= min_time_ || std::isnan(value)) {
+    last_input_ = now;
+    return value;
+  }
+  return {};
+}
+```
+
+**YAML 示例**：
+```yaml
+filters:
+  - throttle_with_priority:
+      timeout: 10s
+      value: nan            # NaN值立即发送（默认），其他值限流
+```
+
+#### ThrottleAverageFilter — 限流均值
+
+在限流的同时对时间段内的所有值取平均——既控制发送频率，又保证数据不失真：
+
+```cpp
+optional<float> new_value(float value) override {
+  if (std::isnan(value)) {
+    this->have_nan_ = true;    // 标记有 NaN
+  } else {
+    this->sum_ += value;       // 累加
+    this->n_++;                // 计数
+  }
+  return {};                    // 永不立即发送
+}
+
+// initialize() 中注册定时器：
+void initialize(Sensor *parent, Filter *next) override {
+  Filter::initialize(parent, next);
+  App.scheduler.set_interval(this, this->time_period_, [this]() {
+    if (this->n_ == 0) {
+      if (this->have_nan_) this->output(NAN);  // 仅 NaN → 输出 NaN
+    } else {
+      this->output(this->sum_ / this->n_);      // 有值 → 输出均值
+      this->sum_ = 0.0f; this->n_ = 0;          // 重置
+    }
+    this->have_nan_ = false;
+  });
+}
+```
+
+**内存优化**：`n_` 和 `have_nan_` 打包在一个 32 位字中——`n_` 占 31 位（最大 2^31 ≈ 2.1B，远大于实际采样率 × 24小时），`have_nan_` 占 1 位。
+
+**YAML 示例**：
+```yaml
+filters:
+  - throttle_average: 60s     # 每60秒发送一次时间段内的均值
+```
+
+#### DebounceFilter — 去抖
+
+收到新值后不立即发送，而是延迟 `time_period` 毫秒——如果延迟期间收到新值，旧定时器被取消（同 key），新值重新开始延迟：
+
+```cpp
+optional<float> new_value(float value) override {
+  // self key: 同一个 Filter 的定时器自动互斥（cancel + replace）
+  App.scheduler.set_timeout(this, this->time_period_, [this, value]() {
+    this->output(value);
+  });
+  return {};    // 永不立即发送，等定时器到期
+}
+```
+
+> 与 `ThrottleFilter` 的区别：Throttle 是"发送后静默 N 秒"，Debounce 是"收到后等 N 秒才发送（新值覆盖等待）"。Debounce 适合按钮/开关场景（最终值才重要），Throttle 适合传感器场景（定期采样）。
+
+#### HeartbeatFilter — 心跳
+
+周期性重发最后收到的值，确保 Home Assistant 始终看到"活"的传感器状态：
+
+```cpp
+optional<float> new_value(float value) override {
+  this->last_input_ = value;
+  this->has_value_ = true;
+  if (this->optimistic_) return value;  // optimistic: 每次都发送 + 心跳重发
+  return {};                             // 否则: 仅通过心跳重发
+}
+
+// initialize() 中注册定时器：
+void initialize(Sensor *parent, Filter *next) override {
+  App.scheduler.set_interval(this, this->time_period_, [this]() {
+    if (this->has_value_) this->output(this->last_input_);
+  });
+}
+```
+
+`optimistic` 模式：收到新值时立即发送（`return value`），同时仍然心跳重发。非 optimistic 模式：仅在心跳定时器到期时发送。
+
+**YAML 示例**：
+```yaml
+filters:
+  - heartbeat: 60s                    # 每60秒重发最后值
+  - heartbeat:
+      period: 60s
+      optimistic: true                # 收到新值也立即发送
+```
+
+#### TimeoutFilter — 超时
+
+当传感器长时间不发值时，自动发布一个替代值。**有意继承 `Component`**（而非使用 Scheduler）——这是经过深思熟虑的 RAM 优化设计：
+
+```
+为什么 TimeoutFilter 继承 Component 而不使用 Scheduler？
+
+每台设备可能有多个传感器使用 timeout filter（如多LD2450板）。
+如果每个 armed filter 都持有一个 live SchedulerItem，
+RAM 开销远大于 Component 的 BSS 字节。
+
+SchedulerItem ≈ 80+ bytes (live, while armed)
+Component overhead ≈ 几字节 (one-time, BSS)
+
+loop() 方案的优势:
+- enable_loop()/disable_loop() 在无超时时零开销
+- armed 时仅一个 timestamp 比较，无 scheduler cancel/insert 路径
+```
+
+两个子类：
+
+| 过滤器 | 超时后发布的值 | 适用场景 |
+|--------|---------------|---------|
+| `TimeoutFilterLast` | 最后收到的值 | "超时后重发最后一次读数" |
+| `TimeoutFilterConfigured` | 用户配置的固定值 | "超时后发布 NaN/0 等" |
+
+```cpp
+// TimeoutFilterLast: 超时发布最后值
+optional<float> new_value(float value) override {
+  this->pending_value_ = value;        // 记住当前值
+  this->timeout_start_time_ = millis(); // 记录超时起点
+  this->enable_loop();                  // 启用 loop 检查
+  return value;                         // 正常发送当前值
+}
+
+// loop() 中检查超时
+void loop() override {
+  const uint32_t now = App.get_loop_component_start_time();
+  if (now - this->timeout_start_time_ >= this->time_period_) {
+    this->output(this->get_output_value()); // 超时 → 发布替代值
+    this->disable_loop();                    // 停止 loop 检查
+  }
+}
+```
+
+**YAML 示例**：
+```yaml
+filters:
+  - timeout:                    # 超时5秒后发布NaN
+      timeout: 5s
+      value: nan
+  - timeout: 5s                 # 简写: 默认 value=nan
+  - timeout:                    # 超时5秒后重发最后值
+      timeout: 5s
+      value: last
+```
+
+> `TimeoutFilter` 在 LD2450/LD2412 等雷达组件中广泛使用——当目标消失后雷达不再发值，timeout 确保距离传感器及时归零。
+
+#### SkipInitialFilter — 跳过初始值
+
+跳过前 N 个值，之后变为透明（所有值直接通过）：
+
+```cpp
+optional<float> new_value(float value) override {
+  if (this->num_to_ignore_ > 0) {
+    this->num_to_ignore_--;
+    return {};    // 跳过
+  }
+  return value;   // N个值后，直接通过
+}
+```
+
+适用场景：传感器刚启动时的读数不稳定，跳过前几个值避免发送错误数据。
+
+#### DeltaFilter — 差值过滤
+
+仅在新值与旧值的差值在指定范围内时发送：
+
+```cpp
+optional<float> new_value(float value) override {
+  if (std::isnan(this->last_value_)) {
+    this->last_value_ = value;
+    return value;    // 首值总是发送
+  }
+  float ref = this->baseline_(this->last_value_); // 默认: baseline = last_value
+  float min = fabsf(this->min_a0_ + ref * this->min_a1_); // 线性阈值
+  float max = fabsf(this->max_a0_ + ref * this->max_a1_);
+  float delta = fabsf(value - ref);
+  if (delta > min && delta <= max) {  // delta 在 [min, max) 范围内
+    this->last_value_ = value;
+    return value;
+  }
+  return {};   // 变化太小或太大 → 丢弃
+}
+```
+
+**阈值是线性方程**：`min_threshold = |min_a0 + value * min_a1|`，支持固定阈值（仅 a0）和百分比阈值（仅 a1）的混合：
+
+| YAML 配置 | 计算方式 | 含义 |
+|-----------|---------|------|
+| `delta: 0.1` | min=0.1, max=∞ | 变化至少 > 0.1 才发送 |
+| `delta: 5%` | min=last*0.05, max=∞ | 变化至少 > 5% 才发送 |
+| `delta: {min_value: 0.1, max_value: 10}` | min=0.1, max=10 | 变化在 0.1~10 之间才发送 |
+
+`baseline` 可自定义——默认是上一个值，但可以设为 lambda 函数（如设为0，则 delta 变为绝对值过滤）。
+
+**YAML 示例**：
+```yaml
+filters:
+  - delta: 0.1                    # 变化 > 0.1 才发送
+  - delta: 5%                     # 变化 > 5% 才发送
+  - delta:
+      min_value: 0.1
+      max_value: 10               # 变化在 0.1~10 之间才发送
+      baseline: !lambda "return 0;" # 基线为0（变为绝对值过滤）
+```
+
+### 15.7 值筛选类过滤器
+
+#### FilterOutValueFilter<N> — 过滤特定值
+
+丢弃匹配指定值列表的读数，其他值正常通过：
+
+```cpp
+optional<float> new_value(float value) override {
+  if (this->value_matches_any_(value))
+    return {};    // 匹配 → 丢弃
+  return value;   // 不匹配 → 通过
+}
+```
+
+**值的匹配考虑精度**：`value_list_matches_any()` 使用传感器的 `accuracy_decimals` 做 `round()` 比较——精度为 2 位小数的传感器，值 1.005 和配置值 1.01 会被视为匹配（先 round 再比较）。NaN 值的匹配是特殊处理的。
+
+**YAML 示例**：
+```yaml
+filters:
+  - filter_out: nan              # 过滤掉 NaN 值
+  - filter_out: [0.0, nan]       # 过滤掉 0 和 NaN
+```
+
+> `FilterOutValueFilter` 是模板类 `<size_t N>`，N 在代码生成时确定。值列表存储在 `std::array<TemplatableFn<float>, N>` 中，零堆分配。
+
+#### OrFilter<N> — 逻辑 OR 组合
+
+将多个过滤器逻辑 OR 组合——**任一子过滤器输出值，则最终输出该值**：
+
+```cpp
+template<size_t N> class OrFilter : public Filter {
+  std::array<Filter *, N> filters_;    // 子过滤器数组
+  PhiNode phi_{this};                  // 特殊的链尾节点
+  bool has_value_{false};              // 本轮是否已有子过滤器输出
+
+  class PhiNode : public Filter {
+    OrFilter *or_parent_;
+    optional<float> new_value(float value) override {
+      if (!this->or_parent_->has_value_) {
+        this->or_parent_->output(value); // 首次输出 → 发送到链尾
+        this->or_parent_->has_value_ = true;
+      }
+      return {};   // 后续输出 → 丢弃（已发过一次了）
+    }
+  };
+};
+```
+
+**PhiNode 的工作机制**：
+
+所有子过滤器共享同一个 `PhiNode` 作为链尾。当任一子过滤器输出值时，`PhiNode` 将该值通过 `OrFilter::output()` 发送到主链的下一个过滤器。同一轮输入中，只有第一个子过滤器的输出被传递，后续子过滤器的输出被丢弃——保证每个输入值最多产生一个输出。
+
+```
+新值 → OrFilter::new_value(value)
+         │  has_value_ = false
+         │  对每个子过滤器调用 input(value)
+         │
+         ├→ 子Filter1 → ... → PhiNode.output(v1) → OrFilter.output(v1) → 下一个主链Filter
+         │                    has_value_ = true
+         ├→ 子Filter2 → ... → PhiNode → has_value_ 已为 true → 丢弃
+         ├→ 子Filter3 → ... → PhiNode → has_value_ 已为 true → 丢弃
+```
+
+**YAML 示例**：
+```yaml
+filters:
+  - or:
+      - throttle: 10s            # 每10秒发一次
+      - delta: 5%                # 变化超5%也发一次
+```
+
+> 这是 "定期采样 + 大变化立即发" 的经典组合——日常10秒一次采样，突发大变化立即感知。
+
+### 15.8 过滤器的条件编译与内存优化
+
+整个过滤器系统通过 `USE_SENSOR_FILTER` 宏裁剪：
+
+```cpp
+// sensor.h
+#ifdef USE_SENSOR_FILTER
+#include "esphome/components/sensor/filter.h"
+#endif
+
+// sensor.cpp
+#ifdef USE_SENSOR_FILTER
+  if (this->filter_list_ == nullptr) {
+    this->internal_send_state_to_frontend(state);
+  } else {
+    this->filter_list_->input(state);
+  }
+#else
+  this->internal_send_state_to_frontend(state);  // 无过滤器 → 直接发布
+#endif
+```
+
+Python 侧仅在 YAML 中配置了 `filters:` 时才添加 `USE_SENSOR_FILTER` 定义：
+
+```python
+if config.get(CONF_FILTERS):  # must exist and not be empty
+  cg.add_define("USE_SENSOR_FILTER")
+  filters = await build_filters(config[CONF_FILTERS])
+  cg.add(var.set_filters(filters))
+```
+
+**模板类参数化**：多个过滤器使用 `<size_t N>` 模板参数，N 在代码生成时确定（等于配置的列表长度），保证所有数据存储在 `std::array` 中，零堆分配：
+
+| 过滤器 | 模板参数 N | 存储结构 |
+|--------|-----------|---------|
+| `FilterOutValueFilter<N>` | 过滤值数量 | `std::array<TemplatableFn<float>, N>` |
+| `ThrottleWithPriorityFilter<N>` | 优先值数量 | 同上 |
+| `OrFilter<N>` | 子过滤器数量 | `std::array<Filter *, N>` |
+| `CalibrateLinearFilter<N>` | 校准段数 | `std::array<std::array<float, 3>, N>` |
+| `CalibratePolynomialFilter<N>` | 系数数量 | `std::array<float, N>` |
+| `RoundSignificantDigitsFilter<Digits>` | 有效数字位数 | 无额外存储 |
+
+**StatelessLambdaFilter 优化**：无捕获的 Lambda 使用函数指针（4字节）而非 `std::function`（32字节），节省 28 字节/过滤器。
+
+**TimeoutFilter 继承 Component 而非使用 Scheduler**：已在上文详述——多传感器场景下，Component 的 BSS 开销远小于 SchedulerItem 的 live 开销。
+
+### 15.9 过滤器组合实战示例
+
+#### 温度传感器去噪 + 校准
+
+```yaml
+sensor:
+  - platform: dht
+    temperature:
+      name: "Living Room Temperature"
+      accuracy_decimals: 1
+      filters:
+        - offset: -0.5              # 校准偏移
+        - sliding_window_moving_average:  # 去噪
+            window_size: 10
+            send_every: 5
+```
+
+#### 功率传感器限流 + 去抖
+
+```yaml
+sensor:
+  - platform: bl0942
+    power:
+      name: "Power"
+      filters:
+        - throttle_average: 60s     # 每60秒发均值，避免频繁更新
+        - filter_out: 0.0           # 过滤掉0W（断线时误报）
+```
+
+#### 雷达距离传感器超时 + Delta
+
+```yaml
+sensor:
+  - platform: ld2450
+    distance:
+      name: "Target Distance"
+      filters:
+        - delta: 0.1               # 变化 >0.1m 才发送
+        - timeout:                  # 5秒无新值 → 发布NaN
+            timeout: 5s
+            value: nan
+```
+
+#### 复合条件："定期采样或大变化立即发"
+
+```yaml
+sensor:
+  - platform: adc
+    voltage:
+      name: "Battery Voltage"
+      filters:
+        - or:
+            - throttle: 30s         # 每30秒发一次
+            - delta: 5%             # 变化超5%立即发
+        - clamp:
+            min_value: 0
+            max_value: 15
+            ignore_out_of_range: true  # 超范围直接丢弃
+```
+
+### 15.10 关键文件索引
+
+| 文件 | 作用 |
+|------|------|
+| `esphome/components/sensor/filter.h` | 所有 Filter 类定义（743行），含继承体系、模板类 |
+| `esphome/components/sensor/filter.cpp` | Filter 链流转机制、各过滤器实现 |
+| `esphome/components/sensor/sensor.h` | Sensor 类 filter_list_ 成员、add/set/clear_filters 方法 |
+| `esphome/components/sensor/sensor.cpp` | publish_state() 过滤器链入口、internal_send_state_to_frontend() |
+| `esphome/components/sensor/__init__.py` | FILTER_REGISTRY 注册、各过滤器 schema + to_code()、StreamingFilter 自动优化 |
+| `esphome/core/helpers.h` | FixedRingBuffer（环形缓冲区）、FixedVector、TemplatableFn |
+| `esphome/core/defines.h` | USE_SENSOR_FILTER 条件编译宏（自动生成） |
 | `esphome/const.py` | TYPE_GIT/TYPE_LOCAL/CONF_EXTERNAL_COMPONENTS 等常量 |
