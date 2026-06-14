@@ -26,9 +26,12 @@ author: 'synodriver'
   - [10.2 manifest.json](#102-manifestjson)
   - [10.3 `__init__.py` — 集成入口](#103-__init__py--集成入口)
   - [10.4 `config_flow.py` — 配置流](#104-config_flowpy--配置流)
-  - [10.5 `sensor.py` — 向 sensor 域提供实体](#105-sensorpy--向-sensor-域提供实体)
+  - [10.5 `sensor.py` — 向 sensor 域提供实体（CoordinatorEntity 模式）](#105-sensorpy--向-sensor-域提供实体coordinatorentity-模式)
   - [10.6 从 YAML 配置加载集成](#106-从-yaml-配置加载集成)
-  - [10.7 关键实现要点](#107-关键实现要点)
+  - [10.7 不使用 Coordinator 的 SensorEntity 实现模式](#107-不使用-coordinator-的-sensorentity-实现模式)
+    - [10.7.1 轮询模式 — 纯 SensorEntity + async_update](#1071-轮询模式--纯-sensorentity--asyncupdate)
+    - [10.7.2 推送模式 — SensorEntity + dispatcher + async_write_ha_state](#1072-推送模式--sensorentity--dispatcher--async_write_ha_state)
+  - [10.8 关键实现要点](#108-关键实现要点)
 - [11. 关键设计模式总结](#11-关键设计模式总结)
 
 ---
@@ -726,30 +729,6 @@ class MyConfigFlow(ConfigFlow, domain="my_integration"):
         return MyOptionsFlow(config_entry)
 ```
 
-### 10.7 关键实现要点
-
-1. **runtime_data 模式**：使用 `ConfigEntry[MyData]` 泛型，在 `async_setup_entry` 中设置 `entry.runtime_data`，平台通过 `config_entry.runtime_data` 获取，类型安全。
-
-2. **ConfigEntryNotReady**：连接失败时抛出此异常，HA 会自动重试设置。
-
-3. **async_forward_entry_setups**：在集成入口的 `async_setup_entry` 中调用，将配置条目转发到各平台。
-
-4. **async_unload_platforms**：在 `async_unload_entry` 中调用，卸载所有平台。
-
-5. **async_on_unload**：注册卸载时的清理回调，如取消订阅、关闭连接。
-
-6. **DataUpdateCoordinator**：轮询式更新的推荐方式，自动处理轮询间隔、错误重试、状态更新。
-
-7. **CoordinatorEntity**：与 Coordinator 配合的实体基类，自动在 Coordinator 刷新时更新状态。
-
-8. **EntityDescription**：将实体属性从子类移到描述对象，支持一个实体类多个实例。
-
-9. **should_poll**：事件驱动集成的实体应设 `_attr_should_poll = False`，通过 `async_write_ha_state()` 主动推送更新。
-
-10. **YAML 与 ConfigFlow 共存**：通过 `SOURCE_IMPORT` 将 YAML 配置导入为 ConfigEntry，统一由 `async_setup_entry` 处理，避免维护两套逻辑。
-
----
-
 ## 6. 实体(Entity)体系
 
 ### 6.1 Entity 生命周期
@@ -933,30 +912,6 @@ class MyEntity(CoordinatorEntity, LightEntity):
     # CoordinatorEntity 自动在 coordinator 刷新时调用 async_write_ha_state()
 ```
 
-### 10.7 关键实现要点
-
-1. **runtime_data 模式**：使用 `ConfigEntry[MyData]` 泛型，在 `async_setup_entry` 中设置 `entry.runtime_data`，平台通过 `config_entry.runtime_data` 获取，类型安全。
-
-2. **ConfigEntryNotReady**：连接失败时抛出此异常，HA 会自动重试设置。
-
-3. **async_forward_entry_setups**：在集成入口的 `async_setup_entry` 中调用，将配置条目转发到各平台。
-
-4. **async_unload_platforms**：在 `async_unload_entry` 中调用，卸载所有平台。
-
-5. **async_on_unload**：注册卸载时的清理回调，如取消订阅、关闭连接。
-
-6. **DataUpdateCoordinator**：轮询式更新的推荐方式，自动处理轮询间隔、错误重试、状态更新。
-
-7. **CoordinatorEntity**：与 Coordinator 配合的实体基类，自动在 Coordinator 刷新时更新状态。
-
-8. **EntityDescription**：将实体属性从子类移到描述对象，支持一个实体类多个实例。
-
-9. **should_poll**：事件驱动集成的实体应设 `_attr_should_poll = False`，通过 `async_write_ha_state()` 主动推送更新。
-
-10. **YAML 与 ConfigFlow 共存**：通过 `SOURCE_IMPORT` 将 YAML 配置导入为 ConfigEntry，统一由 `async_setup_entry` 处理，避免维护两套逻辑。
-
----
-
 ## 7. 服务(Service)机制
 
 ### 7.1 服务注册
@@ -1022,30 +977,6 @@ component.async_register_batched_entity_service(
     async_get_forecasts,  # func(entities, service_call)
 )
 ```
-
-### 10.7 关键实现要点
-
-1. **runtime_data 模式**：使用 `ConfigEntry[MyData]` 泛型，在 `async_setup_entry` 中设置 `entry.runtime_data`，平台通过 `config_entry.runtime_data` 获取，类型安全。
-
-2. **ConfigEntryNotReady**：连接失败时抛出此异常，HA 会自动重试设置。
-
-3. **async_forward_entry_setups**：在集成入口的 `async_setup_entry` 中调用，将配置条目转发到各平台。
-
-4. **async_unload_platforms**：在 `async_unload_entry` 中调用，卸载所有平台。
-
-5. **async_on_unload**：注册卸载时的清理回调，如取消订阅、关闭连接。
-
-6. **DataUpdateCoordinator**：轮询式更新的推荐方式，自动处理轮询间隔、错误重试、状态更新。
-
-7. **CoordinatorEntity**：与 Coordinator 配合的实体基类，自动在 Coordinator 刷新时更新状态。
-
-8. **EntityDescription**：将实体属性从子类移到描述对象，支持一个实体类多个实例。
-
-9. **should_poll**：事件驱动集成的实体应设 `_attr_should_poll = False`，通过 `async_write_ha_state()` 主动推送更新。
-
-10. **YAML 与 ConfigFlow 共存**：通过 `SOURCE_IMPORT` 将 YAML 配置导入为 ConfigEntry，统一由 `async_setup_entry` 处理，避免维护两套逻辑。
-
----
 
 ## 8. 平台(Platform)与 EntityComponent 编排
 
@@ -1426,30 +1357,6 @@ class HueBaseEntity(Entity):
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-### 10.7 关键实现要点
-
-1. **runtime_data 模式**：使用 `ConfigEntry[MyData]` 泛型，在 `async_setup_entry` 中设置 `entry.runtime_data`，平台通过 `config_entry.runtime_data` 获取，类型安全。
-
-2. **ConfigEntryNotReady**：连接失败时抛出此异常，HA 会自动重试设置。
-
-3. **async_forward_entry_setups**：在集成入口的 `async_setup_entry` 中调用，将配置条目转发到各平台。
-
-4. **async_unload_platforms**：在 `async_unload_entry` 中调用，卸载所有平台。
-
-5. **async_on_unload**：注册卸载时的清理回调，如取消订阅、关闭连接。
-
-6. **DataUpdateCoordinator**：轮询式更新的推荐方式，自动处理轮询间隔、错误重试、状态更新。
-
-7. **CoordinatorEntity**：与 Coordinator 配合的实体基类，自动在 Coordinator 刷新时更新状态。
-
-8. **EntityDescription**：将实体属性从子类移到描述对象，支持一个实体类多个实例。
-
-9. **should_poll**：事件驱动集成的实体应设 `_attr_should_poll = False`，通过 `async_write_ha_state()` 主动推送更新。
-
-10. **YAML 与 ConfigFlow 共存**：通过 `SOURCE_IMPORT` 将 YAML 配置导入为 ConfigEntry，统一由 `async_setup_entry` 处理，避免维护两套逻辑。
-
----
-
 ## 10. 如何实现自己的集成
 
 ### 10.1 最小集成结构
@@ -1610,7 +1517,7 @@ class MyOptionsFlow(config_entries.OptionsFlowWithReload):
         )
 ```
 
-### 10.5 `sensor.py` — 向 sensor 域提供实体
+### 10.5 `sensor.py` — 向 sensor 域提供实体（CoordinatorEntity 模式）
 
 ```python
 from homeassistant.components.sensor import SensorEntity, SensorEntityDescription
@@ -2054,7 +1961,371 @@ CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 # 不支持 YAML 配置（manifest.json 中设置 "config_flow": true）
 ```
 
-### 10.7 关键实现要点
+### 10.7 不使用 Coordinator 的 SensorEntity 实现模式
+
+前面 10.5 节展示了最常见的 `CoordinatorEntity + SensorEntity` 模式——通过 `DataUpdateCoordinator` 定时拉取数据，实体自动跟随刷新。然而，并非所有传感器都需要 Coordinator。许多内置集成只继承 `SensorEntity` 本身，根据数据来源的不同，采用两种截然不同的更新策略：
+
+| 策略 | 适用场景 | 关键机制 | 典型集成 |
+|------|----------|----------|----------|
+| **轮询模式** | 本地可定时请求的数据源 | `async_update()` + `should_poll=True`（默认） | `moon` |
+| **推送模式** | 数据由外部事件推送或本地计算 | `should_poll=False` + `async_write_ha_state()` | `sun` |
+
+#### 10.7.1 轮询模式 — 纯 SensorEntity + async_update
+
+当传感器需要定时从某个数据源拉取数据，且数据量较小、更新逻辑简单时，可以直接继承 `SensorEntity`，通过重写 `async_update()` 方法实现轮询更新。这种方式不需要 `DataUpdateCoordinator`，EntityPlatform 的轮询定时器会定期调用 `async_update()`，而 `DataUpdateCoordinator` 提供的错误重试、多实体共享刷新等能力在这种简单场景下并不必要。
+
+**源码实例：Moon 集成** (`homeassistant/components/moon/`)
+
+Moon 集成追踪月相，数据来源是纯计算（`astral.moon.phase()`），无需外部 API，一个传感器就足够。
+
+**`manifest.json`** — 注意 `iot_class` 为 `calculated`（计算型，不是 `local_polling`）：
+
+```json
+{
+  "domain": "moon",
+  "name": "Moon",
+  "config_flow": true,
+  "integration_type": "service",
+  "iot_class": "calculated",
+  "single_config_entry": true
+}
+```
+
+**`__init__.py`** — 极简入口，只转发平台设置：
+
+```python
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.core import HomeAssistant
+from .const import PLATFORMS
+
+async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    return True
+
+async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+```
+
+**`config_flow.py`** — 极简配置流，不需要任何配置参数：
+
+```python
+from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
+from .const import DEFAULT_NAME, DOMAIN
+
+class MoonConfigFlow(ConfigFlow, domain=DOMAIN):
+    VERSION = 1
+
+    async def async_step_user(self, user_input=None) -> ConfigFlowResult:
+        if user_input is not None:
+            return self.async_create_entry(title=DEFAULT_NAME, data={})
+        return self.async_show_form(step_id="user")
+```
+
+**`sensor.py`** — 核心实现，只继承 `SensorEntity`，不使用 `CoordinatorEntity`：
+
+```python
+from astral import moon
+from homeassistant.components.sensor import SensorDeviceClass, SensorEntity
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.device_registry import DeviceEntryType, DeviceInfo
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+from homeassistant.util import dt as dt_util
+from .const import DOMAIN
+
+# 月相枚举值
+STATE_FIRST_QUARTER = "first_quarter"
+STATE_FULL_MOON = "full_moon"
+STATE_LAST_QUARTER = "last_quarter"
+STATE_NEW_MOON = "new_moon"
+STATE_WANING_CRESCENT = "waning_crescent"
+STATE_WANING_GIBBOUS = "waning_gibbous"
+STATE_WAXING_CRESCENT = "waxing_crescent"
+STATE_WAXING_GIBBOUS = "waxing_gibbous"
+
+
+async def async_setup_entry(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
+) -> None:
+    async_add_entities([MoonSensorEntity(entry)], True)
+
+
+class MoonSensorEntity(SensorEntity):
+    """Representation of a Moon sensor."""
+
+    _attr_has_entity_name = True
+    _attr_device_class = SensorDeviceClass.ENUM
+    _attr_options = [
+        STATE_NEW_MOON,
+        STATE_WAXING_CRESCENT,
+        STATE_FIRST_QUARTER,
+        STATE_WAXING_GIBBOUS,
+        STATE_FULL_MOON,
+        STATE_WANING_GIBBOUS,
+        STATE_LAST_QUARTER,
+        STATE_WANING_CRESCENT,
+    ]
+    _attr_translation_key = "phase"
+
+    def __init__(self, entry: ConfigEntry) -> None:
+        self._attr_unique_id = entry.entry_id
+        self._attr_device_info = DeviceInfo(
+            name="Moon",
+            identifiers={(DOMAIN, entry.entry_id)},
+            entry_type=DeviceEntryType.SERVICE,
+        )
+
+    async def async_update(self) -> None:
+        """Get the time and updates the states."""
+        today = dt_util.now().date()
+        state = moon.phase(today)
+
+        if state < 0.5 or state > 27.5:
+            self._attr_native_value = STATE_NEW_MOON
+        elif state < 6.5:
+            self._attr_native_value = STATE_WAXING_CRESCENT
+        elif state < 7.5:
+            self._attr_native_value = STATE_FIRST_QUARTER
+        elif state < 13.5:
+            self._attr_native_value = STATE_WAXING_GIBBOUS
+        elif state < 14.5:
+            self._attr_native_value = STATE_FULL_MOON
+        elif state < 20.5:
+            self._attr_native_value = STATE_WANING_GIBBOUS
+        elif state < 21.5:
+            self._attr_native_value = STATE_LAST_QUARTER
+        else:
+            self._attr_native_value = STATE_WANING_CRESCENT
+```
+
+**关键要点**：
+
+1. **`should_poll` 默认为 `True`**：`SensorEntity` 默认就是轮询模式，不需要显式设置。EntityPlatform 会按 `scan_interval` 定时调用 `async_update()`。
+
+2. **`async_update()` 方法**：这是轮询模式下 Entity 获取数据的入口。每次轮询时，EntityPlatform 先调用 `async_device_update()` → `async_update()`，然后自动调用 `async_write_ha_state()` 将更新写入状态机。因此 `async_update()` 中只需要更新 `_attr_*` 属性，不需要手动调用 `async_write_ha_state()`。
+
+3. **`_attr_*` 类属性**：Moon 传感器大量使用 `_attr_*` 设置静态属性（`_attr_has_entity_name`、`_attr_device_class`、`_attr_options`、`_attr_translation_key`），在 `async_update()` 中通过 `self._attr_native_value = ...` 动态更新值。这是 HA 推荐的写法——避免定义过多的 property。
+
+4. **`async_add_entities([MoonSensorEntity(entry)], True)`**：第二个参数 `True` 表示 `update_before_add`，即添加实体前先调用一次 `async_update()`，确保实体有初始值。
+
+**何时选择此模式而非 CoordinatorEntity**：
+
+- 数据源是纯计算或本地文件读取（无网络请求）
+- 只有一个或少数几个实体，不需要共享刷新逻辑
+- 不需要 Coordinator 提供的错误重试、刷新状态追踪等能力
+- 更新逻辑简单，不需要在多个实体间共享同一数据快照
+
+#### 10.7.2 推送模式 — SensorEntity + dispatcher + async_write_ha_state
+
+当数据由外部事件推送（如 MQTT 消息、WebSocket 通知、定时事件变化）而非需要主动轮询时，应采用推送模式。核心思路是：`should_poll = False`（不轮询）+ 在事件回调中更新属性并调用 `async_write_ha_state()` 主动推送状态变更。
+
+**源码实例：Sun 集成** (`homeassistant/components/sun/`)
+
+Sun 集成的传感器追踪太阳位置（方位角、仰角）和下一个日出/日落时间。太阳位置数据由 Sun 实体自行计算，根据太阳相位以不同间隔更新，通过 dispatcher 信号通知传感器刷新。
+
+**`__init__.py`** — 入口创建 Sun 实体并注册为 runtime_data：
+
+```python
+from homeassistant.config_entries import SOURCE_IMPORT
+from homeassistant.const import Platform
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.entity_component import EntityComponent
+from .entity import Sun, SunConfigEntry
+
+PLATFORMS = [Platform.BINARY_SENSOR, Platform.SENSOR]
+CONFIG_SCHEMA = cv.empty_config_schema(DOMAIN)
+
+async def async_setup(hass: HomeAssistant, config) -> bool:
+    if not hass.config_entries.async_entries(DOMAIN):
+        hass.async_create_task(
+            hass.config_entries.flow.async_init(
+                DOMAIN, context={"source": SOURCE_IMPORT}, data=config,
+            )
+        )
+    return True
+
+async def async_setup_entry(hass: HomeAssistant, entry: SunConfigEntry) -> bool:
+    sun = Sun(hass)
+    component = EntityComponent[Sun](_LOGGER, DOMAIN, hass)
+    await component.async_add_entities([sun])
+    entry.runtime_data = sun
+    entry.async_on_unload(sun.remove_listeners)
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    return True
+
+async def async_unload_entry(hass: HomeAssistant, entry: SunConfigEntry) -> bool:
+    if unload_ok := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
+        await entry.runtime_data.async_remove()
+    return unload_ok
+```
+
+**`entity.py`** — Sun 实体自行计算太阳位置，并通过 dispatcher 信号推送更新：
+
+```python
+from homeassistant.helpers.dispatcher import async_dispatcher_send
+
+SIGNAL_POSITION_CHANGED = "sun_position_changed"
+SIGNAL_EVENTS_CHANGED = "sun_events_changed"
+
+class Sun(Entity):
+    """Representation of the Sun — 核心实体，自行计算并推送。"""
+
+    _attr_name = "Sun"
+    entity_id = "sun.sun"
+
+    # ... 初始化、位置计算等方法 ...
+
+    @callback
+    def update_events(self, now=None):
+        """计算下一个日出/日落等事件，完成后发送信号。"""
+        # ... 计算逻辑 ...
+        async_dispatcher_send(self.hass, SIGNAL_EVENTS_CHANGED)  # ← 通知传感器
+
+        # 设置定时器，在下一个事件时间再次调用 update_events
+        self._update_events_listener = event.async_track_point_in_utc_time(
+            self.hass, self.update_events, self._next_change
+        )
+
+    @callback
+    def update_sun_position(self, now=None):
+        """计算当前太阳方位角和仰角，完成后发送信号。"""
+        self.solar_azimuth = round(
+            self.location.solar_azimuth(utc_point_in_time, self.elevation), 2
+        )
+        self.solar_elevation = round(
+            self.location.solar_elevation(utc_point_in_time, self.elevation), 2
+        )
+        self.async_write_ha_state()  # ← Sun 实体自身也推送状态
+        async_dispatcher_send(self.hass, SIGNAL_POSITION_CHANGED)  # ← 通知传感器
+
+        # 根据太阳相位设置不同间隔的定时器
+        delta = _PHASE_UPDATES[self.phase]
+        self._update_sun_position_listener = event.async_track_point_in_utc_time(
+            self.hass, self.update_sun_position, utc_point_in_time + delta
+        )
+```
+
+**`sensor.py`** — 传感器只继承 SensorEntity，通过 dispatcher 监听信号，收到信号时调用 `async_write_ha_state()`：
+
+```python
+from dataclasses import dataclass
+from homeassistant.components.sensor import (
+    SensorDeviceClass, SensorEntity, SensorEntityDescription, SensorStateClass,
+)
+from homeassistant.const import DEGREE, EntityCategory
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.dispatcher import async_dispatcher_connect
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+from .const import DOMAIN, SIGNAL_EVENTS_CHANGED, SIGNAL_POSITION_CHANGED
+from .entity import Sun, SunConfigEntry
+
+# 自定义 EntityDescription，增加 value_fn 和 signal 字段
+@dataclass(kw_only=True, frozen=True)
+class SunSensorEntityDescription(SensorEntityDescription):
+    """Describes a Sun sensor entity."""
+    value_fn: Callable[[Sun], StateType | datetime]  # ← 从 Sun 实体获取值的函数
+    signal: str                                      # ← 监听的 dispatcher 信号名
+
+# 定义所有传感器的描述
+SENSOR_TYPES: tuple[SunSensorEntityDescription, ...] = (
+    SunSensorEntityDescription(
+        key="next_rising",
+        device_class=SensorDeviceClass.TIMESTAMP,
+        translation_key="next_rising",
+        value_fn=lambda data: data.next_rising,
+        signal=SIGNAL_EVENTS_CHANGED,
+    ),
+    SunSensorEntityDescription(
+        key="solar_elevation",
+        state_class=SensorStateClass.MEASUREMENT,
+        translation_key="solar_elevation",
+        value_fn=lambda data: data.solar_elevation,
+        native_unit_of_measurement=DEGREE,
+        signal=SIGNAL_POSITION_CHANGED,
+        entity_registry_enabled_default=False,
+    ),
+    # ... 更多传感器描述 ...
+)
+
+
+async def async_setup_entry(
+    hass: HomeAssistant, entry: SunConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
+) -> None:
+    sun = entry.runtime_data
+    async_add_entities(
+        [SunSensor(sun, description, entry.entry_id) for description in SENSOR_TYPES]
+    )
+
+
+class SunSensor(SensorEntity):
+    """Representation of a Sun Sensor — 纯推送模式。"""
+
+    _attr_has_entity_name = True
+    _attr_should_poll = False          # ← 关键：不轮询！
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    entity_description: SunSensorEntityDescription
+
+    def __init__(self, sun, entity_description, entry_id) -> None:
+        self.entity_description = entity_description
+        self._attr_unique_id = f"{entry_id}-{entity_description.key}"
+        self.sun = sun
+
+    @property
+    def native_value(self):
+        """Return value of sensor — 从 Sun 实体直接读取计算好的值。"""
+        return self.entity_description.value_fn(self.sun)
+
+    async def async_added_to_hass(self) -> None:
+        """Register signal listener when added to hass."""
+        await super().async_added_to_hass()
+        # ← 关键：监听 dispatcher 信号，收到信号时调用 async_write_ha_state()
+        self.async_on_remove(
+            async_dispatcher_connect(
+                self.hass,
+                self.entity_description.signal,
+                self.async_write_ha_state,
+            )
+        )
+```
+
+**关键要点**：
+
+1. **`_attr_should_poll = False`**：这是推送模式的核心标志。设置后，EntityPlatform 不会定时调用 `async_update()`，实体必须自己负责推送状态更新。
+
+2. **`async_dispatcher_connect`**：在 `async_added_to_hass()` 中订阅 dispatcher 信号。当 Sun 实体计算完新数据后，发送 `SIGNAL_POSITION_CHANGED` 或 `SIGNAL_EVENTS_CHANGED` 信号，所有订阅该信号的 SunSensor 实体收到通知后调用 `async_write_ha_state()`，将最新的 `native_value`（通过 `value_fn(self.sun)` 从 Sun 实体获取）写入状态机。
+
+3. **`value_fn` + EntityDescription 模式**：Sun 集成巧妙地在 `SensorEntityDescription` 中增加了 `value_fn` 字段，让每个传感器描述自带一个从 Sun 实体提取值的函数。这样一来，8 个传感器只需一个 `SunSensor` 类，通过不同的 `entity_description` 配置即可——避免了 8 个子类的冗余。
+
+4. **`async_on_remove`**：在 `async_added_to_hass()` 中用 `async_on_remove()` 包裹信号订阅的取消逻辑，确保实体被移除时自动取消订阅，不会造成内存泄漏。
+
+5. **`native_value` property**：推送模式中，`native_value` 不从 Coordinator 的 `self.coordinator.data` 中取值，而是直接从运行时对象（`self.sun`）读取。因为运行时对象已经通过定时器更新了数据，传感器只需在收到信号时反映最新值即可。
+
+**推送模式的其他常见实现方式**：
+
+dispatcher 信号是 HA 内部通信的一种方式，推送模式还有其他常见的事件监听手段：
+
+| 监听方式 | 适用场景 | 注册方法 | 清理方法 |
+|----------|----------|----------|----------|
+| **dispatcher 信号** | 同一集成内部通信 | `async_dispatcher_connect(hass, signal, callback)` | `async_on_remove()` 包裹 |
+| **EventBus 事件** | 监听 HA 全局事件（如状态变化） | `hass.bus.async_listen(event_type, callback)` | `async_on_remove()` 包裹 |
+| **state_change 事件** | 监听其他实体状态变化 | `async_track_state_change_event(hass, [entity_ids], callback)` | `async_on_remove()` 包裹 |
+| **MQTT 订阅** | 接收 MQTT 消息推送 | `mqtt_subscription.async_subscribe_topics(hass, ...)` | `async_on_remove()` 包裹 |
+| **WebSocket 回调** | 接收设备推送数据 | 在 API 客户端中注册回调 | 连接关闭时自动清理 |
+
+所有监听方式的共同模式：在 `async_added_to_hass()` 中注册，在 `async_on_remove()` 或 `async_will_remove_from_hass()` 中取消。回调中更新 `_attr_*` 属性，然后调用 `async_write_ha_state()`。
+
+**何时选择推送模式而非 CoordinatorEntity**：
+
+- 数据源是事件驱动（设备主动推送状态、MQTT 消息、定时事件变化）
+- 实体可以从已有的运行时对象中直接读取值，不需要独立的拉取逻辑
+- 需要更细粒度的更新控制（如 Sun 根据不同太阳相位以不同间隔更新）
+- 一个数据源驱动多个传感器，但数据已经在别处计算好（如 Sun 实体）
+
+### 10.8 关键实现要点
 
 1. **runtime_data 模式**：使用 `ConfigEntry[MyData]` 泛型，在 `async_setup_entry` 中设置 `entry.runtime_data`，平台通过 `config_entry.runtime_data` 获取，类型安全。
 
@@ -2066,15 +2337,17 @@ CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
 5. **async_on_unload**：注册卸载时的清理回调，如取消订阅、关闭连接。
 
-6. **DataUpdateCoordinator**：轮询式更新的推荐方式，自动处理轮询间隔、错误重试、状态更新。
+6. **DataUpdateCoordinator**：轮询式更新的推荐方式，自动处理轮询间隔、错误重试、状态更新。适合多个实体共享同一数据源的场景。
 
-7. **CoordinatorEntity**：与 Coordinator 配合的实体基类，自动在 Coordinator 刷新时更新状态。
+7. **CoordinatorEntity**：与 Coordinator 配合的实体基类，自动在 Coordinator 刷新时更新状态。适合需要共享刷新逻辑的轮询式集成。
 
-8. **EntityDescription**：将实体属性从子类移到描述对象，支持一个实体类多个实例。
+8. **纯 SensorEntity 模式**：简单传感器可以直接继承 `SensorEntity`，通过 `async_update()` 实现轮询（如 Moon），或通过 `should_poll=False` + `async_write_ha_state()` 实现推送（如 Sun）。不需要 Coordinator 时不应强加 Coordinator。
 
-9. **should_poll**：事件驱动集成的实体应设 `_attr_should_poll = False`，通过 `async_write_ha_state()` 主动推送更新。
+9. **EntityDescription**：将实体属性从子类移到描述对象，支持一个实体类多个实例。配合 `value_fn` 可以进一步简化多传感器场景。
 
-10. **YAML 与 ConfigFlow 共存**：通过 `SOURCE_IMPORT` 将 YAML 配置导入为 ConfigEntry，统一由 `async_setup_entry` 处理，避免维护两套逻辑。
+10. **should_poll**：事件驱动集成的实体应设 `_attr_should_poll = False`，通过 `async_write_ha_state()` 主动推送更新；轮询式集成保持默认 `True`，由 EntityPlatform 定时调用 `async_update()`。
+
+11. **YAML 与 ConfigFlow 共存**：通过 `SOURCE_IMPORT` 将 YAML 配置导入为 ConfigEntry，统一由 `async_setup_entry` 处理，避免维护两套逻辑。
 
 ---
 
@@ -2102,13 +2375,13 @@ CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
 ### 11.3 实体模式
 
-| 模式 | 实现 |
-|------|------|
-| **轮询式** | `should_poll=True` + EntityPlatform 定时轮询 |
-| **协调器式** | `DataUpdateCoordinator` + `CoordinatorEntity` |
-| **事件驱动式** | `should_poll=False` + `async_write_ha_state()` 主动推送 |
-| **描述模式** | `EntityDescription` 将属性从子类移到描述对象 |
-| **_attr_* 模式** | 类属性默认值，减少 property 定义 |
+| 模式 | 实现 | 典型集成 |
+|------|------|----------|
+| **轮询式（纯 Entity）** | `should_poll=True` + `async_update()` | `moon` |
+| **协调器式** | `DataUpdateCoordinator` + `CoordinatorEntity` | `hue` (v1) |
+| **推送式（纯 Entity）** | `should_poll=False` + dispatcher/事件监听 + `async_write_ha_state()` | `sun` |
+| **描述模式** | `EntityDescription` + `value_fn` 将属性从子类移到描述对象 | `sun` |
+| **_attr_* 模式** | 类属性默认值，减少 property 定义 | `moon` |
 
 ### 11.4 集成模式
 
