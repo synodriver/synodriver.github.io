@@ -32,7 +32,12 @@ author: 'synodriver'
     - [10.7.1 轮询模式 — 纯 SensorEntity + async_update](#1071-轮询模式--纯-sensorentity--asyncupdate)
     - [10.7.2 推送模式 — SensorEntity + dispatcher + async_write_ha_state](#1072-推送模式--sensorentity--dispatcher--async_write_ha_state)
   - [10.8 关键实现要点](#108-关键实现要点)
-- [11. 关键设计模式总结](#11-关键设计模式总结)
+- [11. 蓝图(Blueprint)机制](#11-蓝图blueprint机制)
+  - [11.1 蓝图概述与使用方法](#111-蓝图概述与使用方法)
+  - [11.2 蓝图 YAML 格式与自定义蓝图](#112-蓝图-yaml-格式与自定义蓝图)
+  - [11.3 蓝图源码解析：导入、校验与替换](#113-蓝图源码解析导入校验与替换)
+  - [11.4 蓝图与自动化/脚本的集成](#114-蓝图与自动化脚本的集成)
+- [12. 关键设计模式总结](#12-关键设计模式总结)
 
 ---
 
@@ -2351,9 +2356,571 @@ dispatcher 信号是 HA 内部通信的一种方式，推送模式还有其他�
 
 ---
 
-## 11. 关键设计模式总结
+## 11. 蓝图(Blueprint)机制
 
-### 11.1 架构模式
+蓝图（Blueprint）是 Home Assistant 提供的一种配置复用机制——用户可以将自动化（automation）或脚本（script）的模板定义为一个蓝图，然后多次使用该蓝图，每次只需提供不同的输入参数（如不同的传感器、灯光实体）。蓝图让社区能够分享可复用的自动化模板，降低配置门槛。
+
+### 11.1 蓝图概述与使用方法
+
+#### 什么是蓝图？
+
+蓝图本质上是一个包含 `blueprint:` 元数据头的 YAML 文件，其中定义了：
+
+- **元数据**：蓝图名称、描述、所属域（automation 或 script）、作者、最低 HA 版本要求等
+- **输入定义**（`input:`）：蓝图的可配置参数，每个输入可以指定名称、描述、默认值和选择器（selector）
+- **配置模板**：触发器、条件、动作（automation）或序列（script）——其中引用输入的地方用 `!input <input_name>` 标记
+
+用户使用蓝图创建自动化/脚本时，只需填写蓝图定义的输入参数，HA 会自动将 `!input` 替换为用户提供的实际值，生成完整的配置。
+
+#### 使用蓝图的流程
+
+1. **导入蓝图**：在 Settings → Automations & Scenes → Blueprints 页面，点击 "Import Blueprint"，输入蓝图 URL（支持社区论坛、GitHub 文件、GitHub Gist、HA 官网、任意 URL）
+2. **创建自动化**：选择已导入的蓝图，点击 "Create Automation"，在编辑器中填写输入参数
+3. **保存运行**：保存后，自动化使用 `use_blueprint:` 配置，HA 在每次加载时自动替换输入生成完整配置
+
+#### 蓝图文件存储位置
+
+蓝图 YAML 文件存储在配置目录下的 `blueprints/` 子目录中：
+
+```
+config/
+├── blueprints/
+│   ├── automation/                # 自动化蓝图
+│   │   ├── homeassistant/         # HA 内置示例（首次启动自动复制）
+│   │   │   └── motion_light.yaml
+│   │   ├── community_user/        # 从社区论坛导入
+│   │   │   └── some_blueprint.yaml
+│   │   └── github_user/           # 从 GitHub 导入
+│   │       └── another_blueprint.yaml
+│   └── script/                    # 脚本蓝图
+│       ├── homeassistant/
+│       │   └── confirmable_notification.yaml
+│       └── ...
+```
+
+### 11.2 蓝图 YAML 格式与自定义蓝图
+
+#### 蓝图 YAML 结构
+
+一个自动化蓝图的完整 YAML 格式如下：
+
+```yaml
+blueprint:
+  name: Motion-activated Light          # 必需：蓝图名称
+  description: Turn on a light when motion is detected.  # 可选：描述
+  domain: automation                    # 必需：所属域（automation 或 script）
+  source_url: https://github.com/...    # 可选：蓝图来源 URL
+  author: Home Assistant                # 可选：作者
+  homeassistant:                        # 可选：HA 版本要求
+    min_version: 2024.1.0
+  input:                                # 可选：输入参数定义
+    motion_entity:                      # 输入名（与 !input 对应）
+      name: Motion Sensor               # 输入的显示名称
+      selector:                         # 选择器（控制前端输入控件）
+        entity:
+          filter:
+            - device_class: motion
+              domain: binary_sensor
+    light_target:
+      name: Light
+      selector:
+        target:
+          entity:
+            domain: light
+    no_motion_wait:
+      name: Wait time
+      description: Time to leave the light on after last motion.
+      default: 120                       # 默认值
+      selector:
+        number:
+          min: 0
+          max: 3600
+          unit_of_measurement: seconds
+
+# 以下是自动化配置模板，使用 !input 引用输入参数
+mode: restart
+max_exceeded: silent
+
+triggers:
+  - trigger: state
+    entity_id: !input motion_entity      # ← 替换为用户提供的传感器实体
+    from: "off"
+    to: "on"
+
+actions:
+  - action: light.turn_on
+    target: !input light_target          # ← 替换为用户提供的灯光目标
+  - wait_for_trigger:
+      trigger: state
+      entity_id: !input motion_entity
+      from: "on"
+      to: "off"
+  - delay: !input no_motion_wait        # ← 替换为用户提供的等待时间
+  - action: light.turn_off
+    target: !input light_target
+```
+
+#### `!input` 标记
+
+`!input` 是 YAML 自定义标签，在解析时被转换为 `Input` 对象（`annotatedyaml.Input`）。`Input` 是一个仅包含 `name` 字段的 `dataclass`：
+
+```python
+@dataclass(slots=True, frozen=True)
+class Input:
+    name: str
+```
+
+当 YAML Loader 遇到 `!input motion_entity` 时，调用 `Input.from_node(loader, node)`，创建一个 `Input(name="motion_entity")` 对象，暂存于 YAML 数据结构中。这个对象不是最终值——它是一个"占位符"，将在蓝图替换阶段被替换为用户提供的实际值。
+
+#### 输入定义的详细格式
+
+每个输入可以有以下字段：
+
+| 字段 | 必需 | 说明 |
+|------|------|------|
+| `name` | 可选 | 输入的显示名称（前端表单标签） |
+| `description` | 可选 | 输入的详细说明 |
+| `default` | 可选 | 默认值（用户未填时使用） |
+| `selector` | 可选 | 选择器定义（控制前端输入控件类型和过滤条件） |
+
+**选择器类型**（常用的）：
+
+| 选择器 | 前端控件 | 适用输入类型 |
+|--------|----------|-------------|
+| `entity` | 实体选择器 | 选择特定实体 |
+| `target` | 目标选择器 | 选择实体/设备/区域的组合 |
+| `device` | 设备选择器 | 选择特定设备 |
+| `number` | 数字滑块/输入 | 选择数值 |
+| `text` | 文本输入框 | 输入文本 |
+| `boolean` | 开关 | 选择 true/false |
+| `select` | 下拉选择 | 选择预设选项 |
+| `time` | 时间选择器 | 选择时间 |
+| `date` | 日期选择器 | 选择日期 |
+| `action` | 动作序列编辑器 | 定义一组动作 |
+| `addon` | Add-on 选择器 | 选择 Hass.io Add-on |
+| `area` | 区域选择器 | 选择区域 |
+
+#### 输入分组（Input Section）
+
+蓝图支持将输入参数分组显示，通过嵌套的 `input:` 字段实现：
+
+```yaml
+blueprint:
+  input:
+    notification_section:
+      name: Notification Settings
+      icon: mdi:bell
+      description: Configure notification options
+      collapsed: true               # 可折叠
+      input:
+        notify_device:
+          name: Device to notify
+          selector:
+            device:
+              filter:
+                integration: mobile_app
+        message:
+          name: Message
+          selector:
+            text:
+    action_section:
+      name: Action Settings
+      input:
+        confirm_action:
+          name: Confirmation Action
+          default: []
+          selector:
+            action:
+```
+
+分组输入在引用时直接用内部 input 名称（如 `!input notify_device`），而不是用分组名。HA 在校验时会检查所有 `!input` 引用的名称是否都有对应的输入定义，分组内的 key 会被展平到同一层。
+
+#### 使用蓝图创建自动化时的 YAML 格式
+
+用户通过蓝图创建自动化时，生成的 YAML 配置使用 `use_blueprint:` 字段：
+
+```yaml
+# automations.yaml
+- id: "1681234567"
+  alias: "Motion Light - Living Room"
+  use_blueprint:
+    path: homeassistant/motion_light.yaml   # 蓝图文件路径
+    input:
+      motion_entity: binary_sensor.living_room_motion   # 用户提供的实际值
+      light_target:
+        entity_id: light.living_room
+      no_motion_wait: 180
+```
+
+HA 加载此自动化时，会读取蓝图文件，将所有 `!input` 替换为 `input:` 中的实际值，生成完整的自动化配置。
+
+### 11.3 蓝图源码解析：导入、校验与替换
+
+#### 核心类结构
+
+蓝图机制涉及以下核心类，分布在 `homeassistant/components/blueprint/` 和 `annotatedyaml` 包中：
+
+| 类/文件 | 位置 | 说明 |
+|---------|------|------|
+| `Blueprint` | `models.py` | 蓝图数据模型，包含元数据和校验逻辑 |
+| `BlueprintInputs` | `models.py` | 蓝图输入数据，负责输入校验和替换 |
+| `DomainBlueprints` | `models.py` | 域级蓝图管理器，负责加载/存储蓝图文件 |
+| `Input` | `annotatedyaml/objects.py` | YAML `!input` 标记的数据类（占位符） |
+| `substitute()` | `annotatedyaml/input.py` | 递归替换 YAML 数据中的 `Input` 对象 |
+| `extract_inputs()` | `annotatedyaml/input.py` | 递归提取 YAML 数据中所有 `Input` 引用名 |
+| `BLUEPRINT_SCHEMA` | `schemas.py` | 蓝图元数据的 Voluptuous 校验 Schema |
+| `BLUEPRINT_INSTANCE_FIELDS` | `schemas.py` | `use_blueprint:` 字段的校验 Schema |
+
+#### 蓝图导入流程
+
+**源码**: `homeassistant/components/blueprint/importer.py`
+
+用户在前端点击 "Import Blueprint" 时，通过 WebSocket 调用 `ws_import_blueprint`，触发以下流程：
+
+```
+前端输入 URL → websocket_api: blueprint/import
+  │
+  ├── importer.fetch_blueprint_from_url(hass, url)
+  │     │
+  │     ├── 尝试 5 种导入函数（按顺序）：
+  │     │     1. fetch_blueprint_from_community_post → 解析论坛帖子 JSON，提取 YAML 代码块
+  │     │     2. fetch_blueprint_from_github_url → 转换 GitHub URL 为 raw.githubusercontent.com URL，下载 YAML
+  │     │     3. fetch_blueprint_from_github_gist_url → 调用 GitHub Gist API，提取 .yaml 文件
+  │     │     4. fetch_blueprint_from_website_url → 下载 HA 官网的 YAML 文件
+  │     │     5. fetch_blueprint_from_generic_url → 下载任意 URL 的 YAML 文件
+  │     │
+  │     │     每种函数如果 URL 不匹配其模式，抛出 UnsupportedUrl，被 suppress
+  │     │     继续尝试下一种。5 种都不匹配则抛出 "Unsupported URL" 错误
+  │     │
+  │     ├── yaml_util.parse_yaml(raw_yaml) → 解析 YAML 数据
+  │     │     此阶段 !input 标签被解析为 Input 对象（占位符）
+  │     │
+  │     ├── Blueprint(data, schema=BLUEPRINT_SCHEMA) → 校验蓝图元数据
+  │     │     校验: name, domain, input 定义, min_version 等
+  │     │     校验: 所有 !input 引用的名称是否在 input 定义中存在
+  │     │       → extract_inputs(data) 扫描整个数据，收集所有 Input.name
+  │     │       → 与 blueprint.inputs 对比，缺失的抛出 InvalidBlueprint
+  │     │
+  │     └── 返回 ImportedBlueprint(suggested_filename, raw_data, blueprint)
+  │
+  ├── blueprint.update_metadata(source_url=url) → 记录来源 URL
+  │
+  └── 返回给前端: metadata, raw_data, suggested_filename, validation_errors
+        前端显示预览 → 用户确认 → websocket_api: blueprint/save
+          → DomainBlueprints.async_add_blueprint()
+            → 写入 YAML 文件到 config/blueprints/<domain>/<path>
+            → 存入内存缓存 _blueprints[path] = blueprint
+```
+
+**社区论坛导入的细节**：HA 从论坛帖子中提取 YAML 代码块时，会解析帖子的 HTML 内容，查找 `<code class="lang-yaml">` 或 `<code class="lang-auto">` 标签，对 YAML 代码块进行 HTML 反转义（`html.unescape`）后解析。只接受标记为 YAML 或 auto 语法类型的代码块。
+
+**GitHub URL 转换**：`https://github.com/<repo>/blob/<path>` 被自动转换为 `https://raw.githubusercontent.com/<repo>/<path>`，以获取原始 YAML 内容而非 HTML 页面。
+
+#### 蓝图校验流程
+
+`Blueprint.__init__` 在构造时执行两轮校验：
+
+**第一轮：Voluptuous Schema 校验**
+
+```python
+class Blueprint:
+    def __init__(self, data, *, path, expected_domain, schema):
+        data = self.data = schema(data)  # ← BLUEPRINT_SCHEMA 校验
+```
+
+`BLUEPRINT_SCHEMA` 校验以下内容：
+
+```python
+BLUEPRINT_SCHEMA = vol.Schema({
+    vol.Required(CONF_BLUEPRINT): vol.Schema({
+        vol.Required(CONF_NAME): str,                 # 蓝图名称
+        vol.Optional(CONF_DESCRIPTION): str,          # 描述
+        vol.Required(CONF_DOMAIN): str,               # 所属域（automation/script）
+        vol.Optional(CONF_SOURCE_URL): cv.url,        # 来源 URL
+        vol.Optional(CONF_AUTHOR): str,               # 作者
+        vol.Optional(CONF_HOMEASSISTANT): {            # HA 版本约束
+            vol.Optional(CONF_MIN_VERSION): version_validator  # 格式: X.Y.Z
+        },
+        vol.Optional(CONF_INPUT, default=dict): vol.All(  # 输入定义
+            {str: vol.Any(None, BLUEPRINT_INPUT_SCHEMA, BLUEPRINT_INPUT_SECTION_SCHEMA)},
+            unique_input_validator,                    # 禁止重复 input key
+        ),
+    }),
+}, extra=vol.ALLOW_EXTRA)  # ← 允许自动化/脚本配置通过（不做域级校验）
+```
+
+注意 `extra=vol.ALLOW_EXTRA`：蓝图 Schema 只校验 `blueprint:` 元数据部分，自动化/脚本的配置内容（triggers、actions 等）不在蓝图导入时校验——它们在后续由域级 Schema（`PLATFORM_SCHEMA`）校验。
+
+**第二轮：`!input` 引用完整性校验**
+
+```python
+class Blueprint:
+    def __init__(self, data, ...):
+        # ...
+        missing = yaml_util.extract_inputs(data) - set(self.inputs)
+        if missing:
+            raise InvalidBlueprint(..., f"Missing input definition for {', '.join(missing)}")
+```
+
+`extract_inputs()` 递归遍历整个 YAML 数据树，收集所有 `Input` 对象的 `name`。然后与蓝图 `input:` 定义中展平后的所有 key 对比——如果 `!input` 引用了未定义的输入名，抛出 `InvalidBlueprint`。
+
+#### 蓝图替换流程 — 核心机制
+
+当自动化使用 `use_blueprint:` 引用蓝图时，HA 需要将蓝图模板中的所有 `!input` 占位符替换为用户提供的实际值。这是蓝图机制的核心。
+
+**源码路径**：`automation/config.py::_async_validate_config_item` → `blueprint/models.py::BlueprintInputs.async_substitute` → `annotatedyaml/input.py::substitute`
+
+```
+自动化配置包含 use_blueprint:
+  │
+  ├── config.py 检测到 blueprint.is_blueprint_instance_config(config) == True
+  │     即配置中有 "use_blueprint" 键
+  │
+  ├── blueprints.async_inputs_from_config(config)
+  │     │
+  │     ├── BLUEPRINT_INSTANCE_FIELDS(config) → 校验 use_blueprint 结构
+  │     │     校验: path 必须是 .yaml 后缀的合法路径
+  │     │     校验: input 必须是 dict
+  │     │
+  │     ├── blueprints.async_get_blueprint(bp_conf["path"])
+  │     │     │ 加载蓝图文件 → 解析 YAML → Blueprint 对象
+  │     │     │ 缓存：已加载的蓝图存入 _blueprints[path]
+  │     │     │ 并发保护：asyncio.Lock 防止重复加载
+  │     │
+  │     └── BlueprintInputs(blueprint, config_with_inputs)
+  │           │
+  │           ├── inputs.validate() → 校验输入完整性
+  │           │     缺失必需输入（无 default 且用户未提供） → MissingInput
+  │           │
+  │           └── inputs.inputs_with_default → 合并用户输入和默认值
+  │                 用户未提供的输入 → 使用蓝图 input 定义中的 default
+  │
+  ├── blueprint_inputs.async_substitute() → 生成完整自动化配置
+  │     │
+  │     ├── yaml_util.substitute(blueprint.data, inputs_with_default)
+  │     │     │ 递归遍历 blueprint.data（整个 YAML 数据树）
+  │     │     │ 遇到 Input 对象 → 用 inputs_with_default[input.name] 替换
+  │     │     │ 遇到 list → 递归替换每个元素
+  │     │     │ 遇到 dict → 递归替换每个值（key 不替换）
+  │     │     │ 遇到其他类型 → 保持不变
+  │     │     │ 未定义的 Input → 抛出 UndefinedSubstitution
+  │     │
+  │     ├── combined = {**processed, **config_with_inputs}
+  │     │     合并蓝图替换后的配置 + 用户配置中可能额外添加的字段
+  │     │
+  │     ├── combined.pop("use_blueprint")  # 移除蓝图引用
+  │     ├── combined.pop("blueprint")      # 移除蓝图元数据
+  │     │
+  │     └── 返回: 纯自动化配置（无蓝图标记）
+  │
+  └── PLATFORM_SCHEMA(config) → 对替换后的配置做域级校验
+        校验 triggers、conditions、actions 等
+```
+
+**`substitute()` 的核心实现**：
+
+```python
+# annotatedyaml/input.py
+def substitute(obj: Any, substitutions: dict[str, Any]) -> Any:
+    """递归替换 YAML 数据中的 Input 对象。"""
+    if isinstance(obj, Input):
+        # 找到占位符 → 用用户提供的值替换
+        if obj.name not in substitutions:
+            raise UndefinedSubstitution(obj.name)
+        return substitutions[obj.name]
+
+    if isinstance(obj, list):
+        return [substitute(val, substitutions) for val in obj]
+
+    if isinstance(obj, dict):
+        return {key: substitute(val, substitutions) for key, val in obj.items()}
+
+    return obj  # 原始值（字符串、数字等）保持不变
+```
+
+关键点：`substitute()` 是一个**深度递归**函数，会遍历整个 YAML 数据树的所有层级。这意味着 `!input` 可以出现在 YAML 的任何位置——不仅限于实体 ID 或参数值，还可以出现在字典值、列表元素、嵌套结构中。例如 `target: !input light_target` 会被替换为一个完整的 `target` 配置块（如 `{entity_id: light.living_room}`）。
+
+#### 蓝图替换的可视化示例
+
+```yaml
+# 蓝图文件 motion_light.yaml（包含 !input 占位符）
+triggers:
+  - trigger: state
+    entity_id: !input motion_entity      ← Input("motion_entity")
+    from: "off"
+    to: "on"
+actions:
+  - action: light.turn_on
+    target: !input light_target           ← Input("light_target")
+  - delay: !input no_motion_wait          ← Input("no_motion_wait")
+
+# 用户自动化配置（use_blueprint + input）
+use_blueprint:
+  path: homeassistant/motion_light.yaml
+  input:
+    motion_entity: binary_sensor.hall_motion
+    light_target: {entity_id: light.hall}
+    no_motion_wait: 300
+
+# substitute() 替换后生成的完整配置
+triggers:
+  - trigger: state
+    entity_id: binary_sensor.hall_motion  ← 替换完成
+    from: "off"
+    to: "on"
+actions:
+  - action: light.turn_on
+    target: {entity_id: light.hall}        ← 替换完成
+  - delay: 300                             ← 替换完成
+```
+
+### 11.4 蓝图与自动化/脚本的集成
+
+#### 自动化集成中的蓝图集成
+
+**源码**: `homeassistant/components/automation/helpers.py`
+
+自动化集成在 `async_setup` 中注册蓝图域：
+
+```python
+# automation/__init__.py
+async def async_setup(hass, config):
+    # ...
+    async_get_blueprints(hass)  # 注册 automation 域的 DomainBlueprints
+    # 首次启动时自动复制内置蓝图到 config/blueprints/automation/
+    hass.async_create_task(async_get_blueprints(hass).async_populate())
+```
+
+`async_get_blueprints()` 使用 `@singleton` 装饰器，确保全局只创建一个 `DomainBlueprints` 实例：
+
+```python
+# automation/helpers.py
+@singleton(DATA_BLUEPRINTS)
+@callback
+def async_get_blueprints(hass) -> blueprint.DomainBlueprints:
+    return blueprint.DomainBlueprints(
+        hass,
+        DOMAIN,                                   # "automation"
+        LOGGER,
+        _blueprint_in_use,                        # 检查蓝图是否被自动化引用
+        _reload_blueprint_automations,             # 重载引用蓝图的自动化
+        AUTOMATION_BLUEPRINT_SCHEMA,               # 专用蓝图 Schema
+    )
+```
+
+#### 配置校验中的蓝图处理
+
+**源码**: `homeassistant/components/automation/config.py::_async_validate_config_item`
+
+自动化配置校验时，如果检测到 `use_blueprint:` 键，执行蓝图替换后再校验：
+
+```python
+if blueprint.is_blueprint_instance_config(config):
+    # 1. 从 DomainBlueprints 加载蓝图
+    blueprint_inputs = await blueprints.async_inputs_from_config(config)
+
+    # 2. 替换 !input 占位符
+    config = blueprint_inputs.async_substitute()
+
+# 3. 对替换后的完整配置做域级校验
+validated_config = PLATFORM_SCHEMA(config)
+```
+
+蓝图替换后的配置与手动编写的自动化配置完全一致——HA 内部不再区分"蓝图自动化"和"手动自动化"，它们走同样的校验和执行流程。
+
+#### 脚本集成中的蓝图集成
+
+脚本（script）集成同样支持蓝图，使用类似的模式：
+
+```
+# script 集成的蓝图 Schema
+AUTOMATION_BLUEPRINT_SCHEMA → BLUEPRINT_SCHEMA（通用）
+SCRIPT_BLUEPRINT_SCHEMA → BLUEPRINT_SCHEMA（通用）
+
+# script 使用蓝图时的 YAML
+script:
+  my_notify:
+    use_blueprint:
+      path: homeassistant/confirmable_notification.yaml
+      input:
+        notify_device: <device_id>
+        title: "确认操作"
+        message: "是否执行此操作？"
+```
+
+当前蓝图仅支持 `automation` 和 `script` 两个域，但 `DomainBlueprints` 的设计是通用的——任何域都可以注册蓝图支持。
+
+#### 蓝图的更新与重载
+
+当蓝图文件被更新（重新导入或手动编辑 YAML）时：
+
+```
+DomainBlueprints.async_add_blueprint(blueprint, path, allow_override=True)
+  │
+  ├── 覆盖现有 YAML 文件
+  ├── 更新内存缓存
+  │
+  └── 如果覆盖了已有蓝图 → _reload_blueprint_consumers()
+        │ 对于 automation → 调用 automation.reload 服务
+        │ 所有引用该蓝图的自动化将被重新加载
+        │ → 重新执行蓝图替换 → 生成更新后的配置
+```
+
+#### 蓝图的"Take Control"（接管）功能
+
+前端提供的 "Take Control" 功能实际上调用了 `blueprint/substitute` WebSocket 命令：
+
+```python
+# websocket_api.py::ws_substitute_blueprint
+blueprint_config = {"use_blueprint": {"path": msg["path"], "input": msg["input"]}}
+blueprint_inputs = await domain_blueprints.async_inputs_from_config(blueprint_config)
+config = blueprint_inputs.async_substitute()  # 生成完整配置
+```
+
+前端拿到替换后的完整配置后，将其保存为普通自动化（不含 `use_blueprint:` 字段）。从此该自动化与蓝图脱离关系，用户可以自由编辑——但也失去了随蓝图更新自动同步的能力。
+
+#### 蓝图机制的整体架构图
+
+```
+┌───────────────────────────────────────────────────────────────────┐
+│  1. 蓝图导入 (importer.py + websocket_api.py)                     │
+│                                                                   │
+│  URL → fetch_blueprint_from_url() → 解析 YAML → Blueprint 对象    │
+│    → 校验 BLUEPRINT_SCHEMA + !input 完整性                        │
+│    → DomainBlueprints.async_add_blueprint()                        │
+│      → 写入 config/blueprints/<domain>/<path>.yaml                 │
+│      → 存入内存缓存                                                │
+└───────────────────────────┬───────────────────────────────────────┘
+                            │ 蓝图文件存储在磁盘
+                            ▼
+┌───────────────────────────────────────────────────────────────────┐
+│  2. 自动化/脚本配置加载 (config.py)                                │
+│                                                                   │
+│  检测 use_blueprint: → DomainBlueprints.async_inputs_from_config()│
+│    → 加载蓝图 Blueprint 对象 → BlueprintInputs                    │
+│    → 合并用户输入 + 默认值 → inputs_with_default                   │
+│    → substitute(blueprint.data, inputs_with_default)               │
+│      → 递归替换所有 !input Input 对象为实际值                       │
+│    → 移除 blueprint: 和 use_blueprint: → 纯自动化/脚本配置         │
+│    → PLATFORM_SCHEMA 校验 → 正常自动化/脚本流程                    │
+└───────────────────────────┬───────────────────────────────────────┘
+                            │ 替换后的配置与手动配置无异
+                            ▼
+┌───────────────────────────────────────────────────────────────────┐
+│  3. 运行时 (automation/__init__.py)                                │
+│                                                                   │
+│  替换后的自动化配置 → AutomationEntity                             │
+│    保留 raw_blueprint_inputs 用于追踪和 Trace                       │
+│    referenced_blueprint 属性 → 路径字符串                           │
+│    蓝图更新时 → reload 服务 → 重新执行蓝图替换                      │
+└───────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 12. 关键设计模式总结
+
+### 12.1 架构模式
 
 | 模式 | 实现 |
 |------|------|
@@ -2363,7 +2930,7 @@ dispatcher 信号是 HA 内部通信的一种方式，推送模式还有其他�
 | **注册表模式** | ServiceRegistry, EntityRegistry, DeviceRegistry, HANDLERS 等 |
 | **观察者模式** | EventBus 监听器, Coordinator 订阅, ConfigEntry 更新监听 |
 
-### 11.2 加载模式
+### 12.2 加载模式
 
 | 模式 | 实现 |
 |------|------|
@@ -2373,7 +2940,7 @@ dispatcher 信号是 HA 内部通信的一种方式，推送模式还有其他�
 | **惰性加载** | 自定义集成按需解析，平台模块按需导入 |
 | **线性递增退避重试** | `PlatformNotReady` → `min(tries,6)*30` 秒递增等待（30, 60, 90, ... 180s） |
 
-### 11.3 实体模式
+### 12.3 实体模式
 
 | 模式 | 实现 | 典型集成 |
 |------|------|----------|
@@ -2383,17 +2950,18 @@ dispatcher 信号是 HA 内部通信的一种方式，推送模式还有其他�
 | **描述模式** | `EntityDescription` + `value_fn` 将属性从子类移到描述对象 | `sun` |
 | **_attr_* 模式** | 类属性默认值，减少 property 定义 | `moon` |
 
-### 11.4 集成模式
+### 12.4 集成模式
 
 | 模式 | 实现 |
 |------|------|
 | **runtime_data 模式** | `entry.runtime_data` 存储运行时对象，类型安全 |
 | **平台转发模式** | `async_forward_entry_setups` 将设置传播到各平台 |
 | **配置流模式** | `ConfigFlow` + 步骤方法，支持 UI 配置 |
+| **蓝图模式** | `!input` 占位符 + `substitute()` 递归替换，配置模板化复用 |
 | **统一错误处理** | `async_request_call` 包装 API 调用，统一异常转换 |
 | **选项 = 重载** | 选项变更触发 `async_reload`，重新初始化整个集成 |
 
-### 11.5 @final 保护
+### 12.5 @final 保护
 
 以下关键属性/方法标记为 `@final`，子类不可覆盖：
 
@@ -2420,4 +2988,11 @@ dispatcher 信号是 HA 内部通信的一种方式，推送模式还有其他�
 | `homeassistant/helpers/entity_component.py` | 398 | EntityComponent |
 | `homeassistant/helpers/service.py` | 1408 | 服务辅助函数 |
 | `homeassistant/const.py` | 1011 | 全局常量 |
+| `homeassistant/components/blueprint/models.py` | 385 | Blueprint、BlueprintInputs、DomainBlueprints |
+| `homeassistant/components/blueprint/importer.py` | 288 | 蓝图 URL 导入逻辑（论坛/GitHub/Gist/官网/通用） |
+| `homeassistant/components/blueprint/schemas.py` | 151 | BLUEPRINT_SCHEMA、BLUEPRINT_INSTANCE_FIELDS |
+| `homeassistant/components/blueprint/websocket_api.py` | 274 | 蓝图 WebSocket API（导入/保存/删除/替换） |
+| `homeassistant/components/automation/config.py` | 338 | 自动化配置校验（含蓝图替换流程） |
+| `homeassistant/components/automation/helpers.py` | 40 | 自动化蓝图 DomainBlueprints 注册 |
+| `annotatedyaml/input.py` | ~60 | `Input` 类、`substitute()`、`extract_inputs()` |
 | `homeassistant/runner.py` | 330 | 运行器 |
