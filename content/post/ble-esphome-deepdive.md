@@ -944,6 +944,53 @@ class BLESensor : public sensor::Sensor, public PollingComponent, public BLEClie
 
 `BLESensor` 作为 `BLEClientNode` 接收父 `BLEClient` 转发的 GATTC 事件。它在 `ESP_GATTC_SEARCH_CMPL_EVT` 后调用 `parent()->get_characteristic(service_uuid_, char_uuid_)` 查找 characteristic；如果启用 notify，则先调用 `esp_ble_gattc_register_for_notify()`，待 `ESP_GATTC_REG_FOR_NOTIFY_EVT` 后把 node state 设为 `ESTABLISHED`。`update()` 只有在 `node_state == ESTABLISHED` 时才调用 `esp_ble_gattc_read_char(...)`；`ESP_GATTC_READ_CHAR_EVT` / `ESP_GATTC_NOTIFY_EVT` 中再把字节流交给 `parse_data_` / 用户 lambda 并 `publish_state`。
 
+### 3.5.4 ESPHome YAML 的 BLE 参数最终落到哪些 ESP-IDF 函数
+
+前面我们解释了组件职责，这里把最常见的 YAML 参数再往下追一层：**哪些参数只是 codegen / 调度，哪些最终会落到 ESP-IDF 的 BLE API**。不是每个 YAML 字段都会直接对应一个 ESP-IDF 函数，但可以按组件分清楚。
+
+#### `esp32_ble_tracker`
+
+| YAML 参数 | 代码生成后 | 最终 ESP-IDF 影响 |
+|---|---|---|
+| `scan_parameters.interval` | `set_scan_interval(...)` | 转成 `scan_params_.scan_interval`，随后在 `start_scan_()` 里传给 `esp_ble_gap_set_scan_params(&scan_params_)` |
+| `scan_parameters.window` | `set_scan_window(...)` | 同上，落到 `scan_params_.scan_window` |
+| `scan_parameters.active` | `set_scan_active(...)` | 决定 `scan_params_.scan_type = BLE_SCAN_TYPE_ACTIVE/PASSIVE`，影响扫描时是否会发 `SCAN_REQ` |
+| `scan_parameters.duration` | `set_scan_duration(...)` | 决定 `esp_ble_gap_start_scanning(scan_duration_)` 的扫描时长，以及 timeout 监控参数 |
+| `scan_parameters.continuous` | `set_scan_continuous(...)` | 主要影响 tracker 的调度策略；扫描完成后是否持续重启扫描，不直接对应单独 ESP-IDF 函数 |
+| `on_ble_advertise` / `on_ble_service_data_advertise` / `on_ble_manufacturer_data_advertise` / `on_scan_end` | 注册 automation trigger | 这是 C++ 回调路由，不是额外的 ESP-IDF 函数；数据入口仍然来自 `esp_ble_gap_*` 扫描事件 |
+
+对应的关键调用链就是：
+
+```cpp
+esp_ble_gap_set_scan_params(&scan_params_);
+esp_ble_gap_start_scanning(scan_duration_);
+```
+
+#### `bluetooth_proxy`
+
+| YAML 参数 | 代码生成后 | 最终 ESP-IDF 影响 |
+|---|---|---|
+| `active: true/false` | `var.set_active(...)` | 决定是否注册主动连接槽位、是否允许 GATT 代理；不是单独一个 ESP-IDF 调用，但会影响后续是否走 `esp_ble_gattc_*` 链路 |
+| `connection_slots` / `connections` | 生成 `BluetoothConnection` 实例并注册 raw client | 决定可并发的主动 GATT 连接数；连接建立后会走 `esp_ble_gattc_open()`、`esp_ble_gattc_send_mtu_req()`、`esp_ble_gattc_search_service()`、`esp_ble_gattc_read_char()`、`esp_ble_gattc_write_char()`、`esp_ble_gattc_register_for_notify()`、`esp_ble_gattc_write_char_descr()` 等 |
+| `cache_services: true/false` | `add_idf_sdkconfig_option("CONFIG_BT_GATTC_CACHE_NVS_FLASH", True)` | 这是 SDK 配置项，不是运行时函数；它决定 GATTC 服务缓存是否落到 NVS |
+
+#### `ble_client`
+
+| YAML 参数 | 代码生成后 | 最终 ESP-IDF 影响 |
+|---|---|---|
+| `mac_address` | `BLEClient::set_address(...)` / `BLEClientBase::set_address(...)` | 扫描到匹配 MAC 后 `parse_device()` 置 `DISCOVERED`，随后 `connect()` 调 `esp_ble_gattc_open(...)` |
+| `auto_connect` | `BLEClient::enabled` / `BLEClientBase::auto_connect_` | 决定是否在 `parse_device()` 后自动接管连接，不直接对应单独 ESP-IDF 函数 |
+| `service_uuid` / `characteristic_uuid` / `descriptor_uuid` | `set_service_uuid*()` / `set_char_uuid*()` / `set_descr_uuid*()` | 影响后续 `get_characteristic()` / `get_descriptor()` 的 lazy lookup，最后在 GATT 回调里触发 `esp_ble_gattc_get_all_char()`、`esp_ble_gattc_get_descr_by_char_handle()` |
+| `notify: true` | `set_enable_notify(true)` | 在 `ESP_GATTC_SEARCH_CMPL_EVT` 后触发 `esp_ble_gattc_register_for_notify()`；随后 base class 在 `ESP_GATTC_REG_FOR_NOTIFY_EVT` 里写 CCCD：`esp_ble_gattc_write_char_descr(...)` |
+| `update_interval` | `PollingComponent` 的轮询周期 | 到点时调用 `esp_ble_gattc_read_char(...)` |
+| `on_connect` / `on_disconnect` / `on_passkey_request` 等 automation | 注册触发器 | 由 `ESP_GATTC_OPEN_EVT`、`ESP_GATTC_CLOSE_EVT`、GAP 安全事件等驱动，不是额外的 ESP-IDF 主动调用 |
+
+**一句话总结**：
+
+- `esp32_ble_tracker` 的 YAML 主要控制 `esp_ble_gap_set_scan_params()` / `esp_ble_gap_start_scanning()`；
+- `bluetooth_proxy` 的 YAML 主要控制是否启用主动 GATT 代理，以及是否编译出 GATT cache 行为；
+- `ble_client` 的 YAML 主要控制 `esp_ble_gattc_open()` 之后是怎么找 service、怎么订阅 notify、怎么读写 characteristic。
+
 ---
 
 ## 四、自己实现一个 ESPHome 尚未支持的 BLE 信标监听组件
