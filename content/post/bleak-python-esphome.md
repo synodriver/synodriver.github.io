@@ -1213,6 +1213,311 @@ async def read_battery(device: BLEDevice) -> int:
 - Home Assistant + ESPHome Bluetooth Proxy。
 - 多个 ESP32 proxy 组成的覆盖网络。
 
+### 10.4 Home Assistant 源码中是如何使用 Bleak 的
+
+Home Assistant 的 BLE 架构不是“每个集成自己 new 一个 `BleakScanner` 然后各扫各的”，而是把 Bleak 放在一个更高层的统一蓝牙管理器后面。源码路径基于 `E:\pyproject\core`。
+
+#### 10.4.1 bluetooth 集成启动时创建统一 manager
+
+入口在 `homeassistant/components/bluetooth/__init__.py`。`async_setup()` 里做了几件关键事：
+
+```python
+bluetooth_adapters = get_adapters()
+bluetooth_storage = BluetoothStorage(hass)
+slot_manager = BleakSlotManager()
+integration_matcher = IntegrationMatcher(await async_get_bluetooth(hass))
+
+manager = HomeAssistantBluetoothManager(
+    hass, integration_matcher, bluetooth_adapters, bluetooth_storage, slot_manager
+)
+set_manager(manager)
+await manager.async_setup()
+```
+
+这里有两个重点：
+
+- `BleakSlotManager` 来自 `bleak_retry_connector`，负责管理 BLE 连接槽位，避免多个集成盲目并发连接把适配器或 ESPHome proxy 打满。
+- `set_manager(manager)` 把 Home Assistant 自己的 `HomeAssistantBluetoothManager` 注册给 `habluetooth`，后续 scanner、connector、callback 都走这套全局 manager。
+
+也就是说，Home Assistant 把本机蓝牙、远程 ESPHome proxy、历史广播缓存、连接槽位和集成匹配都收口到了 `HomeAssistantBluetoothManager`。
+
+#### 10.4.2 async_get_scanner：给第三方库一个“看起来像 BleakScanner”的入口
+
+`homeassistant/components/bluetooth/api.py` 里有：
+
+```python
+@hass_callback
+def async_get_scanner(hass: HomeAssistant) -> BleakScanner:
+    """Return a HaBleakScannerWrapper cast to BleakScanner."""
+    return cast(BleakScanner, HaBleakScannerWrapper())
+```
+
+注释写得很直白：这是一个 `HaBleakScannerWrapper`，但为了兼容那些“参数类型写死成 `BleakScanner`”的第三方库，HA 把它 `cast(BleakScanner, ...)` 返回。
+
+典型例子是 `homeassistant/components/acaia/coordinator.py`：
+
+```python
+self._scale = AcaiaScale(
+    address_or_ble_device=entry.data[CONF_ADDRESS],
+    name=entry.title,
+    is_new_style_scale=entry.data[CONF_IS_NEW_STYLE_SCALE],
+    notify_callback=debouncer.async_schedule_call,
+    scanner=async_get_scanner(hass),
+)
+```
+
+还有 `homeassistant/components/homekit_controller/utils.py`：
+
+```python
+bleak_scanner_instance = bluetooth.async_get_scanner(hass)
+
+controller = Controller(
+    async_zeroconf_instance=async_zeroconf_instance,
+    bleak_scanner_instance=bleak_scanner_instance,
+    char_cache=char_cache,
+)
+```
+
+这种设计的意义是：第三方库以为自己拿到的是 Bleak scanner；但实际扫描数据来自 HA 的统一蓝牙管理器，能自动包含本机 adapter 和 ESPHome proxy。
+
+#### 10.4.3 async_register_callback：广播数据先变成 BluetoothServiceInfoBleak
+
+HA 集成通常不直接处理 Bleak 的 `(BLEDevice, AdvertisementData)`，而是处理 `BluetoothServiceInfoBleak`。
+
+`homeassistant/components/bluetooth/models.py` 定义：
+
+```python
+type BluetoothCallback = Callable[[BluetoothServiceInfoBleak, BluetoothChange], None]
+type ProcessAdvertisementCallback = Callable[[BluetoothServiceInfoBleak], bool]
+```
+
+`HomeAssistantBluetoothManager` 在 `manager.py` 里维护 callback matcher。当收到广告包后，核心路径在 `_discover_service_info()`：
+
+```python
+def _discover_service_info(self, service_info: BluetoothServiceInfoBleak) -> None:
+    matched_domains = self._integration_matcher.match_domains(service_info)
+
+    for match in self._callback_index.match_callbacks(service_info):
+        callback = match[CALLBACK]
+        callback(service_info, BluetoothChange.ADVERTISEMENT)
+
+    for domain in matched_domains:
+        discovery_flow.async_create_flow(
+            self.hass,
+            domain,
+            {"source": config_entries.SOURCE_BLUETOOTH},
+            service_info,
+            discovery_key=discovery_key,
+        )
+```
+
+所以 HA 的广播分发有两条线：
+
+1. 调用已注册的 callback，让已加载集成更新数据。
+2. 根据 manifest / matcher 匹配域，触发 config flow 自动发现新设备。
+
+上层集成注册 callback 用的是 `api.py` 的：
+
+```python
+def async_register_callback(
+    hass: HomeAssistant,
+    callback: BluetoothCallback,
+    match_dict: BluetoothCallbackMatcher | None,
+    mode: BluetoothScanningMode,
+    *,
+    scan_interval: float | None = None,
+    scan_duration: float | None = None,
+) -> Callable[[], None]:
+    return _get_manager(hass).async_register_callback(
+        callback, match_dict, mode, scan_interval, scan_duration
+    )
+```
+
+这比直接拿 BleakScanner 自己扫更适合 HA：matcher 可以指定 `address`、service UUID、manufacturer id、是否 connectable 等条件，并且还能配合 active scan 调度。
+
+#### 10.4.4 async_process_advertisements：等待特定广播出现
+
+对于 config flow 或迁移逻辑，HA 还提供了一个“等到匹配广播为止”的协程：
+
+```python
+async def async_process_advertisements(
+    hass: HomeAssistant,
+    callback: ProcessAdvertisementCallback,
+    match_dict: BluetoothCallbackMatcher,
+    mode: BluetoothScanningMode,
+    timeout: int,
+) -> BluetoothServiceInfoBleak:
+    done: Future[BluetoothServiceInfoBleak] = hass.loop.create_future()
+
+    def _async_discovered_device(
+        service_info: BluetoothServiceInfoBleak, change: BluetoothChange
+    ) -> None:
+        if not done.done() and callback(service_info):
+            done.set_result(service_info)
+
+    with ExitStack() as stack:
+        unload = manager.async_register_callback(
+            _async_discovered_device, match_dict, mode
+        )
+        stack.callback(unload)
+
+        if mode is BluetoothScanningMode.ACTIVE:
+            task = hass.async_create_task(manager.async_request_active_scan(timeout))
+            stack.callback(task.cancel)
+
+        async with asyncio.timeout(timeout):
+            return await done
+```
+
+`homeassistant/components/gardena_bluetooth/__init__.py` 就是这样用的：
+
+```python
+def _data_callback(info: BluetoothServiceInfoBleak) -> bool:
+    if info.device.address != address:
+        return False
+
+    data.update(info.manufacturer_data.get(ManufacturerData.company, b""))
+    return data.product_type is not ProductType.UNKNOWN
+
+await bluetooth.async_process_advertisements(
+    hass,
+    _data_callback,
+    bluetooth.BluetoothCallbackMatcher(
+        address=address, manufacturer_id=ManufacturerData.company
+    ),
+    mode=bluetooth.BluetoothScanningMode.ACTIVE,
+    timeout=PRODUCT_TYPE_TIMEOUT,
+)
+```
+
+这和我们前面解析 EWD104-BT58 的思路一致：BLE 广播里的 manufacturer data 到 HA 里变成 `BluetoothServiceInfoBleak.manufacturer_data`，集成只关心解析业务字段，不直接管理 scanner 生命周期。
+
+#### 10.4.5 async_ble_device_from_address：需要连接时再拿 BLEDevice
+
+真正要 GATT 连接时，HA 才会从 manager 取 `BLEDevice`：
+
+```python
+@hass_callback
+def async_ble_device_from_address(
+    hass: HomeAssistant, address: str, connectable: bool = True
+) -> BLEDevice | None:
+    """Return BLEDevice for an address if its present."""
+    return _get_manager(hass).async_ble_device_from_address(address, connectable)
+```
+
+例如 `homeassistant/components/bluetooth_le_tracker/device_tracker.py` 里读取电池电量：
+
+```python
+if service_info.connectable:
+    device = service_info.device
+elif connectable_device := bluetooth.async_ble_device_from_address(
+    hass, service_info.device.address, True
+):
+    device = connectable_device
+else:
+    return
+
+async with BleakClient(device) as client:
+    bat_char = await client.read_gatt_char(BATTERY_CHARACTERISTIC_UUID)
+    battery = ord(bat_char)
+```
+
+这体现了 HA 的推荐模式：
+
+- 广播能解决的，只处理 `BluetoothServiceInfoBleak`。
+- 必须连接时，优先使用 `service_info.device`，或者通过 `async_ble_device_from_address()` 找一个可连接路径。
+- 最后才把 `BLEDevice` 交给 `BleakClient`。
+
+`gardena_bluetooth` 也类似：它定义 `_device_lookup()`，内部通过 `bluetooth.async_ble_device_from_address(hass, address, connectable=True)` 找设备，然后交给第三方库的 `CachedConnection`。
+
+#### 10.4.6 Passive / Active processor：HA 对“广播解析”和“连接补读”的封装
+
+HA 还提供了两类更高层的 coordinator：
+
+- `PassiveBluetoothProcessorCoordinator`：只靠广播更新实体。
+- `ActiveBluetoothProcessorCoordinator`：先解析广播，如果需要再触发 GATT 轮询。
+
+`passive_update_processor.py` 里的说明很清楚：`update_method` 每收到一次 `BluetoothServiceInfoBleak` 就返回解析后的数据，然后分发给实体。
+
+```python
+update_method: Callable[[BluetoothServiceInfoBleak], _DataT]
+```
+
+`active_update_processor.py` 则进一步支持 `poll_method`：
+
+```python
+async def poll_method(svc_info: BluetoothServiceInfoBleak) -> YourDataType:
+    return YourDataType(...)
+```
+
+源码注释特别提醒：
+
+```text
+BluetoothServiceInfoBleak.device contains a BLEDevice. You should use this in
+your poll function, as it is the most efficient way to get a BleakClient.
+```
+
+这正是 HA 使用 Bleak 的核心范式：**平时靠广播，必要时用 `BluetoothServiceInfoBleak.device` 建立 BleakClient 短连接补读**。
+
+#### 10.4.7 ESPHome Bluetooth Proxy 如何进入这条链路
+
+ESPHome 集成的接入点在 `homeassistant/components/esphome/bluetooth.py`：
+
+```python
+from bleak_esphome import connect_scanner
+
+client_data = connect_scanner(cli, device_info, entry_data.available)
+scanner = client_data.scanner
+
+callbacks = [
+    async_register_scanner(
+        hass,
+        scanner,
+        source_domain=DOMAIN,
+        source_model=device_info.model,
+        source_config_entry_id=entry_data.entry_id,
+        source_device_id=device_id,
+    ),
+    scanner.async_setup(),
+]
+```
+
+也就是说，ESPHome proxy 不是绕开 HA 的蓝牙系统单独工作，而是通过 `bleak_esphome.connect_scanner()` 生成一个 remote scanner，再调用 HA bluetooth API 的 `async_register_scanner()` 注册进去。注册后：
+
+```text
+ESP32 广播 / GATT 能力
+  -> bleak-esphome ESPHomeScanner / ESPHomeClient
+  -> habluetooth manager
+  -> HomeAssistantBluetoothManager
+  -> BluetoothServiceInfoBleak / BLEDevice
+  -> 各个 HA 集成
+```
+
+所以从 HA 集成作者视角看，本机蓝牙和 ESPHome proxy 的差异被隐藏了：拿到的仍然是 `BluetoothServiceInfoBleak`、`BLEDevice`，连接时仍然可以走 `BleakClient(device)`。
+
+#### 10.4.8 总结：HA 并不是简单地“使用 Bleak”，而是把 Bleak 变成平台能力
+
+Home Assistant 对 Bleak 的使用可以概括为四层：
+
+| 层级 | HA 源码 / 类型 | 作用 |
+|------|----------------|------|
+| 扫描兼容层 | `async_get_scanner()` / `HaBleakScannerWrapper` | 给第三方库一个 BleakScanner 兼容入口 |
+| 广播服务层 | `BluetoothServiceInfoBleak` | 把 BLEDevice + AdvertisementData 包装成 HA 统一服务信息 |
+| 分发与匹配层 | `HomeAssistantBluetoothManager` / `BluetoothCallbackMatcher` | 根据地址、service UUID、manufacturer id、connectable 等条件分发 |
+| 连接层 | `async_ble_device_from_address()` + `BleakClient(device)` | 需要 GATT 时才短连接读写 |
+| 远程代理层 | `bleak_esphome.connect_scanner()` + `async_register_scanner()` | 把 ESPHome proxy 注册成 HA scanner / connector |
+
+这也是为什么在 HA 生态里写 BLE 集成时，不建议自己创建独立 `BleakScanner`。正确姿势通常是：
+
+```text
+广播解析：注册 bluetooth callback，处理 BluetoothServiceInfoBleak；
+需要等待特定广播：用 async_process_advertisements；
+需要连接：从 service_info.device 或 async_ble_device_from_address() 取得 BLEDevice，再交给 BleakClient；
+第三方库要求 BleakScanner：传 bluetooth.async_get_scanner(hass)。
+```
+
+这样写的集成天然支持本机蓝牙、多个 USB 适配器、ESPHome Bluetooth Proxy，以及 HA 的连接槽位管理和 active scan 调度。
+
 ---
 
 ## 十一、一个面向传感器的完整设计范式
