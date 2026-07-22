@@ -1518,6 +1518,296 @@ Home Assistant 对 Bleak 的使用可以概括为四层：
 
 这样写的集成天然支持本机蓝牙、多个 USB 适配器、ESPHome Bluetooth Proxy，以及 HA 的连接槽位管理和 active scan 调度。
 
+### 10.5 结合 habluetooth 看类关系与数据流
+
+`habluetooth` 是 Home Assistant 蓝牙体系的“中间层”。它不是替代 Bleak 的底层 BLE 协议栈，而是在 Bleak 之上增加 Home Assistant 需要的高可用能力：多 scanner 聚合、远程 scanner、连接路径选择、广播历史、可用性判断、active/passive scan 调度、连接槽位评分、Bleak 兼容 wrapper 等。
+
+源码位置：
+
+```text
+D:\conda\envs\hass\Lib\site-packages\habluetooth
+E:\pyproject\core\homeassistant\components\bluetooth
+```
+
+#### 10.5.1 核心类关系
+
+可以把 HA + habluetooth + Bleak 的类关系简化成下面这张图：
+
+```text
+Bleak 层
+  BLEDevice
+  AdvertisementData
+  BleakScanner / BleakClient
+        ▲
+        │ 兼容 wrapper
+        │
+habluetooth
+  HaBleakScannerWrapper
+  HaBleakClientWrapper
+  BaseHaScanner
+    ├── HaScanner                  # 本机适配器 scanner
+    └── BaseHaRemoteScanner         # 远程 scanner 基类，例如 ESPHomeScanner
+  BluetoothScannerDevice            # 某个 scanner 看到的某个 BLEDevice + AdvertisementData
+  BluetoothServiceInfoBleak          # 对外分发的统一广播信息
+  BluetoothManager                   # scanner 注册、历史、连接路径、callback、active scan 调度
+        ▲
+        │ subclass
+        │
+Home Assistant
+  HomeAssistantBluetoothManager      # 增加集成匹配、config flow、存储、HA 生命周期
+  bluetooth.api                      # async_get_scanner / async_register_callback / async_ble_device_from_address
+        ▲
+        │
+各个集成
+  bthome / govee_ble / gardena_bluetooth / homekit_controller / esphome / ...
+```
+
+各类职责可以这样理解：
+
+| 类 / 模块 | 来源 | 职责 |
+|----------|------|------|
+| `BLEDevice` | Bleak | 表示扫描到的 BLE 外设，含 address/name/details |
+| `AdvertisementData` | Bleak | 表示一次广播/扫描响应解析结果，含 manufacturer_data、service_data、RSSI 等 |
+| `BaseHaScanner` | habluetooth | HA scanner 抽象，保存 source、adapter、connectable、connector、历史状态 |
+| `HaScanner` | habluetooth | 本机蓝牙 scanner，包装本机 adapter 的 Bleak 扫描能力 |
+| `BaseHaRemoteScanner` | habluetooth | 远程 scanner 基类，ESPHome proxy 这类远程数据源继承它 |
+| `BluetoothScannerDevice` | habluetooth | 一个 scanner 对一个设备的观测：scanner + BLEDevice + AdvertisementData |
+| `BluetoothServiceInfoBleak` | habluetooth / home_assistant_bluetooth | HA 对外分发的 BLE 服务信息，包装 BLEDevice + AdvertisementData + source/connectable/time |
+| `BluetoothManager` | habluetooth | 多 scanner 聚合、地址历史、连接路径评分、active scan 调度、callback 分发 |
+| `HomeAssistantBluetoothManager` | HA | 继承 BluetoothManager，加入 HA discovery flow、storage、matcher、生命周期 |
+| `HaBleakScannerWrapper` | habluetooth | 给第三方库提供 BleakScanner 兼容 facade |
+| `HaBluetoothConnector` | habluetooth | 连接器抽象，用于把某个 scanner/source 映射到对应 BleakClient backend |
+
+#### 10.5.2 BaseHaScanner：从原始广播到 BluetoothServiceInfoBleak
+
+`habluetooth/base_scanner.py` 里的 `BaseHaScanner` 是 scanner 的共同基类。初始化时它保存：
+
+```python
+self.connectable = connectable
+self.source = source
+self.connector = connector
+self.adapter = adapter
+self.name = adapter_human_name(adapter, source) if adapter != source else source
+self.details = HaScannerDetails(...)
+self._previous_service_info: dict[str, BluetoothServiceInfoBleak] = {}
+```
+
+几个字段很关键：
+
+- `source`：这条广播来自哪里。可能是本机 HCI adapter，也可能是 ESPHome proxy 的 MAC/source。
+- `connectable`：这个 scanner 是否能发起 GATT 连接。
+- `connector`：如果能连接，用哪个 `HaBluetoothConnector` 创建 client。
+- `_previous_service_info`：每个地址上一次广播状态，用于去重、可用性、历史恢复。
+
+`BaseHaScanner` 会把底层 scanner 收到的 `BLEDevice + AdvertisementData` 转成 `BluetoothServiceInfoBleak` 再交给 manager。实际本机 scanner 和远程 scanner 的输入来源不同：
+
+```text
+本机 HaScanner:
+  OS / Bleak backend -> BLEDevice + AdvertisementData -> BaseHaScanner
+
+ESPHomeScanner:
+  ESPHome Native API raw advertisement -> _async_on_raw_advertisement / _async_on_advertisement -> BaseHaScanner
+```
+
+但进入 manager 后，二者都变成同一种 `BluetoothServiceInfoBleak`。
+
+#### 10.5.3 BluetoothScannerDevice：为什么同一个设备会有多条“路径”
+
+`habluetooth/scanner_device.py` 定义：
+
+```python
+@dataclass(slots=True)
+class BluetoothScannerDevice:
+    scanner: BaseHaScanner
+    ble_device: BLEDevice
+    advertisement: AdvertisementData
+
+    def score_connection_path(self, rssi_diff: int) -> float:
+        return self.scanner._score_connection_paths(rssi_diff, self)
+```
+
+这说明 HA 不是只关心“有没有看到某个 MAC”，而是关心：
+
+```text
+某个 scanner/source 以什么 RSSI 看到了这个设备，
+这个 scanner 是否可连接，
+这个 scanner 当前是否还有连接槽位，
+它最近连接这个地址是否失败过，
+它当前是否已经有连接进行中。
+```
+
+`BaseHaScanner._score_connection_paths()` 里会把 RSSI、连接中数量、失败次数、连接槽位都纳入评分。比如：
+
+- 没有空闲连接槽位时，直接认为该路径不可用。
+- 有连接正在进行时降分。
+- 最近连接失败过降分。
+- 只有最后一个空闲 slot 时也会轻微降分。
+
+这就是为什么 Home Assistant 能在多个 ESPHome proxy 或多个本机 adapter 之间选择“更适合连接”的路径，而不是简单选第一个看到设备的 scanner。
+
+#### 10.5.4 BluetoothManager：habluetooth 的核心调度器
+
+`habluetooth/manager.py` 的 `BluetoothManager` 是真正的数据调度核心。它维护了很多状态：
+
+```python
+self._all_history: dict[str, BluetoothServiceInfoBleak] = {}
+self._connectable_history: dict[str, BluetoothServiceInfoBleak] = {}
+self._connectable_scanners: set[BaseHaScanner] = set()
+self._non_connectable_scanners: set[BaseHaScanner] = set()
+self._sources: dict[str, BaseHaScanner] = {}
+self._bleak_callbacks: set[BleakCallback] = set()
+self._advertisement_tracker = AdvertisementTracker()
+self._auto_scheduler = AutoScanScheduler(self)
+self.slot_manager = slot_manager or BleakSlotManager()
+```
+
+这些状态对应几个能力：
+
+| 状态 | 作用 |
+|------|------|
+| `_all_history` | 所有广播历史，包括不可连接来源 |
+| `_connectable_history` | 可连接路径的广播历史，用于 GATT 连接 |
+| `_connectable_scanners` | 能建立连接的 scanner 集合 |
+| `_non_connectable_scanners` | 只能观察广播的 scanner 集合 |
+| `_sources` | source -> scanner 映射 |
+| `_bleak_callbacks` | 给 `HaBleakScannerWrapper` 兼容 Bleak callback 的回调集合 |
+| `_advertisement_tracker` | 学习广告周期、判断 stale/unavailable、fallback 可用性 |
+| `_auto_scheduler` | AUTO 扫描模式下按需触发 active scan window |
+| `slot_manager` | 本机/远程连接槽位协调 |
+
+从这里可以看出，`habluetooth` 做的是“蓝牙资源调度”，不是简单的数据结构封装。
+
+#### 10.5.5 HaBleakScannerWrapper：为什么第三方库还能继续用 BleakScanner 风格
+
+`habluetooth/wrappers.py` 里的 `HaBleakScannerWrapper` 是兼容层。它暴露了类似 BleakScanner 的方法：
+
+```python
+async def start(self) -> None
+async def stop(self) -> None
+async def advertisement_data(self) -> AsyncGenerator[tuple[BLEDevice, AdvertisementData], None]
+async def discover(...) -> list[BLEDevice] | dict[str, tuple[BLEDevice, AdvertisementData]]
+async def find_device_by_address(...) -> BLEDevice | None
+async def find_device_by_name(...) -> BLEDevice | None
+async def find_device_by_filter(...) -> BLEDevice | None
+```
+
+但它内部不是自己开一个 OS scan，而是从 `get_manager()` 取 HA 的全局 manager：
+
+```python
+infos = get_manager().async_discovered_service_info(True)
+return {info.address: (info.device, info.advertisement) for info in infos}
+```
+
+`advertisement_data()` 也不是直接调用 Bleak 后端，而是注册到 manager：
+
+```python
+queue: asyncio.Queue[tuple[BLEDevice, AdvertisementData]] = asyncio.Queue()
+cancel = get_manager().async_register_bleak_callback(
+    lambda bd, ad: queue.put_nowait((bd, ad)),
+    self._mapped_filters,
+)
+```
+
+所以第三方库继续以 `BleakScanner` 的思维使用：
+
+```python
+async with scanner:
+    async for device, adv in scanner.advertisement_data():
+        ...
+```
+
+但数据源实际上已经是：
+
+```text
+所有 HA scanner 聚合后的数据，而不是某一个进程私有扫描器。
+```
+
+这就是 HA 需要 `habluetooth` 再封装 Bleak 的一个核心原因：**兼容第三方库，同时避免每个库各自打开扫描器造成资源冲突**。
+
+#### 10.5.6 数据流：本机蓝牙广播如何到达集成
+
+本机蓝牙的大致数据流是：
+
+```text
+OS 蓝牙栈 / BlueZ / CoreBluetooth / WinRT
+  -> Bleak backend
+  -> BLEDevice + AdvertisementData
+  -> habluetooth.HaScanner / BaseHaScanner
+  -> BluetoothServiceInfoBleak
+  -> habluetooth.BluetoothManager 历史、去重、路径评分
+  -> HA HomeAssistantBluetoothManager._discover_service_info()
+  -> async_register_callback 的订阅者
+  -> config flow discovery
+  -> 具体集成实体 / coordinator
+```
+
+如果是第三方库通过 `async_get_scanner()` 使用 BleakScanner 风格 API，流向是：
+
+```text
+BluetoothManager
+  -> HaBleakScannerWrapper.advertisement_data()
+  -> 第三方库 callback / async iterator
+```
+
+所以 HA 不是把 Bleak 暴露为“全局唯一真实 BleakScanner”，而是暴露了一个“兼容 BleakScanner 的 HA wrapper”。
+
+#### 10.5.7 数据流：ESPHome proxy 广播如何到达集成
+
+ESPHome proxy 的路径稍微长一点：
+
+```text
+ESP32 bluetooth_proxy
+  -> ESPHome Native API / aioesphomeapi
+  -> bleak_esphome.connect_scanner()
+  -> ESPHomeScanner(BaseHaRemoteScanner)
+  -> raw advertisement / structured advertisement 转成 BLEDevice + AdvertisementData
+  -> BluetoothServiceInfoBleak
+  -> habluetooth.BluetoothManager
+  -> HomeAssistantBluetoothManager
+  -> 各集成 callback / discovery flow
+```
+
+连接时则是：
+
+```text
+集成需要 GATT
+  -> service_info.device 或 async_ble_device_from_address()
+  -> manager 选择合适 scanner/source
+  -> scanner.connector / HaBluetoothConnector
+  -> bleak_esphome ESPHomeClient 或本机 Bleak backend client
+  -> BleakClient(device) 读写 GATT
+```
+
+这也是 `BluetoothScannerDevice` 和连接路径评分存在的原因：同一个 BLE 外设可能同时被客厅 ESPHome proxy、卧室 ESPHome proxy、本机 USB 蓝牙看到；HA 需要选择更可靠、更近、更有空闲 slot 的路径去连接。
+
+#### 10.5.8 为什么 HA 不直接裸用 Bleak
+
+如果 Home Assistant 直接让每个集成裸用 Bleak，会有几个问题：
+
+1. **扫描资源冲突**：多个集成各自 `BleakScanner.discover()`，会导致重复扫描、耗电、丢包，甚至某些平台不允许并行扫描。
+2. **连接资源有限**：BLE adapter / ESP32 proxy 同时连接数有限，需要统一 slot 管理和排队。
+3. **多路径选择复杂**：同一个设备可能被多个 scanner 看到，裸 Bleak 不知道哪个 source 更适合连接。
+4. **远程 scanner 不属于 Bleak 原生模型**：ESPHome proxy、未来其他网关都不是本机 OS 蓝牙适配器，需要抽象成 HA scanner。
+5. **active/passive 扫描需要调度**：很多设备名称或 scan response 只有 active scan 才有，但长期 active scan 会增加空口和功耗，需要 AUTO 策略。
+6. **HA 需要统一 discovery flow**：BLE 广播要能触发集成自动发现、回调已加载实体、保存历史，而不是散落在每个库里。
+7. **第三方库兼容**：很多库已经要求 `BleakScanner` / `BLEDevice` / `BleakClient`，`HaBleakScannerWrapper` 可以兼容它们，同时仍走 HA 的统一管理。
+
+因此 `habluetooth` 的价值是：
+
+```text
+Bleak 提供跨平台 BLE 原语；
+habluetooth 把这些原语扩展成 HA 可调度、可聚合、可远程代理、可高可用的蓝牙资源层；
+Home Assistant bluetooth 集成再在其上增加 discovery、storage、config entry、entity 生命周期。
+```
+
+#### 10.5.9 一句话总结类关系
+
+```text
+Bleak 负责“怎么和 BLE 设备说话”；
+habluetooth 负责“HA 里这么多 scanner / proxy / integration 应该怎样共享蓝牙资源”；
+HomeAssistantBluetoothManager 负责“把共享后的蓝牙数据接入 HA 的发现、回调、实体和配置系统”。
+```
+
 ---
 
 ## 十一、一个面向传感器的完整设计范式
