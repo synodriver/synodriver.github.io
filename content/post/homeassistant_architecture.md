@@ -17,6 +17,10 @@ author: 'synodriver'
 - [3. 启动流程详解](#3-启动流程详解)
 - [4. 集成加载机制](#4-集成加载机制)
 - [5. 配置流(ConfigFlow)机制](#5-配置流configflow机制)
+  - [5.7 ConfigFlow step 方法职责与调用时机](#57-configflow-step-方法职责与调用时机)
+  - [5.8 ConfigEntry 创建、更新与 `unique_id`](#58-configentry-创建更新与-unique_id)
+  - [5.9 ConfigFlow 实例生命周期与 BLE 发现去重](#59-configflow-实例生命周期与-ble-发现去重)
+  - [5.10 OptionsFlow — 选项流](#510-optionsflow--选项流)
 - [6. 实体(Entity)体系](#6-实体entity体系)
 - [7. 服务(Service)机制](#7-服务service机制)
 - [8. 平台(Platform)与 EntityComponent 编排](#8-平台platform与-entitycomponent-编排)
@@ -79,7 +83,10 @@ components/<domain>/
 ├── config_flow.py      # 配置流（可选，支持 UI 配置时需要）
 ├── light.py            # 向 light 域提供实体（可选平台文件）
 ├── sensor.py           # 向 sensor 域提供实体（可选平台文件）
-├── strings.json        # 前端字符串
+├── strings.json        # Core 集成英文翻译源；自定义集成通常使用 translations/en.json
+├── icons.json          # 前端图标资源（可选）
+├── translations/       # 自定义集成运行时翻译目录（可选）
+│   └── en.json
 └── services.yaml       # 服务定义
 ```
 
@@ -298,6 +305,26 @@ class ConfigEntry[_DataT = Any]:
     subentries: MappingProxyType[str, ConfigSubentry]  # 子条目
     disabled_by: ConfigEntryDisabler | None
 ```
+
+**`entry_id` 与 `unique_id` 的区别**：
+
+| 字段 | 谁生成/设置 | 是否必须 | 主要用途 | 典型值 |
+|------|-------------|----------|----------|--------|
+| `entry_id` | HA core 在 `ConfigEntry.__init__` 中生成（未传入时使用 ULID） | 必有 | Core 内部主键：setup/unload/reload/remove、存储、设备/实体注册表关联 | `01J...` 形式的 ULID |
+| `unique_id` | 集成在 `ConfigFlow` 中调用 `async_set_unique_id()` 设置 | 可选但强烈建议 | 识别同一个真实设备/账号/服务，防止重复配置；可用于发现流匹配已有条目 | MAC、序列号、云账号 ID、网关 ID |
+
+二者不是同一个概念：`entry_id` 是 HA 分配给“这一条配置记录”的不可变内部 ID；`unique_id` 是集成提供给 HA 的“真实对象身份”。删除后重新添加同一设备时，通常会得到新的 `entry_id`，但应继续使用相同的 `unique_id`，这样 HA 可以在发现阶段判断设备是否已经配置过。
+
+**ConfigEntry 的创建路径**：自定义集成通常不直接实例化 `ConfigEntry`。在 `config_flow.py` 中，集成只返回 `self.async_create_entry(title=..., data=...)` 这样的 `CREATE_ENTRY` 结果；流程结束时由 `ConfigEntriesFlowManager.async_finish_flow()` 根据结果和 `flow.unique_id` 构造真正的 `ConfigEntry`，并调用 `hass.config_entries.async_add(entry)`。此外，HA 启动时还会从 `.storage/core.config_entries` 反序列化已有条目并重建 `ConfigEntry` 对象。因此，“新条目”主要来自 config flow 完成阶段，但 `ConfigEntry` 对象并不只会在 config flow 中被实例化。
+
+**`unique_id` 的设置时机**：通常在某个 `async_step_*` 中拿到可稳定识别设备的信息后立即调用：
+
+```python
+await self.async_set_unique_id(device_serial_or_mac)
+self._abort_if_unique_id_configured()
+```
+
+`async_set_unique_id()` 会把值记录到 flow context，并检查同 domain 下是否已有相同 `unique_id` 的条目或正在进行的 flow；真正创建 `ConfigEntry` 时，core 再把 `flow.unique_id` 写入 `ConfigEntry.unique_id`。如果设备还无法稳定识别，不应使用临时 host/IP 作为 `unique_id`；更好的做法是先探测设备，拿到序列号、MAC、云端账号 ID 等稳定标识后再设置。
 
 **ConfigEntryState 生命周期**:
 
@@ -712,7 +739,126 @@ class ConfigFlow(ConfigEntryBaseFlow):
    如果已覆盖: 通常先 async_set_unique_id()，再返回表单或直接创建条目
 ```
 
-### 5.7 OptionsFlow — 选项流
+### 5.7 ConfigFlow step 方法职责与调用时机
+
+`ConfigFlow` 的每个 `async_step_*` 方法都不是随便命名的回调，而是由 `FlowManager` 根据当前 step id 反射调用：`_async_handle_step(flow, step_id, data)` 会执行 `flow.async_step_{step_id}(user_input)`。对 `ConfigFlow` 来说，初始 step 来自 `context["source"]`，所以不同来源会进入不同方法：
+
+| step 方法 | 何时被调用 | 主要职责 | 常见返回 |
+|-----------|------------|----------|----------|
+| `async_step_user` | 用户在 UI 点击“添加集成”；或默认发现流程转入手动确认 | 展示表单、校验用户输入、连接设备/服务、设置 `unique_id`、创建条目 | `async_show_form` / `async_create_entry` / `async_abort` |
+| `async_step_import` | YAML 配置通过 `hass.config_entries.flow.async_init(..., context={"source": SOURCE_IMPORT})` 导入 | 把 YAML 配置迁移成 config entry；避免和 UI 配置重复 | `async_create_entry` / `async_abort` |
+| `async_step_bluetooth` | Bluetooth 集成发现到匹配 manifest matcher 的 BLE 设备 | 从 `BluetoothServiceInfoBleak` 提取 MAC/名称/service data，设置稳定 `unique_id`，必要时探测设备，进入确认或密钥步骤 | `async_show_form` / `async_create_entry` / `async_abort` |
+| `async_step_zeroconf` / `dhcp` / `ssdp` / `usb` / `homekit` / `mqtt` | 对应发现源产生匹配结果 | 从发现数据提取 host、serial、MAC 等，设置 `unique_id`，提示用户确认或补充认证 | `async_show_form` / `async_create_entry` |
+| `async_step_reauth` | 已有条目认证失败，集成调用 reauth flow | 找到原 `ConfigEntry`，重新收集 token/password，成功后更新并 reload 原条目 | `async_update_reload_and_abort` |
+| `async_step_reconfigure` | 用户对已有条目发起重新配置 | 修改连接参数、账号、host 等核心配置；不应创建新条目 | `async_update_reload_and_abort` / `async_abort` |
+| `async_step_ignore` | 用户忽略某个发现项 | 记录忽略状态，阻止同一发现项反复弹出 | `async_abort` |
+
+典型 step 的工作顺序是：
+
+```
+收到 user_input / discovery_info
+  ├── 如果没有输入：返回 async_show_form()
+  ├── 校验 schema 和连接能力
+  ├── 获取稳定身份：serial / MAC / account id
+  ├── await async_set_unique_id(stable_id)
+  ├── _abort_if_unique_id_configured()
+  └── async_create_entry(...) 或进入下一个 async_step_xxx
+```
+
+需要注意：`async_create_entry()` 只是返回 `CREATE_ENTRY` 类型的 flow result，它本身不是 `ConfigEntry` 构造器。真正的 `ConfigEntry` 由 core 在 flow 完成时创建。
+
+### 5.8 ConfigEntry 创建、更新与 `unique_id`
+
+`ConfigEntriesFlowManager.async_finish_flow()` 处理 `CREATE_ENTRY` 结果时，会把 flow result 中的 `data/title/options/version` 与 `flow.unique_id` 合并，实例化 `ConfigEntry`，再加入 `ConfigEntries` 管理器。伪代码如下：
+
+```python
+entry = ConfigEntry(
+    data=result["data"],
+    domain=result["handler"],
+    source=flow.context["source"],
+    title=result["title"],
+    unique_id=flow.unique_id,
+    version=result["version"],
+    minor_version=result["minor_version"],
+    options=result["options"],
+    subentries_data=result["subentries"],
+    discovery_keys=discovery_keys,
+)
+await self.config_entries.async_add(entry)
+```
+
+因此集成作者在 `config_flow.py` 中应关注“返回正确的 flow result”，而不是手工 new 一个 `ConfigEntry`。已有条目的修改也不应直接改属性，core 对 `entry_id`、`unique_id`、`data`、`options` 等字段有冻结/更新管理逻辑；需要通过 `hass.config_entries.async_update_entry(...)`、`async_update_reload_and_abort(...)` 等 API 更新。
+
+`async_set_unique_id()` 的作用包括：
+
+1. 把 `unique_id` 写入当前 flow 的 context。
+2. 检查同一 domain 是否已有相同 `unique_id` 的 `ConfigEntry`。
+3. 检查是否已有相同 `unique_id` 的 flow 正在进行，避免并发重复配置。
+4. 对发现流，把默认 discovery unique id 替换为真实设备 id 后，终止重复的默认发现 flow。
+
+所以实践中应尽早设置真实 `unique_id`，并紧跟 `_abort_if_unique_id_configured()`：
+
+```python
+await self.async_set_unique_id(format_mac(discovery_info.address))
+self._abort_if_unique_id_configured()
+```
+
+### 5.9 ConfigFlow 实例生命周期与 BLE 发现去重
+
+`ConfigFlow` 实例代表“一次正在进行的配置流程”，不是集成生命周期内的单例。每次调用 `hass.config_entries.flow.async_init(domain, context=..., data=...)`，core 都会通过该 domain 注册的 handler class 创建一个新的 flow 实例，分配新的 `flow_id`，并记录在 `_progress` 中。用户手动添加一次、一次 YAML import、一次 BLE discovery、一次 reauth，通常都是不同的 flow 实例。
+
+但“会多次实例化”不等于“每收到一次 BLE 广播都调用一次 `async_step_bluetooth`”。Bluetooth 路径有多层去重：
+
+```
+BLE advertisement
+  ↓
+bluetooth.manager._discover_service_info()
+  ├── IntegrationMatcher.match_domains(service_info)
+  │     └── 若同 address 的 name / manufacturer data / service data / service UUIDs 等字段此前都见过，返回空集合
+  ↓
+helpers.discovery_flow.async_create_flow(..., source="bluetooth", data=service_info)
+  └── 若已有相同 domain/source/data 的发现 flow 正在进行，则不再 async_init
+  ↓
+ConfigEntriesFlowManager.async_init(...)
+  └── 创建新的 ConfigFlow 实例，init_step="bluetooth"
+        ↓
+      async_step_bluetooth(discovery_info)
+```
+
+因此更准确的说法是：**每个“匹配且未被去重的发现事件”可能启动一个新的 config flow，并调用一次该 flow 实例的 `async_step_bluetooth`；重复广播如果没有新增可匹配字段，通常在 Bluetooth matcher 层就被抑制，不会进入 config flow。** 如果设备消失、历史被清理、已有 config entry 被删除，或同一地址广播出现新的 service data/manufacturer data 等字段，HA 可能重新触发发现。
+
+真实 BLE 集成常见写法类似：
+
+```python
+async def async_step_bluetooth(self, discovery_info: BluetoothServiceInfoBleak):
+    await self.async_set_unique_id(format_mac(discovery_info.address))
+    self._abort_if_unique_id_configured()
+
+    self._discovered = {
+        CONF_ADDRESS: discovery_info.address,
+        CONF_NAME: discovery_info.name,
+    }
+
+    # 可选：探测设备能力、检查是否支持、读取加密要求
+    if not await device_is_supported(discovery_info):
+        return self.async_abort(reason="not_supported")
+
+    self.context["title_placeholders"] = {"name": discovery_info.name}
+    self._set_confirm_only()
+    return self.async_show_form(step_id="bluetooth_confirm")
+
+async def async_step_bluetooth_confirm(self, user_input=None):
+    if user_input is not None:
+        return self.async_create_entry(
+            title=self._discovered[CONF_NAME],
+            data={CONF_ADDRESS: self._discovered[CONF_ADDRESS]},
+        )
+    return self.async_show_form(step_id="bluetooth_confirm")
+```
+
+BTHome、Acaia 等内置集成都遵循这个模式：`async_step_bluetooth()` 先用 BLE address 或格式化 MAC 设置 `unique_id`，检测是否已经配置，然后保存 discovery info，最后进入确认表单、加密密钥表单或直接创建 entry。
+
+### 5.10 OptionsFlow — 选项流
 
 ```python
 class OptionsFlow(ConfigEntryBaseFlow):
@@ -982,6 +1128,66 @@ component.async_register_batched_entity_service(
     async_get_forecasts,  # func(entities, service_call)
 )
 ```
+
+### 7.4 services.yaml — 服务说明文件
+
+`services.yaml` **不是服务注册入口**。真正让服务可以被调用的是 Python 代码里的 `hass.services.async_register(...)`、`component.async_register_entity_service(...)`、`component.async_register_batched_entity_service(...)` 或 `async_register_admin_service(...)`；`services.yaml` 只是为这些已经注册的服务提供“用户文档”：前端服务面板、开发者工具、自动化动作编辑器、LLM action 描述等地方会用它展示字段、目标对象、选择器、示例和分组。
+
+源码里有两个关键边界：
+
+1. `loader.Integration.has_services` 只检查集成目录顶层是否存在 `services.yaml`。
+2. `homeassistant.helpers.service.async_get_all_descriptions()` 会遍历当前已经注册到 `ServiceRegistry` 的服务；如果某个 domain 的服务缺少描述，并且该集成 `has_services=True`，才从 `integration.file_path / "services.yaml"` 加载描述并合并到返回结果。
+
+也就是说：**只写 `services.yaml` 不会注册任何服务；只注册服务但不写 `services.yaml`，服务仍可被调用，但前端缺少友好的字段说明。** hassfest 也会扫描集成源码，如果发现注册服务的代码却没有 `services.yaml`，会报 `Registers services but has no services.yaml`。
+
+一个服务描述文件的结构大致如下：
+
+```yaml
+refresh:
+  target:
+    entity:
+      domain: sensor
+      integration: my_integration
+  fields:
+    force:
+      required: false
+      default: false
+      example: true
+      selector:
+        boolean:
+    options:
+      collapsed: true
+      fields:
+        timeout:
+          default: 10
+          selector:
+            number:
+              min: 1
+              max: 60
+              unit_of_measurement: seconds
+```
+
+| 键 | 作用 |
+|----|------|
+| 顶层 `<service>` | 服务名，必须是 slug；最终完整服务名是 `<domain>.<service>`，例如 `my_integration.refresh`。 |
+| `target` | 目标选择器，用于实体服务常见的 `entity_id` / `area_id` / `device_id` 选择 UI。常见写法是 `target.entity.domain` 限制实体域，`target.entity.integration` 限制集成来源。 |
+| `fields` | 服务参数定义。每个字段名应与 Python 服务 schema / handler 使用的字段一致。 |
+| `required` | 该字段在 UI 和 schema 说明中是否必填；真正的强校验仍应由 Python 的 voluptuous schema 完成。 |
+| `default` | UI 默认值或说明默认值；应和 Python 端默认值保持一致。 |
+| `example` | 开发者工具里展示的示例值。 |
+| `advanced` | 标记为高级字段，前端可以折叠或弱化展示。 |
+| `selector` | 前端输入控件，例如 `text`、`number`、`boolean`、`select`、`template`、`duration`、`entity`、`device` 等。 |
+| `filter` | 仅 targeted service 可用，用于按实体 `supported_features` 或属性能力过滤字段显示；light 的 `transition`、`rgb_color` 等字段大量使用这种模式。 |
+| 字段分区 `<section>` | `fields` 下的某个 key 如果自身包含 `fields`，它就是 section，而不是普通字段。section 可写 `collapsed: true` 并嵌套一组字段。 |
+| `name` / `description` | 自定义集成 schema 允许在 `services.yaml` 内直接写名称和说明；更推荐放到 `translations/en.json` 的 `services` 分类，便于本地化。 |
+
+注意几个源码约束：
+
+- `services.yaml` 的顶层服务值可以为空，例如 MQTT 的 `reload:`，表示该服务没有字段。
+- core 集成可以用 YAML anchor 复用片段，例如 light 的 `.brightness_support: &brightness_support`；hassfest core schema 会移除 `.` 开头的内部 anchor key。自定义集成 schema 顶层只接受 slug 服务名，不建议写 `.` 开头的辅助 key。
+- `target` 不支持写 device filter；hassfest 会报错并提示“Services do not support device filters on target, use a device selector instead”。如果服务需要选择设备，应在 `fields` 里放一个 `device` selector。
+- `services.yaml` 只描述 UI；Python 端仍然要注册服务、定义 schema、处理权限和实际执行逻辑。
+- 服务名称、描述、字段名、section 名和服务图标应与 `translations/en.json`、`icons.json` 对齐。core 集成强制要求服务 icon；自定义集成不一定强制，但写上体验更好。
 
 ## 8. 平台(Platform)与 EntityComponent 编排
 
@@ -1370,7 +1576,12 @@ class HueBaseEntity(Entity):
 custom_components/my_integration/
 ├── manifest.json
 ├── __init__.py
-└── sensor.py          # 向 sensor 域提供实体（可选）
+├── config_flow.py              # 支持 UI 配置流时需要
+├── sensor.py                   # 向 sensor 域提供实体（可选）
+├── translations/
+│   └── en.json                 # 自定义集成运行时翻译（config/options/services/entity 等）
+├── icons.json                  # 前端图标资源（可选）
+└── services.yaml               # 服务定义（可选）
 ```
 
 ### 10.2 manifest.json
@@ -1379,15 +1590,335 @@ custom_components/my_integration/
 {
   "domain": "my_integration",
   "name": "My Integration",
+  "version": "1.0.0",
   "codeowners": ["@your_github"],
   "config_flow": true,
   "documentation": "https://www.example.com",
+  "issue_tracker": "https://www.example.com/issues",
   "integration_type": "device",
   "iot_class": "local_polling",
   "requirements": ["my-library==1.0.0"],
   "zeroconf": ["_myservice._tcp.local."]
 }
 ```
+
+`manifest.json` 是集成加载器读取的元数据入口。HA 在 `loader.py` 中解析每个集成目录下的 `manifest.json`，生成 `Integration` 对象；自定义集成还需要声明 `version`，否则会被标记为无效集成。
+
+| 键 | 作用 |
+|----|------|
+| `domain` | 集成域名，必须等于目录名，例如 `custom_components/my_integration/` 对应 `my_integration`。它也是配置条目、实体平台、服务、翻译 key 的命名空间。 |
+| `name` | 前端展示的集成名称；如果翻译资源没有提供根级 `title`，翻译加载器会回退到 manifest 的 `name`。 |
+| `version` | 自定义集成版本号。Core 内置集成通常不写；custom integration 应写，便于 HA 校验、诊断和兼容性判断。 |
+| `documentation` | 集成文档 URL。内置集成要求指向 Home Assistant 官方集成文档；自定义集成可以指向自己的文档页。 |
+| `issue_tracker` | 自定义集成的问题反馈 URL，通常指向 GitHub Issues。 |
+| `codeowners` | 维护者列表，常写 GitHub 用户名；用于源码维护、诊断展示和 hassfest 校验。 |
+| `integration_type` | 集成类型，默认是 `hub`。常见值包括 `device`、`hub`、`service`、`helper`、`entity`、`system`、`hardware`、`virtual`。它影响质量规则、实体平台预期和图标/翻译 schema。 |
+| `iot_class` | IoT 通信模式，例如 `local_push`、`local_polling`、`cloud_push`、`cloud_polling`、`assumed_state`、`calculated`。用于告诉用户集成依赖本地网络、云端还是计算值。 |
+| `config_flow` | 是否支持 UI 配置流。为 `true` 时，集成目录必须提供 `config_flow.py`，HA 才会把它列入可通过 UI 添加的集成。 |
+| `single_config_entry` | 是否只允许创建一个配置条目。适合全局服务或系统级集成；多设备/多账号集成通常不要开启。 |
+| `requirements` | Python 依赖包列表，HA 会按需安装/加载，例如 `aiohue==4.8.1`。运行时不要在代码里手动 `pip install`。 |
+| `dependencies` | 强依赖集成。HA 会先加载这些集成；依赖失败通常会阻止当前集成正常 setup。 |
+| `after_dependencies` | 弱依赖/加载顺序提示。存在时尽量在这些集成之后加载，但不会强制安装或强制启用。 |
+| `loggers` | 集成相关第三方库 logger 名称；用于日志级别管理和诊断。 |
+| `import_executor` | 是否在线程池中 import 集成模块。未显式设置时默认 `true`，避免同步 import 阻塞事件循环。 |
+| `zeroconf` | mDNS/Zeroconf 发现 matcher。可以是服务类型字符串，也可以是带 `type`、`name`、`properties` 等条件的对象。匹配后进入 `async_step_zeroconf`。 |
+| `ssdp` | SSDP/UPnP 发现 matcher。通常按响应头字段匹配；匹配后进入 `async_step_ssdp`。 |
+| `dhcp` | DHCP 发现 matcher，可按 `macaddress`、`hostname`、`registered_devices` 等匹配；匹配后进入 `async_step_dhcp`。 |
+| `usb` | USB 发现 matcher，可按 `vid`、`pid`、`serial_number`、`manufacturer`、`description` 等匹配；匹配后进入 `async_step_usb`。 |
+| `bluetooth` | BLE 广播 matcher，可按 `service_uuid`、`service_data_uuid`、`local_name`、`manufacturer_id`、`manufacturer_data_start`、`connectable` 等匹配；匹配后进入 `async_step_bluetooth`。 |
+| `homekit` | HomeKit 发现声明，例如 `models`；用于 HomeKit 控制器发现路径。 |
+| `mqtt` | MQTT discovery 相关声明；用于让 MQTT 集成知道哪些 discovery payload 可归属到该集成。 |
+| `quality_scale` | 内置集成的质量等级标记；自定义集成在 loader 属性中会归类为 `custom`。 |
+| `preview_features` | 预览功能元数据，可为每个 feature 提供反馈、了解更多、报错链接；需要配合翻译资源展示名称和说明。 |
+| `disabled` | 禁用原因。一般由 core/维护流程使用，自定义集成通常不主动写。 |
+| `is_built_in` / `overwrites_built_in` | loader 运行时附加的内部元数据，不是自定义集成作者应该手写的 manifest 字段。 |
+
+#### 翻译字符串：strings.json 与 translations/en.json
+
+HA 有两套容易混淆的翻译文件入口：**内置 core 集成源码中通常维护 `strings.json`**；**自定义集成运行时应提供 `translations/<language>.json`，至少 `translations/en.json`**。源码中的翻译加载器通过 `Integration.has_translations` 判断集成目录是否有 `translations/` 目录，然后读取 `translations/en.json` 和当前语言 JSON；pylint 辅助工具也明确区分“core integrations use strings.json, custom integrations use translations/en.json”。因此写自定义集成时，最好把下面的结构放在 `translations/en.json`，而不是只放一个根级 `strings.json`。
+
+翻译资源会按 category 拉取，并被扁平化成类似 `component.my_integration.config.step.user.data.host` 的 key。英文永远先作为 fallback 加载，其他语言只覆盖已有 key；占位符如 `{name}`、`{host}` 必须和英文字符串保持一致。
+
+```json
+{
+  "title": "My Integration",
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect to device",
+        "description": "Enter the connection details for {name}.",
+        "data": {
+          "host": "Host",
+          "api_key": "API key"
+        },
+        "data_description": {
+          "host": "Hostname or IP address of the device."
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Failed to connect",
+      "invalid_auth": "Invalid authentication"
+    },
+    "abort": {
+      "already_configured": "Device is already configured"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "data": {
+          "poll_interval": "Poll interval"
+        }
+      }
+    }
+  },
+  "services": {
+    "refresh": {
+      "name": "Refresh data",
+      "description": "Fetch fresh data from the device.",
+      "fields": {
+        "force": {
+          "name": "Force refresh",
+          "description": "Ignore cached data."
+        }
+      }
+    }
+  },
+  "entity": {
+    "sensor": {
+      "temperature": {
+        "name": "Temperature",
+        "state_attributes": {
+          "signal": {
+            "name": "Signal strength"
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+| 键 | 作用 |
+|----|------|
+| `title` | 集成显示标题。通常可以省略，让 HA 使用 manifest 的 `name`；如果要与品牌名不同才单独设置。 |
+| `config` | ConfigFlow 的 UI 文案，对应 `config_flow.py` 中的 `async_step_*`、`async_show_form(errors=...)`、`async_abort(reason=...)`、`async_create_entry(...)`。 |
+| `config.step.<step_id>.title` | 某个 step 表单标题。`step_id` 必须对应代码里的 `async_show_form(step_id="...")`，例如 `user`、`bluetooth_confirm`、`reauth_confirm`。 |
+| `config.step.<step_id>.description` | 表单说明文字，可使用 `description_placeholders` 传入的 `{placeholder}`。 |
+| `config.step.<step_id>.data.<field>` | 表单字段标签。`field` 应对应 `data_schema` 中的字段名。 |
+| `config.step.<step_id>.data_description.<field>` | 字段帮助说明；必须对应同一 step 的 `data` 字段。 |
+| `config.step.<step_id>.sections.<section>` | 表单分区。每个 section 可有 `name`、`description`、`data`、`data_description`，用于复杂表单分组。 |
+| `config.step.<step_id>.menu_options` | 菜单式 flow 的选项标题，对应 `async_show_menu` 的 menu option。 |
+| `config.step.<step_id>.submit` | 自定义提交按钮文案。 |
+| `config.error.<error_key>` | 表单错误文案。代码中 `errors["base"] = "cannot_connect"` 或 `errors[field] = "invalid_auth"` 时，前端查这里。 |
+| `config.abort.<reason>` | 终止 flow 的文案。代码中 `async_abort(reason="already_configured")` 的 reason 必须能在这里找到。`_abort_if_unique_id_configured()` 等助手也要求常见 reason 有翻译。 |
+| `config.progress.<key>` | 长任务/进度型 flow 的进度文案。 |
+| `config.create_entry.<key>` | 成功创建条目时的补充文案。 |
+| `config.flow_title` | Flow 标题模板，常和 `title_placeholders` 一起用于发现流，例如显示设备名称。 |
+| `config_subentries` | Config subentry flow 文案。结构类似 `config`，但还包含 `entry_type`、`initiate_flow`，用于一个 config entry 下再添加子设备/子配置。 |
+| `options` | OptionsFlow 的 UI 文案，结构和 `config` 类似；`options.step.init.data.poll_interval` 对应选项表单字段。 |
+| `services` | 服务面板文案。`services.<service>.name/description` 描述服务；`fields.<field>.name/description/example` 描述服务字段；`sections` 描述服务字段分区。 |
+| `entity` | 具体实体翻译。结构通常是 `entity.<platform>.<translation_key>`；实体类通过 `_attr_translation_key` 或 description 的 `translation_key` 关联。 |
+| `entity.<platform>.<translation_key>.name` | 实体名称翻译。配合 `_attr_has_entity_name = True` 可得到符合 HA 命名规范的实体名称。 |
+| `entity.<platform>.<translation_key>.state` | 实体 state 值翻译，例如 sensor 枚举状态。 |
+| `entity.<platform>.<translation_key>.state_attributes` | 实体属性名和属性枚举值翻译。常见结构是 `<attr>.name` 和 `<attr>.state.<value>`。 |
+| `entity.<platform>.<translation_key>.unit_of_measurement` | 单位文本翻译，适合需要本地化展示的单位。 |
+| `entity_component` | 平台级翻译，主要用于 `entity` / `helper` / `system` 型集成自身作为实体平台时的状态、属性等通用文案。 |
+| `device` | 设备 translation key 的名称翻译。 |
+| `device_automation` | 设备自动化文案，包括 `trigger_type`、`trigger_subtype`、`condition_type`、`action_type`、`extra_fields` 等。 |
+| `issues` | Repairs/issue registry 文案。`issues.<issue_key>.title` 是问题标题；`description` 是说明；`fix_flow` 可定义修复流程表单文案。 |
+| `selector` | selector 中 choices/options/fields/unit 的本地化文案。 |
+| `conditions` / `triggers` | 自定义自动化 condition/trigger 的名称、说明和字段文案。 |
+| `exceptions` | 可翻译异常文案。异常类或调用方使用 `translation_key` 和 `translation_placeholders` 时，会查这里。 |
+| `preview_features` | manifest `preview_features` 中 feature 的显示名、说明和启停确认文案。 |
+| `application_credentials` | OAuth/application credentials 配置说明。 |
+| `system_health` / `config_panel` / `conversation` / `common` | 较少见的专用分类，分别用于系统健康信息、自定义面板、对话 agent、集成内复用通用文案。 |
+
+翻译值还可以引用已有 key，避免重复维护：
+
+```json
+{
+  "config": {
+    "error": {
+      "cannot_connect": "[%key:common::config_flow::error::cannot_connect%]"
+    },
+    "step": {
+      "user": {
+        "data": {
+          "host": "[%key:common::config_flow::data::host%]"
+        }
+      }
+    }
+  }
+}
+```
+
+`common::...` 引用 HA 全局通用字符串；`component::<domain>::...` 引用某个集成自己的翻译 key。注意不要拼接多个引用，也不要在翻译字符串中写 HTML；URL 应通过 description placeholders 传入。
+
+#### icons.json
+
+`icons.json` 是前端图标资源，不负责实体状态值或服务说明的文字翻译。源码中的 icon helper 会读取每个集成目录下的 `icons.json`，按 category 建缓存；frontend 通过 `frontend/get_icons` WebSocket 命令按 `conditions`、`entity`、`entity_component`、`services`、`triggers` 等分类获取资源。hassfest 还支持校验 `config`、`options`、`issues.fix_flow` 等表单 section 图标。
+
+```json
+{
+  "entity": {
+    "sensor": {
+      "temperature": {
+        "default": "mdi:thermometer",
+        "state": {
+          "unavailable": "mdi:thermometer-alert"
+        },
+        "state_attributes": {
+          "signal": {
+            "default": "mdi:wifi",
+            "range": {
+              "0": "mdi:wifi-strength-outline",
+              "50": "mdi:wifi-strength-2",
+              "80": "mdi:wifi-strength-4"
+            }
+          }
+        }
+      }
+    }
+  },
+  "services": {
+    "refresh": {
+      "service": "mdi:refresh"
+    }
+  },
+  "triggers": {
+    "device_pressed": {
+      "trigger": "mdi:gesture-tap-button"
+    }
+  }
+}
+```
+
+| 键 | 作用 |
+|----|------|
+| `entity` | 具体实体图标。结构是 `entity.<platform>.<translation_key>`，通常与翻译文件里的实体 translation key 对齐。 |
+| `entity.<platform>.<translation_key>.default` | 该实体 translation key 的默认图标。 |
+| `entity.<platform>.<translation_key>.state.<state>` | 按实体 state 值切换图标。state 图标不要和 default 图标重复。 |
+| `entity.<platform>.<translation_key>.range.<number>` | 按数值区间切换图标，key 必须是数字并按升序排列。适合电量、信号强度等。 |
+| `entity.<platform>.<translation_key>.state_attributes.<attr>.default` | 某个属性的默认图标。 |
+| `entity.<platform>.<translation_key>.state_attributes.<attr>.state.<value>` | 某个属性取特定枚举值时的图标。Hue 的 `effect=candle/fire/sunrise` 图标就是这种模式。 |
+| `entity.<platform>.<translation_key>.state_attributes.<attr>.range.<number>` | 某个数值属性按区间切换图标。 |
+| `entity_component` | 平台级实体图标，主要用于 `entity` / `helper` / `system` 类型集成。需要 `_` default 图标作为兜底。 |
+| `services.<service>.service` | 服务图标，对应服务名。自定义集成还可以使用简写：`"refresh": "mdi:refresh"`，加载时会被转换成 `{ "service": "mdi:refresh" }`。 |
+| `services.<service>.sections.<section>` | 服务字段分区图标。 |
+| `conditions.<condition>.condition` | 自动化 condition 图标。 |
+| `triggers.<trigger>.trigger` | 自动化 trigger 图标。 |
+| `config.step.<step_id>.sections.<section>` | ConfigFlow 表单 section 图标。 |
+| `options.step.<step_id>.sections.<section>` | OptionsFlow 表单 section 图标。 |
+| `issues.<issue_key>.fix_flow.step.<step_id>.sections.<section>` | Repair issue 修复流程中表单 section 的图标。 |
+
+所有图标值必须是 Material Design Icons 标识并以 `mdi:` 开头，例如 `mdi:refresh`。文字放在翻译资源里，图标放在 `icons.json`，两者通过相同的 service 名、trigger 名或 entity `translation_key` 对齐。
+
+#### services.yaml
+
+如果集成注册了自己的服务，建议同时提供 `services.yaml`、`translations/en.json` 的 `services` 文案，以及 `icons.json` 的服务图标。下面是一个自定义集成中常见的组合：
+
+```python
+# __init__.py
+import voluptuous as vol
+
+from homeassistant.core import HomeAssistant, ServiceCall
+from homeassistant.helpers import config_validation as cv
+
+DOMAIN = "my_integration"
+SERVICE_REFRESH = "refresh"
+
+REFRESH_SCHEMA = vol.Schema({
+    vol.Optional("force", default=False): cv.boolean,
+    vol.Optional("timeout", default=10): vol.All(vol.Coerce(int), vol.Range(min=1, max=60)),
+})
+
+
+async def async_setup_entry(hass: HomeAssistant, entry) -> bool:
+    async def async_refresh(call: ServiceCall) -> None:
+        force = call.data["force"]
+        timeout = call.data["timeout"]
+        await entry.runtime_data.async_refresh(force=force, timeout=timeout)
+
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_REFRESH,
+        async_refresh,
+        schema=REFRESH_SCHEMA,
+    )
+    return True
+```
+
+```yaml
+# services.yaml
+refresh:
+  fields:
+    force:
+      default: false
+      example: true
+      selector:
+        boolean:
+    advanced_options:
+      collapsed: true
+      fields:
+        timeout:
+          default: 10
+          example: 30
+          selector:
+            number:
+              min: 1
+              max: 60
+              unit_of_measurement: seconds
+```
+
+```json
+// translations/en.json
+{
+  "services": {
+    "refresh": {
+      "name": "Refresh data",
+      "description": "Fetch fresh data from the device.",
+      "fields": {
+        "force": {
+          "name": "Force refresh",
+          "description": "Ignore cached data and poll the device immediately."
+        },
+        "timeout": {
+          "name": "Timeout",
+          "description": "Maximum time to wait for the refresh request."
+        }
+      },
+      "sections": {
+        "advanced_options": {
+          "name": "Advanced options"
+        }
+      }
+    }
+  }
+}
+```
+
+```json
+// icons.json
+{
+  "services": {
+    "refresh": {
+      "service": "mdi:refresh"
+    }
+  }
+}
+```
+
+写自己的 `services.yaml` 时，按下面的顺序最不容易出错：
+
+1. **先注册服务**：在 `async_setup` 或 `async_setup_entry` 中调用 `hass.services.async_register(...)`，或在实体平台里调用 `async_register_entity_service(...)`。服务名、字段名先在 Python schema 中确定。
+2. **再写描述文件**：顶层 key 写服务名；无参数服务可以只写 `reload:`；有参数则写 `fields`、`selector`、`default`、`example`。
+3. **实体服务写 target**：如果服务作用于实体，使用 `target.entity.domain` / `target.entity.integration` 限制可选实体；不要在 `target` 里写 device filter。
+4. **复杂字段用 section**：一组高级参数可以写成带 `collapsed: true` 的 section，section 内再放 `fields`。
+5. **文案放翻译文件**：自定义集成优先在 `translations/en.json` 的 `services.<service>` 下写 `name`、`description`、`fields`、`sections`，再按需添加其他语言。
+6. **图标放 icons.json**：用 `services.<service>.service` 提供 `mdi:` 图标，让服务列表更容易识别。
+7. **保持三处一致**：Python schema、`services.yaml`、`translations/en.json` 的字段名必须一致；默认值也应一致，否则 UI 展示和实际调用行为会产生偏差。
 
 ### 10.3 `__init__.py` — 集成入口
 
@@ -1439,6 +1970,19 @@ async def _async_update_listener(hass: HomeAssistant, entry: MyConfigEntry) -> N
 
 ### 10.4 `config_flow.py` — 配置流
 
+要启用 UI 配置流，`manifest.json` 中必须声明 `"config_flow": true`，并在集成目录下提供 `config_flow.py`。自定义集成的 `ConfigFlow` 只负责“收集输入、校验、去重、返回 flow result”；它不直接实例化 `ConfigEntry`。
+
+#### 常用 step 设计
+
+- `async_step_user`：用户手动添加入口。展示表单，校验 host/token，连接设备或云端账号，拿到稳定 ID 后创建条目。
+- `async_step_import`：YAML 导入入口。通常复用 `async_step_user` 的校验逻辑，但 source 是 `import`，用于把 YAML 迁移成 config entry。
+- `async_step_bluetooth` / `zeroconf` / `dhcp` / `ssdp`：自动发现入口。先从发现数据提取稳定 ID 并去重，再展示确认表单或补充认证表单。
+- `async_step_reauth`：认证失效后的重新认证入口。成功后更新原条目并 reload，而不是创建新条目。
+- `async_step_reconfigure`：用户修改已有条目的核心连接参数。成功后更新原条目。
+- `async_get_options_flow`：返回 OptionsFlow，用于管理非身份类选项，例如轮询间隔、启用功能开关。
+
+#### 手动配置 + Zeroconf/YAML 导入示例
+
 ```python
 from homeassistant import config_entries
 from homeassistant.core import callback
@@ -1457,19 +2001,20 @@ class MyConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         errors = {}
 
         if user_input is not None:
-            # 验证连接
             try:
-                await validate_input(self.hass, user_input)
+                info = await validate_input(self.hass, user_input)
             except CannotConnect:
                 errors["base"] = "cannot_connect"
             except InvalidAuth:
                 errors["base"] = "invalid_auth"
             else:
-                # 设置唯一 ID 防止重复配置
-                await self.async_set_unique_id(user_input[CONF_HOST])
-                self._abort_if_unique_id_configured()
+                # 使用设备序列号/账号 ID/MAC 等稳定身份；host/IP 不稳定时不要作为 unique_id。
+                await self.async_set_unique_id(info["serial_number"])
+                self._abort_if_unique_id_configured(
+                    updates={CONF_HOST: user_input[CONF_HOST]},
+                )
                 return self.async_create_entry(
-                    title=f"My Device ({user_input[CONF_HOST]})",
+                    title=info["title"],
                     data=user_input,
                 )
 
@@ -1482,13 +2027,20 @@ class MyConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             errors=errors,
         )
 
+    async def async_step_import(self, import_data):
+        """YAML 导入步骤。"""
+        return await self.async_step_user(import_data)
+
     async def async_step_zeroconf(self, discovery_info):
         """Zeroconf 自动发现步骤。"""
         host = discovery_info.host
-        await self.async_set_unique_id(host)
-        self._abort_if_unique_id_configured()
+        serial = discovery_info.properties.get("serial")
 
-        # 展示确认表单
+        if serial:
+            await self.async_set_unique_id(serial)
+            self._abort_if_unique_id_configured(updates={CONF_HOST: host})
+
+        self.context["title_placeholders"] = {"name": discovery_info.name}
         return self.async_show_form(
             step_id="user",
             data_schema=vol.Schema({
@@ -1502,8 +2054,64 @@ class MyConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     def async_get_options_flow(config_entry):
         """选项流。"""
         return MyOptionsFlow(config_entry)
+```
+
+#### BLE 自动发现示例
+
+BLE 集成不应假设每个广播包都会进入 `async_step_bluetooth`；HA 会先按 manifest matcher 匹配 domain，再用 Bluetooth matcher 和 discovery flow 机制去重。进入该方法后，仍然必须设置真实 `unique_id` 并检查重复配置。
+
+```python
+from homeassistant.components.bluetooth import BluetoothServiceInfoBleak
+from homeassistant.const import CONF_ADDRESS, CONF_NAME
+from homeassistant.helpers.device_registry import format_mac
 
 
+class MyBleConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
+    """BLE 设备配置流。"""
+
+    VERSION = 1
+
+    def __init__(self):
+        self._discovered: dict[str, str] = {}
+
+    async def async_step_bluetooth(
+        self, discovery_info: BluetoothServiceInfoBleak,
+    ):
+        """处理匹配且未被去重的 BLE 发现事件。"""
+        address = discovery_info.address
+        await self.async_set_unique_id(format_mac(address))
+        self._abort_if_unique_id_configured()
+
+        if not device_advertisement_supported(discovery_info):
+            return self.async_abort(reason="not_supported")
+
+        self._discovered = {
+            CONF_ADDRESS: address,
+            CONF_NAME: discovery_info.name or address,
+        }
+        self.context["title_placeholders"] = {
+            "name": self._discovered[CONF_NAME],
+        }
+        self._set_confirm_only()
+        return self.async_show_form(step_id="bluetooth_confirm")
+
+    async def async_step_bluetooth_confirm(self, user_input=None):
+        """用户确认添加发现到的 BLE 设备。"""
+        if user_input is not None:
+            return self.async_create_entry(
+                title=self._discovered[CONF_NAME],
+                data={CONF_ADDRESS: self._discovered[CONF_ADDRESS]},
+            )
+
+        return self.async_show_form(
+            step_id="bluetooth_confirm",
+            description_placeholders=self.context["title_placeholders"],
+        )
+```
+
+#### OptionsFlow 示例
+
+```python
 class MyOptionsFlow(config_entries.OptionsFlowWithReload):
     """选项流。"""
 

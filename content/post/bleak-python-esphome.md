@@ -177,13 +177,14 @@ dev = await BleakScanner.find_device_by_address("AA:BB:CC:DD:EE:FF", timeout=10.
 
 ```python
 import asyncio
-from bleak import BleakScanner
+from bleak import BleakScanner, BleakClient, BleakGATTCharacteristic
 
 async def main() -> None:
     async with BleakScanner() as scanner:
         async for device, adv in scanner.advertisement_data():
-            print(device.address, adv.rssi, adv.local_name, adv.service_data)
-
+            print(device.address, adv.rssi, adv.local_name, adv.service_data, adv.manufacturer_data)
+            if 16965 in adv.manufacturer_data:
+                print("found target device:", device.address)
 asyncio.run(main())
 ```
 
@@ -356,7 +357,7 @@ ValueError: Cannot write to CCCD (0x2902) directly. Use start_notify() or stop_n
 
 ```python
 import asyncio
-from bleak import BleakClient, BleakScanner
+from bleak import BleakClient, BleakScanner, BleakGATTCharacteristic
 
 NOTIFY_UUID = "0000xxxx-0000-1000-8000-00805f9b34fb"
 
