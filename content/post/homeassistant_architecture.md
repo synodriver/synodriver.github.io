@@ -1021,6 +1021,8 @@ from homeassistant.helpers.entity import EntityDescription
 # 定义描述
 SENSOR_DESCRIPTION = SensorEntityDescription(
     key="temperature",
+    translation_key="temperature",
+    translation_placeholders={"room": "Living room"},
     device_class=SensorDeviceClass.TEMPERATURE,
     native_unit_of_measurement="°C",
     state_class=SensorStateClass.MEASUREMENT,
@@ -1028,6 +1030,8 @@ SENSOR_DESCRIPTION = SensorEntityDescription(
 
 # 使用描述
 class MySensor(SensorEntity):
+    _attr_has_entity_name = True
+
     def __init__(self, description):
         self.entity_description = description
         self._attr_unique_id = f"{description.key}_sensor"
@@ -1036,6 +1040,50 @@ class MySensor(SensorEntity):
     @property
     def native_value(self):
         return self._native_value
+```
+
+`EntityDescription` 的 `translation_key` 不是实体唯一 ID，也不是 entity_id 的来源；它是“去翻译文件里找哪一组文案”的 key。`Entity.translation_key` 会优先读取 `_attr_translation_key`，否则读取 `entity_description.translation_key`。HA 构造实体名称翻译 key 时，会拼成：
+
+```text
+component.<integration_domain>.entity.<platform_domain>.<translation_key>.name
+```
+
+例如平台 domain 是 `sensor`、集成 domain 是 `my_integration`、`translation_key="temperature"` 时，对应翻译文件：
+
+```json
+{
+  "entity": {
+    "sensor": {
+      "temperature": {
+        "name": "{room} temperature",
+        "state_attributes": {
+          "signal": {
+            "name": "Signal strength"
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+`translation_placeholders` 是给翻译字符串里的 `{room}` 这类占位符填值的映射。源码中的 `_substitute_name_placeholders()` 会对实体名称执行 `name.format(**self.translation_placeholders)`；如果翻译字符串需要 `{room}`，但实体没有提供对应 key，开发版/非 stable 场景会更严格，stable 中也会记录 warning。它只用于翻译文本替换，不参与实体注册、状态计算或唯一性判断。
+
+常见写法有两种：
+
+```python
+# 写在描述对象上，适合多个同类实体复用同一实体类
+SensorEntityDescription(
+    key="battery",
+    translation_key="battery",
+    translation_placeholders={"device_name": "Door lock"},
+)
+
+# 写在实体类属性上，适合运行时动态决定
+class MyBatterySensor(SensorEntity):
+    _attr_has_entity_name = True
+    _attr_translation_key = "battery"
+    _attr_translation_placeholders = {"device_name": "Door lock"}
 ```
 
 ### 6.5 CoordinatorEntity — 协调器实体
@@ -1756,6 +1804,105 @@ HA 有两套容易混淆的翻译文件入口：**内置 core 集成源码中通
 
 `common::...` 引用 HA 全局通用字符串；`component::<domain>::...` 引用某个集成自己的翻译 key。注意不要拼接多个引用，也不要在翻译字符串中写 HTML；URL 应通过 description placeholders 传入。
 
+#### translation_key 与各种 placeholders
+
+HA 源码里经常同时出现 `translation_key` 和 `*_placeholders`，它们本质上是同一个翻译机制的两部分：
+
+- `translation_key`：选择翻译资源中的哪一条模板字符串。
+- `*_placeholders`：给模板字符串里的 `{name}`、`{host}`、`{url}` 等变量填值。
+
+不同子系统会把 key 拼到不同 category 下：
+
+| 使用位置 | key 如何映射到翻译文件 | placeholders 参数 |
+|----|----|----|
+| Entity / EntityDescription | `component.<integration>.entity.<platform>.<translation_key>.name`、`.state.<state>`、`.unit_of_measurement` | `_attr_translation_placeholders` 或 `EntityDescription.translation_placeholders`，主要替换实体名称中的变量。 |
+| ConfigFlow 表单 | `config.step.<step_id>.description`、`config.abort.<reason>`、`config.flow_title` 等 | `description_placeholders`、`title_placeholders`。 |
+| ConfigFlow 创建条目 | `config.create_entry.<key>` 或 create-entry description | `async_create_entry(description_placeholders=...)`。 |
+| AbortFlow / `_abort_if_unique_id_configured()` | `config.abort.<reason>` | `description_placeholders`。 |
+| Repairs / issue registry | `issues.<issue_key>.title`、`issues.<issue_key>.description` | `translation_placeholders`。 |
+| 可翻译异常 | `exceptions.<translation_key>.message` | `translation_placeholders`。 |
+| Selector | `selector.<translation_key>...` | 通常由 selector 配置的 `translation_key` 决定选项/字段文案。 |
+| ServiceCall 描述 | `services.<service>.description` 可结合 runtime `description_placeholders` | 服务注册时传入的 `description_placeholders` 会随服务描述返回给前端。 |
+
+以 ConfigFlow 为例，`description_placeholders` 不会改变 step id，也不会改变错误 key；它只给当前 step 的说明文案填变量：
+
+```python
+return self.async_show_form(
+    step_id="bluetooth_confirm",
+    description_placeholders={"name": discovery_info.name or discovery_info.address},
+)
+```
+
+对应翻译：
+
+```json
+{
+  "config": {
+    "step": {
+      "bluetooth_confirm": {
+        "description": "Do you want to add {name}?"
+      }
+    }
+  }
+}
+```
+
+`title_placeholders` 则保存在 flow context 里，常用于自动发现流程的标题。源码中 `ConfigFlow.async_update_title_placeholders()` 会更新 `self.context["title_placeholders"]` 并通知前端刷新发现通知标题；如果马上要返回新 step，直接设置 `self.context["title_placeholders"]` 即可：
+
+```python
+self.context["title_placeholders"] = {"name": discovery_info.name}
+return self.async_show_form(step_id="user")
+```
+
+对应翻译：
+
+```json
+{
+  "config": {
+    "flow_title": "{name}",
+    "step": {
+      "user": {
+        "title": "Set up {name}"
+      }
+    }
+  }
+}
+```
+
+可翻译异常和 Repairs 使用的是更显式的 `translation_key` + `translation_placeholders`。例如自定义服务校验失败时，可以抛出可翻译异常：
+
+```python
+from homeassistant.exceptions import ServiceValidationError
+
+raise ServiceValidationError(
+    translation_domain=DOMAIN,
+    translation_key="invalid_channel",
+    translation_placeholders={"channel": channel},
+)
+```
+
+对应翻译：
+
+```json
+{
+  "exceptions": {
+    "invalid_channel": {
+      "message": "Channel {channel} is invalid"
+    }
+  }
+}
+```
+
+源码中的 `async_get_exception_message()` 会查 `component.<domain>.exceptions.<translation_key>.message`，再执行 `message.format(**translation_placeholders)`；找不到翻译时会回退返回 `translation_key` 本身。
+
+几个容易踩坑的点：
+
+- `translation_key` 要稳定、语义化、可复用；不要把设备名、host、MAC、序列号这类动态值写进 key，动态值放到 placeholders。
+- placeholders 的 key 必须和英文翻译字符串里的 `{placeholder}` 完全一致；其他语言也必须保留同一组 placeholder。
+- placeholders 只用于文字格式化，不是安全边界，也不是校验逻辑；服务参数、配置输入仍要用 Python schema 校验。
+- 不要把 HTML 拼进翻译字符串；URL、设备名、集成名等动态内容通过 placeholders 传入。
+- `description_placeholders`、`title_placeholders`、`translation_placeholders` 名字不同，是因为它们挂在不同 flow/result/registry 对象上；作用都是给翻译模板填变量。
+
 #### icons.json
 
 `icons.json` 是前端图标资源，不负责实体状态值或服务说明的文字翻译。源码中的 icon helper 会读取每个集成目录下的 `icons.json`，按 category 建缓存；frontend 通过 `frontend/get_icons` WebSocket 命令按 `conditions`、`entity`、`entity_component`、`services`、`triggers` 等分类获取资源。hassfest 还支持校验 `config`、`options`、`issues.fix_flow` 等表单 section 图标。
@@ -1970,7 +2117,7 @@ async def _async_update_listener(hass: HomeAssistant, entry: MyConfigEntry) -> N
 
 ### 10.4 `config_flow.py` — 配置流
 
-要启用 UI 配置流，`manifest.json` 中必须声明 `"config_flow": true`，并在集成目录下提供 `config_flow.py`。自定义集成的 `ConfigFlow` 只负责“收集输入、校验、去重、返回 flow result”；它不直接实例化 `ConfigEntry`。
+要启用 UI 配置流，`manifest.json` 中必须声明 `"config_flow": true`，并在集成目录下提供 `config_flow.py`。自定义集成的 `ConfigFlow` 只负责“收集输入、校验、去重、返回 flow result”；它不直接实例化 `ConfigEntry`。Flow 中的 `description_placeholders` / `title_placeholders` 只负责给翻译文案填变量，例如自动发现时把设备名 `{name}` 填进确认页标题或说明，不参与去重或条目创建。
 
 #### 常用 step 设计
 
