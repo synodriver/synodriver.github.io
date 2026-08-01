@@ -995,7 +995,7 @@ class SensorEntity(Entity):
     # 内部自动处理: 单位转换、精度、校验
 ```
 
-**SensorEntityDescription** 额外字段：`device_class`, `native_unit_of_measurement`, `options`, `state_class`, `suggested_display_precision`, `suggested_unit_of_measurement`
+`SensorEntityDescription` 的扩展字段和使用方式在 6.4 节统一说明。
 
 #### BinarySensorEntity
 
@@ -1013,12 +1013,55 @@ class BinarySensorEntity(Entity):
 
 ### 6.4 EntityDescription — 实体描述模式
 
-用于将实体属性从子类移到描述对象，减少子类数量：
+`EntityDescription` 是 HA 推荐的“描述对象”模式：把一类实体的静态元数据放到 description 里，把运行时值留在实体实例里。这样一个实体类可以通过不同 description 创建多个实体，避免为每个传感器/开关写一个子类。
+
+源码中的基类定义在 `homeassistant/helpers/entity.py`：
 
 ```python
-from homeassistant.helpers.entity import EntityDescription
+class EntityDescription(metaclass=FrozenOrThawed, frozen_or_thawed=True):
+    """A class that describes Home Assistant entities."""
 
-# 定义描述
+    key: str
+    device_class: str | None = None
+    entity_category: EntityCategory | None = None
+    entity_registry_enabled_default: bool = True
+    entity_registry_visible_default: bool = True
+    force_update: bool = False
+    icon: str | None = None
+    has_entity_name: bool = False
+    name: str | UndefinedType | None = UNDEFINED
+    translation_key: str | None = None
+    translation_placeholders: Mapping[str, str] | None = None
+    unit_of_measurement: str | None = None
+```
+
+`Entity` 的很多属性都会按“`_attr_*` 优先，否则读 `entity_description.*`”的顺序解析。例如 `translation_key` 会先读 `_attr_translation_key`，没有时读 `entity_description.translation_key`；`entity_category`、`device_class`、`icon` 等也遵循类似模式。
+
+| 字段 | 作用 |
+|----|----|
+| `key` | description 的内部标识，通常用于生成 `unique_id`、从 coordinator 数据中取值、区分同一实体类创建出的多个实体。它不是 HA 的 `entity_id`，也不是 ConfigEntry 的 `unique_id`。 |
+| `device_class` | 设备类别。基类中是 `str | None`，具体平台会收窄类型，例如 sensor 使用 `SensorDeviceClass`，binary_sensor 使用 `BinarySensorDeviceClass`。它影响前端图标、单位换算、状态/统计校验、自动化条件等。 |
+| `entity_category` | 实体类别，常见为 `diagnostic` 或 `config`。诊断类实体会在 UI 中弱化展示；部分平台禁止某些 category，例如 sensor/binary_sensor 不允许 `EntityCategory.CONFIG`。 |
+| `entity_registry_enabled_default` | 实体第一次进入 entity registry 时默认是否启用。适合把很少用或高频更新的实体默认禁用。用户之后在 UI 中的启用/禁用选择优先。 |
+| `entity_registry_visible_default` | 实体第一次进入 registry 时默认是否可见。用于控制默认 UI 可见性，不等同于 enabled。 |
+| `force_update` | 状态值即使没有变化也强制写入状态机。常规实体应保持 `False`；只有需要记录重复相同事件/采样的实体才考虑开启。 |
+| `icon` | 默认图标，如 `mdi:temperature-celsius`。如果同时使用 `device_class` 或 `icons.json`，前端可能根据平台规则选择更具体的图标。 |
+| `has_entity_name` | 是否启用 HA 新命名模型。设为 `True` 时，实体名只描述实体自身，设备名由 device registry 拼接；新集成通常应使用 `True`。 |
+| `name` | 静态实体名称。`UNDEFINED` 表示未显式设置，HA 可根据 `translation_key`、device class 等生成名称；`None` 表示实体本身无名，常用于主实体。 |
+| `translation_key` | 翻译 key，用来定位 `translations/en.json` / `strings.json` 中的实体名称、状态、属性、单位等文案。不是唯一 ID，也不参与状态计算。 |
+| `translation_placeholders` | 给实体名称翻译字符串中的 `{placeholder}` 填值。只用于文字格式化，不参与实体注册、唯一性或状态计算。 |
+| `unit_of_measurement` | 基类通用单位字段，适合部分非 sensor 平台；`SensorEntityDescription` 明确覆盖为 `None`，sensor 应使用 `native_unit_of_measurement` 和 `suggested_unit_of_measurement`。 |
+
+最常见用法如下：
+
+```python
+from homeassistant.components.sensor import (
+    SensorDeviceClass,
+    SensorEntity,
+    SensorEntityDescription,
+    SensorStateClass,
+)
+
 SENSOR_DESCRIPTION = SensorEntityDescription(
     key="temperature",
     translation_key="temperature",
@@ -1028,11 +1071,11 @@ SENSOR_DESCRIPTION = SensorEntityDescription(
     state_class=SensorStateClass.MEASUREMENT,
 )
 
-# 使用描述
+
 class MySensor(SensorEntity):
     _attr_has_entity_name = True
 
-    def __init__(self, description):
+    def __init__(self, description: SensorEntityDescription) -> None:
         self.entity_description = description
         self._attr_unique_id = f"{description.key}_sensor"
         self._native_value = None
@@ -1042,7 +1085,9 @@ class MySensor(SensorEntity):
         return self._native_value
 ```
 
-`EntityDescription` 的 `translation_key` 不是实体唯一 ID，也不是 entity_id 的来源；它是“去翻译文件里找哪一组文案”的 key。`Entity.translation_key` 会优先读取 `_attr_translation_key`，否则读取 `entity_description.translation_key`。HA 构造实体名称翻译 key 时，会拼成：
+#### translation_key 与 translation_placeholders
+
+`EntityDescription.translation_key` 是“去翻译文件里找哪一组文案”的 key。HA 构造实体名称翻译 key 时，会拼成：
 
 ```text
 component.<integration_domain>.entity.<platform_domain>.<translation_key>.name
@@ -1067,7 +1112,7 @@ component.<integration_domain>.entity.<platform_domain>.<translation_key>.name
 }
 ```
 
-`translation_placeholders` 是给翻译字符串里的 `{room}` 这类占位符填值的映射。源码中的 `_substitute_name_placeholders()` 会对实体名称执行 `name.format(**self.translation_placeholders)`；如果翻译字符串需要 `{room}`，但实体没有提供对应 key，开发版/非 stable 场景会更严格，stable 中也会记录 warning。它只用于翻译文本替换，不参与实体注册、状态计算或唯一性判断。
+`translation_placeholders` 是给 `{room}` 这类占位符填值的映射。源码中的 `_substitute_name_placeholders()` 会对实体名称执行 `name.format(**self.translation_placeholders)`；如果翻译字符串需要 `{room}`，但实体没有提供对应 key，开发版/非 stable 场景会更严格，stable 中也会记录 warning。
 
 常见写法有两种：
 
@@ -1086,30 +1131,422 @@ class MyBatterySensor(SensorEntity):
     _attr_translation_placeholders = {"device_name": "Door lock"}
 ```
 
-### 6.5 CoordinatorEntity — 协调器实体
+#### SensorEntityDescription 扩展字段
 
-用于配合 `DataUpdateCoordinator` 实现轮询式更新：
+`sensor` 平台在 `homeassistant/components/sensor/__init__.py` 中扩展了 `EntityDescription`：
 
 ```python
-from homeassistant.helpers.update_coordinator import CoordinatorEntity, DataUpdateCoordinator
+class SensorEntityDescription(EntityDescription, frozen_or_thawed=True):
+    """A class that describes sensor entities."""
 
-coordinator = DataUpdateCoordinator(
-    hass, LOGGER,
-    update_method=async_fetch_data,
-    update_interval=timedelta(seconds=30),
+    device_class: SensorDeviceClass | None = None
+    last_reset: datetime | None = None
+    native_unit_of_measurement: str | None = None
+    options: list[str] | None = None
+    state_class: SensorStateClass | None = None
+    suggested_display_precision: int | None = None
+    suggested_unit_of_measurement: str | None = None
+    unit_of_measurement: None = None  # Type override, use native_unit_of_measurement
+```
+
+| 字段 | 作用 |
+|----|----|
+| `device_class` | 传感器设备类别，如 `TEMPERATURE`、`HUMIDITY`、`POWER`、`ENERGY`、`TIMESTAMP`、`ENUM` 等。它决定单位换算、图标、状态合法性、长期统计规则等。 |
+| `native_unit_of_measurement` | 设备/API 原始返回值的单位，例如 `°C`、`W`、`kWh`、`%`。`SensorEntity.state` 会基于 device class 和用户单位系统做转换。 |
+| `state_class` | 状态类别，常见为 `MEASUREMENT`、`TOTAL`、`TOTAL_INCREASING`。它告诉 recorder/statistics 如何处理长期统计；错误组合会触发校验 warning。 |
+| `options` | 枚举传感器的可选状态列表。通常配合 `device_class=SensorDeviceClass.ENUM` 使用，HA 会把它作为 capability attribute 暴露。 |
+| `last_reset` | 总量型传感器的重置时间。源码只允许 `state_class == SensorStateClass.TOTAL` 时使用；其他 state class 设置 `last_reset` 会抛错。新集成通常更常使用 `TOTAL_INCREASING` 而不是手写 `last_reset`。 |
+| `suggested_display_precision` | 建议前端显示的小数位数。它影响显示精度，不应该用来改变底层 `native_value` 的实际精度。 |
+| `suggested_unit_of_measurement` | 建议显示单位，会在实体首次进入 registry 时写入 entity options。适合覆盖自动单位系统推荐值，例如希望温度默认显示为 °C。用户在 UI 中修改单位后，以用户选择为准。 |
+| `unit_of_measurement` | 在 sensor description 中被强制覆盖为 `None`；不要在 `SensorEntityDescription` 里写这个字段，应写 `native_unit_of_measurement`。 |
+
+典型传感器 description：
+
+```python
+SensorEntityDescription(
+    key="energy_today",
+    translation_key="energy_today",
+    device_class=SensorDeviceClass.ENERGY,
+    native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+    state_class=SensorStateClass.TOTAL_INCREASING,
+    suggested_display_precision=2,
+)
+```
+
+如果是枚举传感器：
+
+```python
+SensorEntityDescription(
+    key="mode",
+    translation_key="mode",
+    device_class=SensorDeviceClass.ENUM,
+    options=["auto", "heat", "cool"],
+)
+```
+
+对应翻译可写：
+
+```json
+{
+  "entity": {
+    "sensor": {
+      "mode": {
+        "name": "Mode",
+        "state": {
+          "auto": "Auto",
+          "heat": "Heat",
+          "cool": "Cool"
+        }
+      }
+    }
+  }
+}
+```
+
+#### BinarySensorEntityDescription 扩展字段
+
+`binary_sensor` 平台的 description 很简单，只收窄/扩展了 `device_class`：
+
+```python
+class BinarySensorEntityDescription(EntityDescription, frozen_or_thawed=True):
+    """A class that describes binary sensor entities."""
+
+    device_class: BinarySensorDeviceClass | None = None
+```
+
+`BinarySensorEntityDescription.device_class` 决定二元传感器的语义和前端展示，例如：
+
+- `MOTION`：运动传感器，`is_on=True` 表示检测到运动。
+- `DOOR` / `WINDOW` / `OPENING`：门窗/开口状态，`True` 通常表示打开。
+- `BATTERY`：电池低电量，`True` 通常表示低电量告警。
+- `CONNECTIVITY`：连接状态，`True` 表示已连接。
+- `PROBLEM`：问题/故障状态，`True` 表示存在问题。
+- `SAFETY`：安全状态，`True` 表示不安全或告警，具体语义按设备类翻译展示。
+
+典型写法：
+
+```python
+from homeassistant.components.binary_sensor import (
+    BinarySensorDeviceClass,
+    BinarySensorEntity,
+    BinarySensorEntityDescription,
 )
 
-class MyEntity(CoordinatorEntity, LightEntity):
-    def __init__(self, coordinator, light_data):
-        super().__init__(coordinator)
-        self.light_data = light_data
+BINARY_SENSORS = (
+    BinarySensorEntityDescription(
+        key="motion",
+        translation_key="motion",
+        device_class=BinarySensorDeviceClass.MOTION,
+    ),
+    BinarySensorEntityDescription(
+        key="low_battery",
+        translation_key="low_battery",
+        device_class=BinarySensorDeviceClass.BATTERY,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+)
+
+
+class MyBinarySensor(BinarySensorEntity):
+    _attr_has_entity_name = True
+
+    def __init__(self, description: BinarySensorEntityDescription) -> None:
+        self.entity_description = description
+        self._attr_unique_id = description.key
 
     @property
-    def brightness(self):
-        return self.coordinator.data[self.light_data.id]["brightness"]
-
-    # CoordinatorEntity 自动在 coordinator 刷新时调用 async_write_ha_state()
+    def is_on(self) -> bool | None:
+        return self._device_state.get(self.entity_description.key)
 ```
+
+#### 自定义 EntityDescription 子类
+
+很多内置集成会继续继承平台 description，加入“如何从数据对象取值”的函数或字段。例如 AirPatrol 增加 `data_field`，Sun 传感器增加 `value_fn`。这种模式可以让实体类完全通用：
+
+```python
+from collections.abc import Callable
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True, kw_only=True)
+class MySensorEntityDescription(SensorEntityDescription):
+    value_fn: Callable[[dict[str, Any]], StateType]
+
+
+SENSORS = (
+    MySensorEntityDescription(
+        key="temperature",
+        translation_key="temperature",
+        device_class=SensorDeviceClass.TEMPERATURE,
+        native_unit_of_measurement="°C",
+        state_class=SensorStateClass.MEASUREMENT,
+        value_fn=lambda data: data["temperature"],
+    ),
+)
+
+
+class MySensor(CoordinatorEntity, SensorEntity):
+    entity_description: MySensorEntityDescription
+
+    @property
+    def native_value(self):
+        return self.entity_description.value_fn(self.coordinator.data)
+```
+
+选择是否自定义 description 子类的原则：如果只是设置 HA 已有静态元数据，用 `SensorEntityDescription` / `BinarySensorEntityDescription` 即可；如果每个实体还需要携带“从 API 数据取哪个字段”“调用哪个方法”“是否支持该实体”等集成私有逻辑，就定义自己的 description 子类。
+
+### 6.5 CoordinatorEntity — 协调器实体
+
+`CoordinatorEntity` 是“实体订阅 coordinator 数据”的实体基类；真正负责拉取、缓存、调度、通知的是不同类型的 coordinator。HA 源码里常见三类：
+
+1. `DataUpdateCoordinator`：最常用，适合定时从一个 API / 设备 / 网关拉取一份共享数据。
+2. `TimestampDataUpdateCoordinator`：`DataUpdateCoordinator` 的子类，额外记录最后一次成功更新时间。
+3. `PassiveBluetoothDataUpdateCoordinator` / `ActiveBluetoothDataUpdateCoordinator`：蓝牙集成专用，基于 BLE 广播和可选主动轮询驱动更新。
+
+#### DataUpdateCoordinator — 共享轮询数据
+
+`DataUpdateCoordinator` 的定位是“一个数据源，多实体共享”。它管理：
+
+- `update_interval` 定时刷新。
+- `update_method` 或子类 `_async_update_data()` 拉取数据。
+- `data` 缓存最新结果。
+- `last_update_success` / `last_exception` 表示刷新状态。
+- `async_config_entry_first_refresh()` 在 setup 阶段做首次刷新；失败时会转成 `ConfigEntryNotReady` 等合适行为。
+- `async_request_refresh()` 手动请求刷新，内部有 debouncer，避免短时间重复刷新。
+- `async_set_updated_data(data)` 由外部推送手动更新缓存并通知实体。
+- `always_update=False` 时，只有新旧数据不相等才通知 listener；这要求数据对象有可靠的 `__eq__`。
+
+典型写法：
+
+```python
+from datetime import timedelta
+import logging
+
+from homeassistant.helpers.update_coordinator import (
+    CoordinatorEntity,
+    DataUpdateCoordinator,
+    UpdateFailed,
+)
+
+_LOGGER = logging.getLogger(__name__)
+
+
+async def async_setup_entry(hass, entry, async_add_entities):
+    api = entry.runtime_data.api
+
+    async def async_fetch_data():
+        try:
+            return await api.async_get_status()
+        except ApiError as err:
+            raise UpdateFailed(f"Error fetching data: {err}") from err
+
+    coordinator = DataUpdateCoordinator(
+        hass,
+        _LOGGER,
+        config_entry=entry,
+        name="my_integration status",
+        update_method=async_fetch_data,
+        update_interval=timedelta(seconds=30),
+        always_update=False,
+    )
+    await coordinator.async_config_entry_first_refresh()
+
+    async_add_entities(MyEntity(coordinator, key) for key in ("temperature", "humidity"))
+
+
+class MyEntity(CoordinatorEntity, SensorEntity):
+    _attr_has_entity_name = True
+
+    def __init__(self, coordinator, key):
+        super().__init__(coordinator)
+        self._attr_unique_id = key
+        self._key = key
+
+    @property
+    def native_value(self):
+        return self.coordinator.data[self._key]
+```
+
+`CoordinatorEntity` 自身做的事情很少但很关键：
+
+- `should_poll=False`：实体不再让 EntityPlatform 单独轮询。
+- `async_added_to_hass()`：注册 coordinator listener。
+- coordinator 刷新完成后调用实体 `_handle_coordinator_update()`。
+- 默认 `_handle_coordinator_update()` 只执行 `async_write_ha_state()`。
+- 默认 `available` 取 `coordinator.last_update_success`。
+- 用户手动调用 `homeassistant.update_entity` 时，`CoordinatorEntity.async_update()` 会调用 `coordinator.async_request_refresh()`。
+
+因此，多数实体只需要从 `self.coordinator.data` 读值，不要在 `native_value` / `is_on` property 里直接做 I/O。
+
+#### TimestampDataUpdateCoordinator — 记录最后成功刷新时间
+
+`TimestampDataUpdateCoordinator` 继承自 `DataUpdateCoordinator`，只额外做一件事：每次 refresh 结束后，如果 `last_update_success=True`，就把 `last_update_success_time` 设为当前 UTC 时间。源码里的 `_async_refresh_finished()` 逻辑非常简单：成功才更新时间戳，失败则保留上一次成功时间。
+
+它适合天气预报、系统监控、外部数据源等场景：实体除了显示数据本身，还可能需要知道“这份数据最后一次成功更新是什么时候”。例如 AccuWeather 的 forecast coordinator、NWS 的 forecast coordinator、System Monitor coordinator 都使用这种类型。
+
+可以直接实例化：
+
+```python
+from homeassistant.helpers.update_coordinator import TimestampDataUpdateCoordinator
+
+coordinator_forecast = TimestampDataUpdateCoordinator(
+    hass,
+    _LOGGER,
+    config_entry=entry,
+    name="my_integration forecast",
+    update_method=api.async_get_forecast,
+    update_interval=timedelta(minutes=30),
+)
+await coordinator_forecast.async_config_entry_first_refresh()
+```
+
+也可以继承后实现 `_async_update_data()`：
+
+```python
+class MyForecastCoordinator(TimestampDataUpdateCoordinator[list[dict[str, Any]]]):
+    def __init__(self, hass, entry, api):
+        self.api = api
+        super().__init__(
+            hass,
+            _LOGGER,
+            config_entry=entry,
+            name="my forecast",
+            update_interval=timedelta(minutes=30),
+        )
+
+    async def _async_update_data(self):
+        return await self.api.async_get_forecast()
+```
+
+实体仍然继承普通 `CoordinatorEntity`，只是在需要时读取：
+
+```python
+self.coordinator.last_update_success_time
+```
+
+如果不需要“最后成功更新时间”，普通 `DataUpdateCoordinator` 就足够。
+
+#### PassiveBluetoothDataUpdateCoordinator — 被动 BLE 广播更新
+
+BLE 设备不一定适合定时轮询。许多设备会周期性广播状态，HA 的蓝牙栈已经在后台接收 advertisement。`PassiveBluetoothDataUpdateCoordinator` 用于这种“只听广播”的模式：
+
+- 构造时绑定 `address`、扫描 `mode`、是否要求 `connectable`。
+- `async_start()` 内部注册蓝牙 callback，并注册 unavailable tracking。
+- 收到匹配 address 的 BLE 事件后，设置 `_available=True` 并通知 listener。
+- 设备消失时 `_async_handle_unavailable()` 设置 `_available=False` 并通知 listener。
+- `PassiveBluetoothCoordinatorEntity` 继承 `BaseCoordinatorEntity`，`async_update()` 是 no-op，因为所有更新都来自广播。
+- 实体 `available` 取 `coordinator.available`，而不是 `last_update_success`。
+
+一个被动 BLE coordinator 的骨架：
+
+```python
+from homeassistant.components.bluetooth import (
+    BluetoothChange,
+    BluetoothScanningMode,
+    BluetoothServiceInfoBleak,
+)
+from homeassistant.components.bluetooth.passive_update_coordinator import (
+    PassiveBluetoothCoordinatorEntity,
+    PassiveBluetoothDataUpdateCoordinator,
+)
+from homeassistant.core import callback
+
+
+class MyBleCoordinator(PassiveBluetoothDataUpdateCoordinator):
+    def __init__(self, hass, address):
+        super().__init__(
+            hass,
+            _LOGGER,
+            address=address,
+            mode=BluetoothScanningMode.PASSIVE,
+            connectable=False,
+        )
+        self.data = None
+
+    @callback
+    def _async_handle_bluetooth_event(
+        self,
+        service_info: BluetoothServiceInfoBleak,
+        change: BluetoothChange,
+    ) -> None:
+        self.data = parse_advertisement(service_info)
+        super()._async_handle_bluetooth_event(service_info, change)
+
+
+class MyBleSensor(PassiveBluetoothCoordinatorEntity[MyBleCoordinator], SensorEntity):
+    @property
+    def native_value(self):
+        return self.coordinator.data.temperature
+```
+
+使用时要在 config entry 生命周期里启动并登记停止回调：
+
+```python
+coordinator = MyBleCoordinator(hass, address)
+entry.async_on_unload(coordinator.async_start())
+entry.runtime_data = coordinator
+```
+
+这种模式适合温湿度计、门磁、按键等“广播里已经包含状态”的设备。
+
+#### ActiveBluetoothDataUpdateCoordinator — 广播触发 + 必要时连接轮询
+
+`ActiveBluetoothDataUpdateCoordinator` 继承 `PassiveBluetoothDataUpdateCoordinator`，适合“广播能提供部分状态，但某些状态需要连接设备读取”的 BLE 设备。SwitchBot、Casper Glow 等集成就是这种模式。
+
+它新增两个核心回调：
+
+- `needs_poll_method(service_info, seconds_since_last_poll)`：每次收到广播时判断是否需要主动 poll。
+- `poll_method(service_info)`：真正连接设备读取数据的 coroutine。
+
+源码会保存最近一次 `BluetoothServiceInfoBleak`，当 `needs_poll()` 返回 `True` 时通过 debouncer 调度 `_async_poll()`；poll 成功后更新 `data` 并通知 listener，失败时记录 `last_poll_successful=False`。
+
+典型写法：
+
+```python
+from homeassistant.components.bluetooth.active_update_coordinator import (
+    ActiveBluetoothDataUpdateCoordinator,
+)
+
+
+class MyActiveBleCoordinator(ActiveBluetoothDataUpdateCoordinator[MyData]):
+    def __init__(self, hass, device, address):
+        super().__init__(
+            hass=hass,
+            logger=_LOGGER,
+            address=address,
+            mode=BluetoothScanningMode.ACTIVE,
+            needs_poll_method=self._needs_poll,
+            poll_method=self._async_poll_device,
+            connectable=True,
+        )
+        self.device = device
+
+    @callback
+    def _needs_poll(self, service_info, seconds_since_last_poll):
+        return seconds_since_last_poll is None or seconds_since_last_poll > 60
+
+    async def _async_poll_device(self, service_info):
+        # service_info.device 里有 BLEDevice，优先用它建立连接
+        return await self.device.async_read_full_state(service_info.device)
+
+    @callback
+    def _async_handle_bluetooth_event(self, service_info, change):
+        if data := parse_advertisement(service_info):
+            self.data = data
+        super()._async_handle_bluetooth_event(service_info, change)
+```
+
+实体通常仍然继承 `PassiveBluetoothCoordinatorEntity`，因为可用性和 listener 模型仍来自蓝牙 coordinator。
+
+#### 选择哪种 Coordinator
+
+| 场景 | 推荐模式 |
+|----|----|
+| 多个实体共享同一个 HTTP/API/网关请求结果 | `DataUpdateCoordinator + CoordinatorEntity` |
+| 需要记录最后一次成功刷新时间 | `TimestampDataUpdateCoordinator + CoordinatorEntity` |
+| 数据来自 BLE advertisement，不需要主动连接设备 | `PassiveBluetoothDataUpdateCoordinator + PassiveBluetoothCoordinatorEntity` |
+| BLE advertisement 触发更新，但偶尔需要连接设备补全状态 | `ActiveBluetoothDataUpdateCoordinator + PassiveBluetoothCoordinatorEntity` |
+| 单个简单实体、数据源轻量、不需要共享刷新状态 | 直接继承实体类，实现 `async_update()` 或推送回调即可 |
 
 ## 7. 服务(Service)机制
 
@@ -2280,6 +2717,9 @@ class MyOptionsFlow(config_entries.OptionsFlowWithReload):
 ### 10.5 `sensor.py` — 向 sensor 域提供实体（CoordinatorEntity 模式）
 
 ```python
+from datetime import timedelta
+import logging
+
 from homeassistant.components.sensor import SensorEntity, SensorEntityDescription
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
@@ -2290,6 +2730,8 @@ from homeassistant.helpers.update_coordinator import (
 )
 
 from .const import DOMAIN
+
+_LOGGER = logging.getLogger(__name__)
 
 
 async def async_setup_entry(
@@ -2303,7 +2745,9 @@ async def async_setup_entry(
     # 创建协调器（轮询式）
     coordinator = DataUpdateCoordinator(
         hass,
-        __name__,
+        _LOGGER,
+        config_entry=config_entry,
+        name="my_integration sensors",
         update_method=runtime_data.async_fetch_data,
         update_interval=timedelta(seconds=30),
     )
