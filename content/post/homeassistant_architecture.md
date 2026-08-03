@@ -1301,7 +1301,9 @@ class MySensor(CoordinatorEntity, SensorEntity):
 
 1. `DataUpdateCoordinator`：最常用，适合定时从一个 API / 设备 / 网关拉取一份共享数据。
 2. `TimestampDataUpdateCoordinator`：`DataUpdateCoordinator` 的子类，额外记录最后一次成功更新时间。
-3. `PassiveBluetoothDataUpdateCoordinator` / `ActiveBluetoothDataUpdateCoordinator`：蓝牙集成专用，基于 BLE 广播和可选主动轮询驱动更新。
+3. `PassiveBluetoothDataUpdateCoordinator`：蓝牙广播 listener 模式，适合固定实体集合。
+4. `PassiveBluetoothProcessorCoordinator`：蓝牙广播 processor 模式，支持动态 description、动态实体、按实体分发和恢复。
+5. `ActiveBluetoothDataUpdateCoordinator`：被动接收广播，并在必要时主动连接设备轮询。
 
 #### DataUpdateCoordinator — 共享轮询数据
 
@@ -1487,7 +1489,171 @@ entry.async_on_unload(coordinator.async_start())
 entry.runtime_data = coordinator
 ```
 
-这种模式适合温湿度计、门磁、按键等“广播里已经包含状态”的设备。
+这种模式适合温湿度计、门磁、按键等“广播里已经包含状态”的设备。如果实体集合固定、每次广播只是更新同一份 coordinator data，使用它最直接。
+
+#### PassiveBluetoothProcessorCoordinator — 广播解析、动态描述与实体分发
+
+`PassiveBluetoothProcessorCoordinator` 同样用于纯 BLE advertisement 驱动，但它解决的问题比 `PassiveBluetoothDataUpdateCoordinator` 更高一层：不仅通知“数据更新了”，还把**广播解析、DeviceInfo、EntityDescription、实体值、动态实体创建、按实体差异通知和恢复数据**组织成一条标准管道。Aranet、BTHome、Govee BLE、Mopeka、Qingping、RuuviTag 等内置集成使用这种模式。
+
+它由四个主要部分组成：
+
+```text
+BluetoothServiceInfoBleak
+  │
+  ▼ coordinator.update_method
+解析后的第三方库数据 _DataT
+  │
+  ▼ PassiveBluetoothDataProcessor.update_method
+PassiveBluetoothDataUpdate
+  ├── devices             # device_id -> DeviceInfo
+  ├── entity_descriptions # PassiveBluetoothEntityKey -> EntityDescription
+  ├── entity_names        # PassiveBluetoothEntityKey -> 名称/None
+  └── entity_data         # PassiveBluetoothEntityKey -> 实体值
+  │
+  ├── 新 description → 动态创建实体
+  └── 值/描述变化 → 只通知对应实体 listener
+```
+
+| 类型 | 职责 |
+|----|----|
+| `PassiveBluetoothProcessorCoordinator[_DataT]` | 按 address 订阅 BLE 广播，调用第一层 `update_method(service_info)` 把原始广播转换成第三方库对象或其他中间数据，然后分发给所有 processor；同时跟踪设备可用性、解析是否成功和恢复数据。 |
+| `PassiveBluetoothDataProcessor[_T, _DataT]` | 针对一个 HA 平台（如 sensor、binary_sensor）把中间数据转换成 `PassiveBluetoothDataUpdate[_T]`，累积设备、实体描述和实体值，并管理 listener。一个 coordinator 可以注册多个 processor。 |
+| `PassiveBluetoothDataUpdate[_T]` | 一次广播产生的增量更新容器。广播长度有限，所以每次只需包含本次实际更新的 device/entity；processor 会把多次广播结果累积起来。 |
+| `PassiveBluetoothEntityKey` | 实体键，由 `key` 和可选 `device_id` 组成。同一广播源可代表多个子设备时，`device_id` 用于区分；`key` 通常对应 description key。 |
+| `PassiveBluetoothProcessorEntity` | 与 processor 配套的实体基类，绑定一个 `entity_key`，从 processor 读取 description、DeviceInfo 和数据，并只订阅该实体 key 的变化。 |
+
+与简单的 `PassiveBluetoothDataUpdateCoordinator` 相比，关键差异是：
+
+- `PassiveBluetoothDataUpdateCoordinator` 只有 coordinator listener；实体通常是集成代码预先创建的固定集合，并自行读取 `coordinator.data`。
+- `PassiveBluetoothProcessorCoordinator` 允许 parser 在运行时返回 `EntityDescription`。processor 看到新的 description 后，可以通过 `async_add_entities_listener()` 动态创建新实体。
+- processor 按 `PassiveBluetoothEntityKey` 追踪变化，可以只通知真正变化的实体，而不是每次广播刷新全部实体。
+- processor 数据会周期性保存，并在 reload/restart 后恢复 description、name、data 和 DeviceInfo，避免等待下一次广播才恢复已有实体结构。
+
+典型用法分为集成入口和平台文件两部分。
+
+**1. 在 `__init__.py` 创建并启动 coordinator**
+
+```python
+from homeassistant.components.bluetooth import BluetoothScanningMode
+from homeassistant.components.bluetooth.models import BluetoothServiceInfoBleak
+from homeassistant.components.bluetooth.passive_update_processor import (
+    PassiveBluetoothProcessorCoordinator,
+)
+
+
+def parse_service_info(service_info: BluetoothServiceInfoBleak) -> AdvertisementData:
+    return AdvertisementData(service_info.device, service_info.advertisement)
+
+
+async def async_setup_entry(hass, entry) -> bool:
+    address = entry.unique_id
+    assert address is not None
+
+    coordinator = PassiveBluetoothProcessorCoordinator(
+        hass,
+        _LOGGER,
+        address=address,
+        mode=BluetoothScanningMode.PASSIVE,
+        update_method=parse_service_info,
+        connectable=False,
+    )
+    entry.runtime_data = coordinator
+
+    # 先 setup 平台，让 processor 有机会订阅；再启动接收广播。
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    entry.async_on_unload(coordinator.async_start())
+    return True
+```
+
+这里的 `update_method` 是同步 callback：每次匹配广播到来时，它接收 `BluetoothServiceInfoBleak` 并返回解析后的 `_DataT`。如果解析抛出异常，coordinator 会设置 `last_update_success=False`；下一次成功解析后恢复。
+
+**2. 在 `sensor.py` 把解析结果转成 HA 实体更新**
+
+```python
+from homeassistant.components.bluetooth.passive_update_processor import (
+    PassiveBluetoothDataProcessor,
+    PassiveBluetoothDataUpdate,
+    PassiveBluetoothEntityKey,
+    PassiveBluetoothProcessorEntity,
+)
+
+SENSOR_DESCRIPTIONS = {
+    "temperature": SensorEntityDescription(
+        key="temperature",
+        translation_key="temperature",
+        device_class=SensorDeviceClass.TEMPERATURE,
+        native_unit_of_measurement=UnitOfTemperature.CELSIUS,
+        state_class=SensorStateClass.MEASUREMENT,
+    ),
+    "humidity": SensorEntityDescription(
+        key="humidity",
+        translation_key="humidity",
+        device_class=SensorDeviceClass.HUMIDITY,
+        native_unit_of_measurement=PERCENTAGE,
+        state_class=SensorStateClass.MEASUREMENT,
+    ),
+}
+
+
+def sensor_update(advertisement: AdvertisementData) -> PassiveBluetoothDataUpdate:
+    address = advertisement.device.address
+    temperature_key = PassiveBluetoothEntityKey("temperature", address)
+    humidity_key = PassiveBluetoothEntityKey("humidity", address)
+
+    return PassiveBluetoothDataUpdate(
+        devices={
+            address: DeviceInfo(
+                connections={(CONNECTION_BLUETOOTH, address)},
+                name=advertisement.name,
+            )
+        },
+        entity_descriptions={
+            temperature_key: SENSOR_DESCRIPTIONS["temperature"],
+            humidity_key: SENSOR_DESCRIPTIONS["humidity"],
+        },
+        entity_names={temperature_key: None, humidity_key: None},
+        entity_data={
+            temperature_key: advertisement.temperature,
+            humidity_key: advertisement.humidity,
+        },
+    )
+
+
+async def async_setup_entry(hass, entry, async_add_entities) -> None:
+    processor = PassiveBluetoothDataProcessor(sensor_update)
+
+    entry.async_on_unload(
+        processor.async_add_entities_listener(MyBluetoothSensor, async_add_entities)
+    )
+    entry.async_on_unload(
+        entry.runtime_data.async_register_processor(
+            processor,
+            SensorEntityDescription,
+        )
+    )
+
+
+class MyBluetoothSensor(
+    PassiveBluetoothProcessorEntity[PassiveBluetoothDataProcessor],
+    SensorEntity,
+):
+    @property
+    def native_value(self):
+        return self.processor.entity_data.get(self.entity_key)
+```
+
+注册顺序应保持和内置集成一致：先给 processor 注册 `async_add_entities_listener()`，再用 coordinator 的 `async_register_processor()` 注册 processor；两个取消函数都交给 `entry.async_on_unload()`。传给 `async_register_processor()` 的 description class 用于恢复持久化后的 description，应该传实际平台 description 类型；自定义 description 子类则传该自定义类。
+
+`PassiveBluetoothDataUpdate` 是**增量**而不是必须包含全量快照。例如某个广播包只包含温度，就只返回温度对应的 description/name/data；此前从其他广播累积的湿度数据仍会保留。源码会比较新旧 `devices`、`entity_descriptions`、`entity_names`、`entity_data`：
+
+- DeviceInfo 改变时更新所有相关实体。
+- 只有某些 `PassiveBluetoothEntityKey` 改变时，只通知这些 key 的 listener。
+- 新出现的 entity description 会触发实体创建；已经创建的 key 不会重复创建。
+- 设备 unavailable 时，processor 通知实体更新可用性。
+
+此外，`coordinator.async_set_updated_data(update)` 可把 BLE notification 等其他路径得到的 `_DataT` 手动送入同一 processor 管道。注意这里传入的是 coordinator 第一层 `_DataT`，不是 `PassiveBluetoothDataUpdate`；后者由各 processor 的 `update_method` 生成。
+
+选择这一模式的典型条件是：一个 BLE 广播源可能产生多个平台/多个子设备/动态测量项，第三方 parser 已经能给出结构化更新，或者希望复用 HA 对动态实体和恢复数据的通用处理。若实体种类固定且只有少量字段，简单的 `PassiveBluetoothDataUpdateCoordinator` 更容易理解，不必为了抽象而使用 processor 管道。
 
 #### ActiveBluetoothDataUpdateCoordinator — 广播触发 + 必要时连接轮询
 
@@ -1544,7 +1710,8 @@ class MyActiveBleCoordinator(ActiveBluetoothDataUpdateCoordinator[MyData]):
 |----|----|
 | 多个实体共享同一个 HTTP/API/网关请求结果 | `DataUpdateCoordinator + CoordinatorEntity` |
 | 需要记录最后一次成功刷新时间 | `TimestampDataUpdateCoordinator + CoordinatorEntity` |
-| 数据来自 BLE advertisement，不需要主动连接设备 | `PassiveBluetoothDataUpdateCoordinator + PassiveBluetoothCoordinatorEntity` |
+| 数据来自 BLE advertisement，实体集合固定，只需统一通知更新 | `PassiveBluetoothDataUpdateCoordinator + PassiveBluetoothCoordinatorEntity` |
+| BLE 广播要生成多个平台/子设备/动态实体，需按实体分发和恢复 | `PassiveBluetoothProcessorCoordinator + PassiveBluetoothDataProcessor + PassiveBluetoothProcessorEntity` |
 | BLE advertisement 触发更新，但偶尔需要连接设备补全状态 | `ActiveBluetoothDataUpdateCoordinator + PassiveBluetoothCoordinatorEntity` |
 | 单个简单实体、数据源轻量、不需要共享刷新状态 | 直接继承实体类，实现 `async_update()` 或推送回调即可 |
 
