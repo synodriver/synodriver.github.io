@@ -2110,13 +2110,111 @@ custom_components/my_integration/
 | `ssdp` | SSDP/UPnP 发现 matcher。通常按响应头字段匹配；匹配后进入 `async_step_ssdp`。 |
 | `dhcp` | DHCP 发现 matcher，可按 `macaddress`、`hostname`、`registered_devices` 等匹配；匹配后进入 `async_step_dhcp`。 |
 | `usb` | USB 发现 matcher，可按 `vid`、`pid`、`serial_number`、`manufacturer`、`description` 等匹配；匹配后进入 `async_step_usb`。 |
-| `bluetooth` | BLE 广播 matcher，可按 `service_uuid`、`service_data_uuid`、`local_name`、`manufacturer_id`、`manufacturer_data_start`、`connectable` 等匹配；匹配后进入 `async_step_bluetooth`。 |
+| `bluetooth` | BLE 广播 matcher 列表。**列表中每个对象之间是 OR（或）关系；同一个对象里填写的字段之间是 AND（与）关系。** 任意一个对象完整匹配即可让该集成成为候选，并触发 Bluetooth discovery flow；随后才可能进入 `async_step_bluetooth`。 |
 | `homekit` | HomeKit 发现声明，例如 `models`；用于 HomeKit 控制器发现路径。 |
 | `mqtt` | MQTT discovery 相关声明；用于让 MQTT 集成知道哪些 discovery payload 可归属到该集成。 |
 | `quality_scale` | 内置集成的质量等级标记；自定义集成在 loader 属性中会归类为 `custom`。 |
 | `preview_features` | 预览功能元数据，可为每个 feature 提供反馈、了解更多、报错链接；需要配合翻译资源展示名称和说明。 |
 | `disabled` | 禁用原因。一般由 core/维护流程使用，自定义集成通常不主动写。 |
 | `is_built_in` / `overwrites_built_in` | loader 运行时附加的内部元数据，不是自定义集成作者应该手写的 manifest 字段。 |
+
+#### bluetooth matcher：列表是 OR，对象内字段是 AND
+
+`manifest.json` 的 `bluetooth` 是 matcher 对象列表。逻辑可以理解为：
+
+```text
+matcher_1 完整匹配
+OR matcher_2 完整匹配
+OR matcher_3 完整匹配
+...
+```
+
+而每一个 matcher 对象内部是：
+
+```text
+connectable 条件
+AND service_uuid 条件
+AND service_data_uuid 条件
+AND manufacturer_id 条件
+AND manufacturer_data_start 条件
+AND local_name 条件
+```
+
+只计算对象中实际出现的字段；未填写的字段不参与限制。源码中的 `BluetoothMatcherIndex.match()` 会收集可能匹配的 matcher，然后逐个调用 `ble_device_matches()`。后者依次检查对象内的每个字段，只要任一已声明条件不满足就立即返回 `False`；最终通过的任意 matcher 都会把所属 integration domain 加入 `matched_domains` 集合。因此结论是：**外层列表 OR，单个对象内部 AND。**
+
+例如：
+
+```json
+{
+  "bluetooth": [
+    {
+      "connectable": false,
+      "manufacturer_id": 89,
+      "manufacturer_data_start": [3],
+      "service_uuid": "0000fee5-0000-1000-8000-00805f9b34fb"
+    },
+    {
+      "connectable": false,
+      "local_name": "MySensor-*"
+    }
+  ]
+}
+```
+
+它表示：
+
+```text
+(
+  manufacturer_data 包含 company ID 89
+  AND company ID 89 对应的数据以字节 0x03 开头
+  AND service UUID 列表包含 0000fee5-...
+  AND 不要求广播必须来自可连接设备
+)
+OR
+(
+  local name 匹配 MySensor-*
+  AND 不要求广播必须来自可连接设备
+)
+```
+
+各字段的匹配规则：
+
+| matcher 字段 | 源码匹配方式 |
+|----|----|
+| `service_uuid` | 指定 UUID 必须存在于 `service_info.service_uuids`。UUID 应使用规范化的小写完整形式。 |
+| `service_data_uuid` | 指定 UUID 必须是 `service_info.service_data` 的一个 key，即广播中包含该 Service Data。 |
+| `manufacturer_id` | 指定 Company Identifier 必须是 `service_info.manufacturer_data` 的一个 key。 |
+| `manufacturer_data_start` | 只有配合 `manufacturer_id` 才有意义；对应 manufacturer data 必须以这些十进制字节开头。源码使用 `bytes(list)` 和 `startswith()` 比较。 |
+| `local_name` | 对 `service_info.name` 做 fnmatch 匹配，可使用 `*` 等模式，例如 `MySensor-*`。为避免过宽匹配，源码限制名称模式开头的若干字符不能出现通配符。 |
+| `connectable` | 默认值相当于 `true`：要求 `service_info.connectable=True`。写成 `false` 的含义是**取消“必须可连接”的限制**，因此既可以匹配不可连接广播，也可以匹配可连接广播；它不是“只匹配不可连接设备”。 |
+
+几个常见写法：
+
+```json
+{
+  "bluetooth": [
+    {"service_uuid": "0000abcd-0000-1000-8000-00805f9b34fb"},
+    {"manufacturer_id": 1234}
+  ]
+}
+```
+
+这里是“有该 Service UUID **或**有 manufacturer ID 1234”。如果本意是两个条件必须同时满足，应该写在同一个对象：
+
+```json
+{
+  "bluetooth": [
+    {
+      "service_uuid": "0000abcd-0000-1000-8000-00805f9b34fb",
+      "manufacturer_id": 1234
+    }
+  ]
+}
+```
+
+如果同一厂商 ID 下有多个协议版本/型号前缀，则写多个 matcher，表示多个完整条件分支，例如 HA 的 Mopeka 集成对 `[3]`、`[4]`、`[5]` 等不同 manufacturer data 起始字节分别写一个对象。不要为了“多写几个线索”把互斥型号条件塞进同一个对象，否则对象内 AND 会导致永远无法匹配。
+
+另外，matcher 成功只表示该广播归属于该 integration domain。Bluetooth manager 随后调用 discovery flow，并且还会经过已见地址、进行中 flow、已有 config entry 等去重机制；因此不能把“一个 matcher 成功”理解为每个广播包都会新建 `ConfigFlow` 或反复调用 `async_step_bluetooth`。
 
 #### 翻译字符串：strings.json 与 translations/en.json
 
