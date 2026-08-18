@@ -8,12 +8,13 @@ author: 'synodriver'
 
 # Home Assistant 核心架构与实现深度解析
 
-> 基于源码版本 2026.7.0.dev0，Python 3.14.2+
+> 基于源码版本 2026.9.0.dev0（提交 `478b722e25d`），Python 3.14.5+
 
 ## 目录
 
 - [1. 项目总体结构](#1-项目总体结构)
 - [2. 核心类与基类体系](#2-核心类与基类体系)
+  - [2.9 ConfigSubentry 与 2026.9 设备归属模型](#29-configsubentry-与-20269-设备归属模型)
 - [3. 启动流程详解](#3-启动流程详解)
 - [4. 集成加载机制](#4-集成加载机制)
 - [5. 配置流(ConfigFlow)机制](#5-配置流configflow机制)
@@ -41,7 +42,14 @@ author: 'synodriver'
   - [11.2 蓝图 YAML 格式与自定义蓝图](#112-蓝图-yaml-格式与自定义蓝图)
   - [11.3 蓝图源码解析：导入、校验与替换](#113-蓝图源码解析导入校验与替换)
   - [11.4 蓝图与自动化/脚本的集成](#114-蓝图与自动化脚本的集成)
-- [12. 关键设计模式总结](#12-关键设计模式总结)
+- [12. MQTT 集成：异步客户端与自动发现](#12-mqtt-集成异步客户端与自动发现)
+  - [12.1 MQTT 集成的分层与启动顺序](#121-mqtt-集成的分层与启动顺序)
+  - [12.2 把同步 Paho 客户端接入 asyncio](#122-把同步-paho-客户端接入-asyncio)
+  - [12.3 将 publish/subscribe 的 MID 回调变成 await](#123-将-publishsubscribe-的-mid-回调变成-await)
+  - [12.4 MQTT 实体自动发现](#124-mqtt-实体自动发现)
+  - [12.5 manifest 的 MQTT 配置流发现](#125-manifest-的-mqtt-配置流发现)
+  - [12.6 设备侧 discovery 示例与工程约束](#126-设备侧-discovery-示例与工程约束)
+- [13. 关键设计模式总结](#13-关键设计模式总结)
 
 ---
 
@@ -100,7 +108,7 @@ components/<domain>/
   "config_flow": true,
   "dependencies": [],
   "after_dependencies": [],
-  "requirements": ["aiohue==4.8.1"],
+  "requirements": ["aiohue==4.9.0"],
   "iot_class": "local_push",
   "zeroconf": ["_hue._tcp.local."],
   "codeowners": ["@marcelveldt"]
@@ -111,7 +119,7 @@ components/<domain>/
 |------|------|
 | `domain` | 集成域名，必须等于目录名 |
 | `name` | 人类可读名称 |
-| `integration_type` | `entity`(平台型)、`hub`(集线器型)、`system`(系统型)、`virtual`(虚拟型)、`helper`(辅助型)、`device`(设备型) |
+| `integration_type` | `entity`(平台型)、`device`(设备型)、`hardware`(硬件基础设施)、`helper`(辅助型)、`hub`(集线器型)、`service`(服务型)、`system`(系统型)、`virtual`(虚拟型) |
 | `config_flow` | 是否支持 UI 配置流 |
 | `dependencies` | 前置依赖集成（必须先加载） |
 | `after_dependencies` | 后置依赖（仅影响加载顺序，不强制加载） |
@@ -138,6 +146,7 @@ class HomeAssistant:
         self.services = ServiceRegistry(self)     # 服务注册表
         self.states = StateMachine(self.bus, self.loop)  # 状态机
         self.config = Config(self, config_dir)     # 配置
+        self.config.async_initialize()             # 初始化配置对象的事件循环侧状态
         self.config_entries: ConfigEntries         # 配置条目管理器
         self.auth: AuthManager                     # 认证管理器
         self.state: CoreState = CoreState.not_running
@@ -152,8 +161,23 @@ class HomeAssistant:
 |------|------|
 | `async_run()` | 主入口，设置信号处理，等待停止 |
 | `async_start()` | 发射 `EVENT_HOMEASSISTANT_START` → `CoreState.running` → 发射 `EVENT_HOMEASSISTANT_STARTED` |
-| `async_create_task()` | 创建异步任务 |
-| `async_add_job()` / `async_add_executor_job()` | 添加任务到事件循环或线程池 |
+| `async_create_task()` / `async_create_background_task()` | Core 创建普通任务/长生命周期后台任务；集成优先使用 `ConfigEntry` 上的同名方法绑定卸载生命周期 |
+| `async_add_executor_job()` | 把阻塞函数提交到默认线程池；不要在事件循环中直接执行文件、网络等阻塞 I/O |
+
+`hass.async_add_job()` 和 `hass.async_add_hass_job()` 已经过弃用周期，不应再作为新集成的调度入口。Config Entry 驱动的集成应优先使用：
+
+```python
+# 普通任务会参与 setup/unload 生命周期管理
+entry.async_create_task(hass, do_one_shot_work(), name="refresh device")
+
+# 常驻任务在 entry unload 时自动取消，也不会阻塞 HA 完成启动
+entry.async_create_background_task(
+    hass, run_push_listener(), name="device push listener"
+)
+
+# 真正阻塞的同步调用才进入 executor
+result = await hass.async_add_executor_job(sync_library.read, address)
+```
 
 **CoreState 生命周期**:
 
@@ -369,15 +393,58 @@ class Integration:
     @classmethod
     def resolve_from_root(cls, hass, root_module, domain) -> Integration | None
 
-    async def async_get_component(self) -> ModuleType     # 获取 __init__.py 模块
+    async def async_get_component(self) -> ComponentProtocol  # 获取 __init__.py 模块
     async def async_get_platform(self, platform) -> ModuleType  # 获取平台模块
-    async def resolve_dependencies(self) -> bool | None
+    async def async_get_platforms(self, platforms) -> dict[str, ModuleType]
+    async def resolve_dependencies(self) -> set[str] | None
 ```
 
 关键数据键：
 - `DATA_COMPONENTS` — 已加载的组件模块缓存
 - `DATA_INTEGRATIONS` — 已解析的 Integration 对象缓存
 - `DATA_CUSTOM_COMPONENTS` — 自定义集成缓存
+
+### 2.9 ConfigSubentry 与 2026.9 设备归属模型
+
+`ConfigSubentry` 用于在一个 `ConfigEntry` 下表示多个同类逻辑单元，例如一个账号下的多个站点，或 MQTT 配置条目下由 UI 管理的多个设备。它不是独立的 `ConfigEntry`，共享父条目的连接与生命周期：
+
+```python
+@dataclass(frozen=True, kw_only=True)
+class ConfigSubentry:
+    data: MappingProxyType[str, Any]
+    subentry_id: str        # Core 分配的 ULID
+    subentry_type: str
+    title: str
+    unique_id: str | None
+```
+
+平台添加实体时可传入 `config_subentry_id`，Core 会校验该 subentry 确实属于当前 entry，并把实体和设备注册到对应 subentry：
+
+```python
+async_add_entities(entities, config_subentry_id=subentry.subentry_id)
+```
+
+2026.8 之后 Device Registry 的关键约束发生了变化：一个设备只归属一个 `config_entry_id` 和一个可选的 `config_subentry_id`。旧的 `device.config_entries`、`config_entries_subentries` 和 `primary_config_entry` 只是兼容属性；新代码应读取单数属性。设备查找也应限定 entry，例如：
+
+```python
+device = device_registry.async_get_device_by_identifier(
+    (DOMAIN, serial_number), config_entry.entry_id
+)
+```
+
+2026.9 又新增了真正的轻量级 child device。它与 `DeviceInfo.via_device_id` 表达的“经由某个网关通信的完整设备”不同：child device 是父设备内部的逻辑组成部分，只拥有少量元数据，不能继续充当其他 child 的父级。实体返回 `ChildDeviceInfo` 后，`EntityPlatform` 会调用 `async_get_or_create_child()`：
+
+```python
+from homeassistant.helpers.device_registry import ChildDeviceInfo
+
+self._attr_device_info = ChildDeviceInfo(
+    identifiers={(DOMAIN, channel_id)},
+    name="Channel 1",
+    parent_device_id=parent_device_entry.id,
+)
+```
+
+父设备必须先注册，并且 child 与父设备必须属于同一个 config entry 和同一个 config subentry。`parent_device_id` 是 Device Registry 的内部设备 ID，不是 `(domain, identifier)`；需要先通过限定 config entry 的查找 API 解析出来。
 
 ---
 
@@ -424,8 +491,11 @@ __main__.py::main()
               └── hass.async_run()
                     ├── hass.async_start()
                     │     ├── CoreState → STARTING
+                    │     ├── fire EVENT_CORE_CONFIG_UPDATE
                     │     ├── fire EVENT_HOMEASSISTANT_START
+                    │     ├── wait startup tasks and startup jobs (with timeout)
                     │     ├── CoreState → RUNNING
+                    │     ├── fire EVENT_CORE_CONFIG_UPDATE
                     │     └── fire EVENT_HOMEASSISTANT_STARTED
                     └── await _stopped.wait()
 ```
@@ -449,6 +519,8 @@ __main__.py::main()
 - mqtt_eventstream, cloud, hassio
 
 **Stage 2 — 所有其余集成**（超时 300s）
+
+`async_start()` 不是简单地“发 START 事件后立即把状态改成 RUNNING”：它先等待 START 事件触发的 core tasks，再执行通过 `async_at_started()` 等 API 登记的 startup jobs；只有这些阶段在超时窗口内完成后，才把 `CoreState` 设为 `running` 并发出 `EVENT_HOMEASSISTANT_STARTED`。停止时还会依次发出 `EVENT_HOMEASSISTANT_STOP`、`EVENT_HOMEASSISTANT_FINAL_WRITE` 和 `EVENT_HOMEASSISTANT_CLOSE`，最后才进入 `CoreState.stopped`。
 
 ### 3.3 async_load_base_functionality — 注册表并行加载
 
@@ -922,6 +994,8 @@ entity.async_update_ha_state(force_refresh=False)
 # 从设备拉取最新数据
 entity.async_device_update()
 ```
+
+`async_update_ha_state()` 仍为兼容入口，但当前 Core 会在实体首次调用时记录弃用/误用警告；推送型实体更新 `_attr_*` 后应直接调用 `async_write_ha_state()`，只有确实需要在写状态前执行设备刷新时才使用 `async_update_ha_state(force_refresh=True)`。
 
 `async_write_ha_state()` 的内部流程：
 1. 收集实体的 state、capability_attributes、state_attributes
@@ -2268,7 +2342,7 @@ custom_components/my_integration/
 | `iot_class` | IoT 通信模式，例如 `local_push`、`local_polling`、`cloud_push`、`cloud_polling`、`assumed_state`、`calculated`。用于告诉用户集成依赖本地网络、云端还是计算值。 |
 | `config_flow` | 是否支持 UI 配置流。为 `true` 时，集成目录必须提供 `config_flow.py`，HA 才会把它列入可通过 UI 添加的集成。 |
 | `single_config_entry` | 是否只允许创建一个配置条目。适合全局服务或系统级集成；多设备/多账号集成通常不要开启。 |
-| `requirements` | Python 依赖包列表，HA 会按需安装/加载，例如 `aiohue==4.8.1`。运行时不要在代码里手动 `pip install`。 |
+| `requirements` | Python 依赖包列表，HA 会按需安装/加载，例如 `aiohue==4.9.0`。运行时不要在代码里手动 `pip install`。 |
 | `dependencies` | 强依赖集成。HA 会先加载这些集成；依赖失败通常会阻止当前集成正常 setup。 |
 | `after_dependencies` | 弱依赖/加载顺序提示。存在时尽量在这些集成之后加载，但不会强制安装或强制启用。 |
 | `loggers` | 集成相关第三方库 logger 名称；用于日志级别管理和诊断。 |
@@ -4382,9 +4456,325 @@ config = blueprint_inputs.async_substitute()  # 生成完整配置
 
 ---
 
-## 12. 关键设计模式总结
+## 12. MQTT 集成：异步客户端与自动发现
 
-### 12.1 架构模式
+**核心源码**：
+
+- `homeassistant/components/mqtt/__init__.py`：Config Entry 初始化、协议迁移、平台预加载
+- `homeassistant/components/mqtt/async_client.py`：Paho Client 子类与无锁适配
+- `homeassistant/components/mqtt/client.py`：asyncio socket 驱动、订阅路由、ACK Future、重连
+- `homeassistant/components/mqtt/discovery.py`：实体 discovery 与集成 config flow discovery
+- `homeassistant/components/mqtt/entity.py`：discovery signal 到 MQTT Entity 的桥梁
+
+当前 MQTT 集成使用 `paho-mqtt==2.1.0` 和 Callback API v2，新建连接默认 MQTT 5。旧条目启动时会尝试迁移到 MQTT 5；如果 broker 不支持，当前版本仍保留旧协议并创建 repair issue，这段兼容逻辑计划在 2027.1 移除。
+
+MQTT 的 manifest 还声明了 `single_config_entry: true`：broker 连接全局只有一个 Config Entry，设备级配置可以作为该 entry 的 ConfigSubentry 管理。不要为每个 MQTT 设备再创建一个 broker Config Entry；实体 discovery 和 subentry 导入都会复用同一个客户端。
+
+### 12.1 MQTT 集成的分层与启动顺序
+
+源码里有三个名字相近、职责不同的对象：
+
+| 层 | 对象 | 职责 |
+|----|------|------|
+| Paho 层 | `AsyncMQTTClient(Client)` | 仍是 Paho Client，只是在单事件循环模型下替换内部线程锁，并声明 Callback API v2 类型 |
+| 构造层 | `MqttClientSetup` | 选择协议/transport，配置认证、TLS、WebSocket、will；因证书和文件访问而在线程池运行 |
+| HA 适配层 | `MQTT` | 将 socket 注册给 asyncio，管理连接/重连、订阅、消息分发以及 publish/subscribe ACK |
+
+`async_setup_entry()` 的关键顺序是：
+
+```
+读取 entry.data | entry.options
+  ↓
+MqttClientSetup.setup() 在线程池构造 Paho Client
+  ↓
+预加载配置中已经用到的 MQTT entity platforms
+  ↓
+MQTT.async_connect() 在线程池执行阻塞 connect
+  ↓
+转发已有平台的 config entry setup
+  ↓
+discovery.async_start() 注册 discovery wildcard subscriptions
+  ↓
+收到 retained discovery 消息后，按需加载尚未加载的平台
+```
+
+预加载发生在连接 broker 之前，是为了避免连接瞬间涌入大量 retained discovery 消息时，每条消息都等待平台 import，造成任务洪峰。
+
+### 12.2 把同步 Paho 客户端接入 asyncio
+
+这里最重要的事实是：`AsyncMQTTClient` 这个类名并不表示 Paho API 自动变成了 coroutine。真正的异步化由 Paho 的 external event loop hooks 和 `MQTT` 包装器共同完成。正式 MQTT Config Entry 运行期没有调用 `loop_start()` 创建 Paho 网络线程；只有配置流里的临时 `try_connection()` 使用 Paho 的线程循环做连通性测试。
+
+Paho 把网络循环拆成三部分：
+
+- `loop_read()`：socket 可读时解析入站报文并触发 `on_message`、`on_connect` 等回调。
+- `loop_write()`：socket 可写时刷新 Paho 的发送缓冲区。
+- `loop_misc()`：周期处理 keepalive、PING 和超时，不能因为没有网络流量就省略。
+
+HA 通过 socket hooks 把它们挂到 asyncio：
+
+```python
+def _async_on_socket_open(self, client, userdata, sock):
+    self.loop.add_reader(sock, self._async_reader_callback, client)
+    self._start_misc_timer()
+    self._async_reader_callback(client)  # 立即消费已有数据
+
+def _async_reader_callback(self, client):
+    status = client.loop_read(MAX_PACKETS_TO_READ)
+    if status != mqtt.MQTT_ERR_SUCCESS:
+        self._handle_error(status)
+
+def _async_on_socket_register_write(self, client, userdata, sock):
+    self.loop.add_writer(sock, self._async_writer_callback, client)
+
+def _async_writer_callback(self, client):
+    status = client.loop_write()
+    if status != mqtt.MQTT_ERR_SUCCESS:
+        self._handle_error(status)
+
+def _async_on_socket_unregister_write(self, client, userdata, sock):
+    self.loop.remove_writer(sock)
+
+def _async_on_socket_close(self, client, userdata, sock):
+    self.loop.remove_reader(sock)
+    self._misc_timer.cancel()
+```
+
+`loop_misc()` 则由 `loop.call_at(loop.time() + 1, callback)` 每秒调度一次。使用 `call_at` 而不是一个永久 `while asyncio.sleep(1)` 任务，可以直接用 `TimerHandle.cancel()` 清理，并避免为简单定时工作常驻一个 Task。
+
+连接是一个容易遗漏的线程边界。`Client.connect()` 会执行 DNS、TCP/TLS 握手等阻塞操作，所以 HA 使用：
+
+```python
+connect = partial(client.connect, host=host, port=port, keepalive=keepalive)
+async with connection_lock:
+    result = await hass.async_add_executor_job(connect)
+```
+
+但 `connect()` 在线程池里可能同步触发 `on_socket_open` 和 `on_socket_register_write`。线程池线程不能直接调用 `loop.add_reader()`，因此 HA 在连接期间临时安装线程安全桥接回调：
+
+```python
+def _on_socket_open(self, client, userdata, sock):
+    self.loop.call_soon_threadsafe(
+        self._async_on_socket_open, client, userdata, sock
+    )
+```
+
+连接 executor job 结束后，再把 hook 切回直接运行的 `_async_on_socket_open` / `_async_on_socket_register_write`，减少每次写事件多一次跨线程投递。重连也受同一个 `asyncio.Lock` 保护，避免 connect、reconnect 和 disconnect 交叠。
+
+`async_client.py` 还把 Paho 的 7 个内部 mutex 替换成 `NullLock`。这只是性能优化，成立的前提是运行期的网络处理和公开操作都由同一个事件循环串行化，只有受 `connection_lock` 保护的 connect/reconnect executor 边界例外，且没有 `loop_start()` 网络线程。把这段代码复制到一个仍会跨线程调用 `publish()` 的项目里会制造数据竞争；通用封装应先完成线程归一化，再考虑去锁。
+
+### 12.3 将 publish/subscribe 的 MID 回调变成 await
+
+Paho 的 `publish()`、`subscribe()` 和 `unsubscribe()` 本身立即返回，不代表 broker 已确认操作。HA 用 MQTT message id（MID）把回调式完成通知转换成 Future：
+
+```python
+def _async_get_mid_future(self, mid: int) -> asyncio.Future[None]:
+    if future := self._pending_operations.get(mid):
+        return future
+    future = self.hass.loop.create_future()
+    self._pending_operations[mid] = future
+    return future
+
+def _async_mqtt_on_callback(self, mid: int) -> None:
+    future = self._async_get_mid_future(mid)
+    if not future.done():
+        future.set_result(None)
+
+async def async_publish(self, topic, payload, qos, retain):
+    info = self._mqttc.publish(topic, payload, qos, retain)
+    await self._async_wait_for_mid_or_raise(info.mid, info.rc)
+```
+
+回调可能比 coroutine 创建 Future 更早发生，所以“等待方”和“回调方”都必须调用同一个幂等的 `_async_get_mid_future()`；谁先到都创建同一份 Future。这是包装 callback API 时很实用的竞态处理模式。当前实现对 Paho 的立即错误码抛出 `HomeAssistantError`，ACK 超时则记录警告并清理 MID。
+
+订阅层还做了几件 Paho 原生 Client 不负责的事：
+
+- 相同 topic 的多个 HA 订阅合并成一次 broker subscription，使用请求中的最大 QoS。
+- 精确 topic 用字典 O(1) 查找，通配 topic 用 `MQTTMatcher` 匹配。
+- MQTT 5 下给通配订阅分配 Subscription Identifier，避免重叠订阅导致同一报文被错误路由。
+- 短时间内的 subscribe/unsubscribe 经 cooldown 和 debouncer 合并，降低启动期报文数量。
+- `on_message` 把 Paho `MQTTMessage` 转成不可变的 `ReceiveMessage`，再按 `HassJobType` 直接执行 `@callback` 或调度 coroutine。
+
+`await mqtt.async_subscribe(...)` 的语义是“把订阅加入 HA 的跟踪集合并返回取消函数”，不保证此刻已经收到 broker 的 SUBACK；实际 SUBSCRIBE 会由 debouncer 批量提交。确实需要确认订阅完成时，使用 `mqtt.async_on_subscribe_done()` 注册状态回调，而不要把 `await async_subscribe()` 当成网络 ACK。
+
+自定义集成不应访问 `hass.data[DATA_MQTT]`、`async_subscribe_internal()` 或 `_mqttc`，应使用 MQTT 集成导出的公共 API：
+
+```python
+from homeassistant.components import mqtt
+from homeassistant.core import callback
+
+@callback
+def message_received(msg: mqtt.ReceiveMessage) -> None:
+    coordinator.async_set_updated_data(parse_payload(msg.payload))
+
+unsubscribe = await mqtt.async_subscribe(
+    hass, "my_device/+/state", message_received, qos=1
+)
+entry.async_on_unload(unsubscribe)
+
+await mqtt.async_publish(
+    hass,
+    "my_device/node-1/command",
+    "ON",
+    qos=1,
+    retain=False,
+)
+```
+
+### 12.4 MQTT 实体自动发现
+
+默认 discovery prefix 是 `homeassistant`，可以在 MQTT options 中修改。Core 同时支持两种实体发现格式。
+
+**单组件 discovery topic**：
+
+```
+<prefix>/<component>/<object_id>/config
+<prefix>/<component>/<node_id>/<object_id>/config
+```
+
+例如 `homeassistant/sensor/kitchen/temperature/config`。`component` 必须在 `SUPPORTED_COMPONENTS` 中，`node_id` 和 `object_id` 只允许字母、数字、下划线和连字符。`node_id` 只参与 discovery identity，不会自动成为设备标识。
+
+**设备级 discovery topic**：
+
+```
+<prefix>/device/<object_id>/config
+<prefix>/device/<node_id>/<object_id>/config
+```
+
+设备级 payload 必须包含：
+
+- `device`：至少有 `identifiers` 或 `connections` 之一。
+- `origin`：发布 discovery 的应用名称，可附带版本和支持 URL。
+- `components`：一个或多个组件配置；每个组件必须有 `platform`，实体平台还必须有 `unique_id`。
+
+设备级格式把公共 availability、state/command topic、QoS、encoding 等选项继承给各组件，组件自己的值优先。源码也接受 `dev`、`o`、`cmps` 等缩写，并在 schema 校验前展开。
+
+收到 discovery 消息后的完整链路是：
+
+```
+Paho socket readable
+  → MQTT._async_mqtt_on_message()
+  → discovery.async_discovery_message_received()
+  → 解析 topic / JSON / 缩写 / '~' base topic / schema
+  → discovery_hash = (component, node_id + object_id)
+  ├─ 新发现：MQTT_DISCOVERY_NEW
+  │    → 平台 async_setup_entry 注册的 dispatcher listener
+  │    → discovery schema 校验
+  │    → async_add_entities([MqttEntity(...)])
+  ├─ 已存在：MQTT_DISCOVERY_UPDATED
+  │    → 已有实体重建订阅和配置并写入新状态
+  └─ 空 payload：发送删除更新并清理实体/设备
+```
+
+如果消息对应的平台尚未加载，`discovery.py` 先通过 `async_forward_entry_setup_and_setup_discovery()` 加载平台，再发 `MQTT_DISCOVERY_NEW`。每个平台有独立的 `asyncio.Lock`，同一平台不会被并发加载多次。
+
+同一 `discovery_hash` 的更新也不会并发处理。Core 在 `discovery_pending_discovered` 中为它维护 deque，只有实体发回 `MQTT_DISCOVERY_DONE` 后才取下一条。这避免 retained 初始配置、在线更新和删除消息交错，导致旧配置覆盖新配置。
+
+设备应把 discovery 配置以 retained 消息发布，否则 HA 重启或 MQTT 重连后无法重新发现。删除实体或整个设备时，向原 discovery topic 发布**零长度的 retained payload**。单组件路径收到 `{}` 也会被当作空配置，但设备级 payload 的 `{}` 会因为缺少 `device`、`origin`、`components` 而校验失败；跨格式实现不要依赖 `{}`，统一发布零长度消息。状态是否 retained 则取决于设备语义，不能照搬 discovery 的规则。
+
+### 12.5 manifest 的 MQTT 配置流发现
+
+另一套容易混淆的机制是集成 manifest 中的 `"mqtt"` 字段：
+
+```json
+{
+  "domain": "tasmota",
+  "dependencies": ["mqtt"],
+  "mqtt": ["tasmota/discovery/#"],
+  "config_flow": true
+}
+```
+
+它不是创建通用 MQTT Entity 的 discovery schema，而是“某个 MQTT topic 出现消息后，启动指定集成的 ConfigFlow”。内置 manifest 数据由 hassfest 生成到 `homeassistant/generated/mqtt.py`，自定义集成则由 loader 动态补入。
+
+MQTT 集成为每个 matcher 订阅 topic。消息到达后构造：
+
+```python
+MqttServiceInfo(
+    topic=msg.topic,
+    payload=msg.payload,
+    qos=msg.qos,
+    retain=msg.retain,
+    subscribed_topic=msg.subscribed_topic,
+    timestamp=msg.timestamp,
+)
+```
+
+随后用 `source=SOURCE_MQTT` 和以实际 topic 为 key 的 `DiscoveryKey` 调用 `discovery_flow.async_create_flow()`，最终进入目标集成的 `async_step_mqtt()`：
+
+```python
+async def async_step_mqtt(
+    self, discovery_info: MqttServiceInfo
+) -> ConfigFlowResult:
+    await self.async_set_unique_id(stable_device_id)
+    self._abort_if_unique_id_configured()
+    # 校验 payload，保存发现信息，再进入 confirm 或直接创建 entry
+```
+
+Core 会缓存每个实际 topic 最近处理过的 payload，完全相同的消息不会重复启动 flow；删除由该 discovery key 创建的 Config Entry 后，会用缓存消息重新触发发现。空 payload 会清掉缓存。由于大量 retained 消息可能同时到达，这条路径还用一个锁串行启动 config flows，但这个锁是启动洪峰保护，不代替 `unique_id` 去重。
+
+两套发现机制的区别可以概括为：
+
+| 机制 | 输入 | 结果 |
+|------|------|------|
+| `homeassistant/.../config` | 标准 MQTT discovery JSON | MQTT 集成直接创建/更新实体、设备、tag 或 device automation |
+| manifest `"mqtt": [...]` | 集成私有 topic 和私有 payload | 启动目标集成 `ConfigFlow.async_step_mqtt()`，通常创建该集成自己的 Config Entry |
+
+### 12.6 设备侧 discovery 示例与工程约束
+
+下面使用设备级 discovery 一次声明温度传感器和继电器。发布 topic 为 `homeassistant/device/env-node-01/config`，消息必须 retained：
+
+```json
+{
+  "origin": {
+    "name": "env-node-firmware",
+    "sw_version": "1.2.0",
+    "support_url": "https://example.com/env-node/support"
+  },
+  "device": {
+    "identifiers": ["env-node-01"],
+    "name": "Environment Node 01",
+    "manufacturer": "Example Labs",
+    "model": "EN-2"
+  },
+  "availability_topic": "env-node/01/status",
+  "components": {
+    "temperature": {
+      "platform": "sensor",
+      "unique_id": "env-node-01-temperature",
+      "name": "Temperature",
+      "device_class": "temperature",
+      "state_class": "measurement",
+      "unit_of_measurement": "°C",
+      "state_topic": "env-node/01/state",
+      "value_template": "{{ value_json.temperature }}"
+    },
+    "relay": {
+      "platform": "switch",
+      "unique_id": "env-node-01-relay",
+      "name": "Relay",
+      "state_topic": "env-node/01/relay/state",
+      "command_topic": "env-node/01/relay/set",
+      "payload_on": "ON",
+      "payload_off": "OFF"
+    }
+  }
+}
+```
+
+设备实现时还应满足以下约束：
+
+1. `device.identifiers` 和每个实体的 `unique_id` 必须跨重启稳定，不能使用 IP、启动时间或随机数。
+2. discovery topic 和 identity 一旦发布就应保持稳定；单组件与设备级格式之间迁移时使用 `migrate_discovery` 流程，普通改 topic 则先清理旧 retained topic，否则会留下重复实体。
+3. 用 MQTT will 把 availability topic 设为 `offline`，连接成功后发布 `online`；这与 HA 自己的 `homeassistant/status` birth/will 不是同一个方向。
+4. 配置更新继续向同一 discovery topic 发布完整 retained payload。要删除设备级组件，发布该组件的空配置或对整个设备发布零长度 retained payload，让 Core 生成清理更新。
+5. 不要假定 QoS 1 等于业务动作“恰好一次”。MQTT QoS 1 是至少一次，命令如果不可重复执行，应在应用 payload 中加入 command id 并由设备去重。
+6. 大 payload 和大量 retained 配置会在 HA 连接时同时到达。优先使用设备级 discovery 合并配置，并避免在高频 state topic 中携带无关大字段。
+
+---
+
+## 13. 关键设计模式总结
+
+### 13.1 架构模式
 
 | 模式 | 实现 |
 |------|------|
@@ -4394,7 +4784,7 @@ config = blueprint_inputs.async_substitute()  # 生成完整配置
 | **注册表模式** | ServiceRegistry, EntityRegistry, DeviceRegistry, HANDLERS 等 |
 | **观察者模式** | EventBus 监听器, Coordinator 订阅, ConfigEntry 更新监听 |
 
-### 12.2 加载模式
+### 13.2 加载模式
 
 | 模式 | 实现 |
 |------|------|
@@ -4404,7 +4794,7 @@ config = blueprint_inputs.async_substitute()  # 生成完整配置
 | **惰性加载** | 自定义集成按需解析，平台模块按需导入 |
 | **线性递增退避重试** | `PlatformNotReady` → `min(tries,6)*30` 秒递增等待（30, 60, 90, ... 180s） |
 
-### 12.3 实体模式
+### 13.3 实体模式
 
 | 模式 | 实现 | 典型集成 |
 |------|------|----------|
@@ -4414,18 +4804,19 @@ config = blueprint_inputs.async_substitute()  # 生成完整配置
 | **描述模式** | `EntityDescription` + `value_fn` 将属性从子类移到描述对象 | `sun` |
 | **_attr_* 模式** | 类属性默认值，减少 property 定义 | `moon` |
 
-### 12.4 集成模式
+### 13.4 集成模式
 
 | 模式 | 实现 |
 |------|------|
 | **runtime_data 模式** | `entry.runtime_data` 存储运行时对象，类型安全 |
 | **平台转发模式** | `async_forward_entry_setups` 将设置传播到各平台 |
 | **配置流模式** | `ConfigFlow` + 步骤方法，支持 UI 配置 |
+| **MQTT 外部事件循环适配** | `add_reader/add_writer` 驱动 Paho `loop_read/loop_write`，MID callback 转 Future |
 | **蓝图模式** | `!input` 占位符 + `substitute()` 递归替换，配置模板化复用 |
 | **统一错误处理** | `async_request_call` 包装 API 调用，统一异常转换 |
 | **选项 = 重载** | 选项变更触发 `async_reload`，重新初始化整个集成 |
 
-### 12.5 @final 保护
+### 13.5 @final 保护
 
 以下关键属性/方法标记为 `@final`，子类不可覆盖：
 
@@ -4441,17 +4832,22 @@ config = blueprint_inputs.async_substitute()  # 生成完整配置
 
 | 文件 | 行数 | 说明 |
 |------|------|------|
-| `homeassistant/core.py` | 2878 | HomeAssistant 主类、EventBus、StateMachine、ServiceRegistry |
-| `homeassistant/config_entries.py` | 4180 | ConfigEntry、ConfigFlow、ConfigEntries 管理器 |
-| `homeassistant/bootstrap.py` | 1084 | 启动引导 |
-| `homeassistant/loader.py` | 1789 | Integration 类、manifest 解析 |
-| `homeassistant/setup.py` | 842 | async_setup_component |
-| `homeassistant/data_entry_flow.py` | 940 | FlowHandler/FlowManager 基类 |
-| `homeassistant/helpers/entity.py` | 1780 | Entity 基类 |
-| `homeassistant/helpers/entity_platform.py` | 1348 | EntityPlatform |
-| `homeassistant/helpers/entity_component.py` | 398 | EntityComponent |
-| `homeassistant/helpers/service.py` | 1408 | 服务辅助函数 |
-| `homeassistant/const.py` | 1011 | 全局常量 |
+| `homeassistant/core.py` | 3011 | HomeAssistant 主类、EventBus、StateMachine、ServiceRegistry |
+| `homeassistant/config_entries.py` | 4221 | ConfigEntry、ConfigSubentry、ConfigFlow、ConfigEntries 管理器 |
+| `homeassistant/bootstrap.py` | 1113 | 启动引导 |
+| `homeassistant/loader.py` | 1804 | Integration 类、manifest 解析与 MQTT matcher 加载 |
+| `homeassistant/setup.py` | 841 | async_setup_component |
+| `homeassistant/data_entry_flow.py` | 939 | FlowHandler/FlowManager 基类 |
+| `homeassistant/helpers/entity.py` | 1788 | Entity 基类 |
+| `homeassistant/helpers/entity_platform.py` | 1353 | EntityPlatform、subentry 与 child device 注册 |
+| `homeassistant/helpers/entity_component.py` | 399 | EntityComponent |
+| `homeassistant/helpers/service.py` | 1416 | 服务辅助函数 |
+| `homeassistant/const.py` | 1076 | 全局常量 |
+| `homeassistant/components/mqtt/__init__.py` | 735 | MQTT Config Entry 设置、协议迁移、平台预加载 |
+| `homeassistant/components/mqtt/client.py` | 1538 | Paho asyncio 适配、连接、订阅与消息分发 |
+| `homeassistant/components/mqtt/async_client.py` | 71 | Paho Client 无锁子类 |
+| `homeassistant/components/mqtt/discovery.py` | 733 | MQTT 实体发现和 manifest MQTT ConfigFlow 发现 |
+| `homeassistant/components/mqtt/entity.py` | 1801 | MQTT Entity 基类与 discovery 更新 |
 | `homeassistant/components/blueprint/models.py` | 385 | Blueprint、BlueprintInputs、DomainBlueprints |
 | `homeassistant/components/blueprint/importer.py` | 288 | 蓝图 URL 导入逻辑（论坛/GitHub/Gist/官网/通用） |
 | `homeassistant/components/blueprint/schemas.py` | 151 | BLUEPRINT_SCHEMA、BLUEPRINT_INSTANCE_FIELDS |
