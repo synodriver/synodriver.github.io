@@ -22,6 +22,11 @@ author: 'synodriver'
   - [5.8 ConfigEntry 创建、更新与 `unique_id`](#58-configentry-创建更新与-unique_id)
   - [5.9 ConfigFlow 实例生命周期与 BLE 发现去重](#59-configflow-实例生命周期与-ble-发现去重)
   - [5.10 OptionsFlow — 选项流](#510-optionsflow--选项流)
+    - [5.10.1 OptionsFlow 的数据模型与源码入口](#5101-optionsflow-的数据模型与源码入口)
+    - [5.10.2 OptionsFlow 的执行时序](#5102-optionsflow-的执行时序)
+    - [5.10.3 OptionsFlow 的实现方式](#5103-optionsflow-的实现方式)
+    - [5.10.4 OptionsFlow 与 ConfigFlow 的区别](#5104-optionsflow-与-configflow-的区别)
+    - [5.10.5 选项流的常见误区](#5105-选项流的常见误区)
 - [6. 实体(Entity)体系](#6-实体entity体系)
 - [7. 服务(Service)机制](#7-服务service机制)
 - [8. 平台(Platform)与 EntityComponent 编排](#8-平台platform与-entitycomponent-编排)
@@ -932,25 +937,175 @@ BTHome、Acaia 等内置集成都遵循这个模式：`async_step_bluetooth()` �
 
 ### 5.10 OptionsFlow — 选项流
 
-```python
-class OptionsFlow(ConfigEntryBaseFlow):
-    @property
-    def config_entry(self) -> ConfigEntry: ...  # 关联的 ConfigEntry
+`OptionsFlow` 用于修改**已经存在的 ConfigEntry 的可变选项**。例如轮询间隔、启用哪些实体、媒体播放参数、调试开关等，都属于选项；设备地址、用户名、令牌等决定“连接到哪个服务”的身份配置，通常属于 `ConfigEntry.data`，应由 ConfigFlow 或 reconfigure/reauth flow 管理。
 
-# 常用变体
-class OptionsFlowWithReload(OptionsFlow):
-    automatic_reload: bool = True  # 选项变更后自动重新加载 ConfigEntry
-```
+OptionsFlow 的最终结果不会创建第二个 ConfigEntry，而是把流程返回的 `data` 写回原条目的 `options` 字段。可以把它理解为“绑定到某个 ConfigEntry 的表单编辑器”，而不是第二种设备发现流程。
 
-集成通过在 ConfigFlow 中覆盖 `async_get_options_flow` 支持选项流：
+### 5.10.1 OptionsFlow 的数据模型与源码入口
+
+相关实现位于 `homeassistant/config_entries.py`：
 
 ```python
-class MyConfigFlow(ConfigFlow, domain="my_integration"):
+class ConfigEntries:
+    def __init__(self, hass, hass_config):
+        self.flow = ConfigEntriesFlowManager(hass, self, hass_config)
+        self.options = OptionsFlowManager(hass)
+
+class ConfigFlow(ConfigEntryBaseFlow):
     @staticmethod
     @callback
-    def async_get_options_flow(config_entry) -> OptionsFlow:
-        return MyOptionsFlow(config_entry)
+    def async_get_options_flow(config_entry: ConfigEntry) -> OptionsFlow:
+        raise UnknownHandler
+
+class OptionsFlow(ConfigEntryBaseFlow):
+    @property
+    def _config_entry_id(self) -> str: ...
+
+    @property
+    def config_entry(self) -> ConfigEntry: ...
 ```
+
+`ConfigEntry.supports_options` 会检查对应 `ConfigFlow` 是否覆写了 `async_get_options_flow()`；前端据此决定是否显示“配置选项”入口。默认实现抛出 `UnknownHandler`，因此只实现 ConfigFlow 的集成不会意外获得一个空的选项页。
+
+`OptionsFlow` 基类提供的 `config_entry` 和 `_config_entry_id` 属性在 flow 被 `OptionsFlowManager` 初始化之后才可用，不能在 `__init__` 中读取。当前 Core 中 `OptionsFlowWithConfigEntry` 只为旧自定义集成保留并处于淘汰阶段，新代码不要再继承它，也不要给只读的 `config_entry` 属性赋值。
+
+### 5.10.2 OptionsFlow 的执行时序
+
+用户从某个已配置集成的设置页进入选项时，调用链可以概括为：
+
+```
+前端
+  │  hass.config_entries.options.async_init(entry.entry_id,
+  │      context={"source": "user"})
+  ↓
+OptionsFlowManager.async_create_flow(entry_id)
+  ├── 根据 entry_id 找到已有 ConfigEntry
+  ├── 加载 entry.domain 的 config_flow.py
+  └── handler.async_get_options_flow(entry) → OptionsFlow 实例
+  ↓
+FlowManager 设置 flow.hass / flow.handler / flow_id
+  └── 默认进入 async_step_init(None)
+  ↓
+前端提交表单
+  └── options.async_configure(flow_id, user_input)
+        ├── 先用 data_schema 校验输入
+        └── 反射调用 async_step_<当前 step>(user_input)
+  ↓
+async_create_entry(data=new_options)
+  ↓
+OptionsFlowManager.async_finish_flow()
+  ├── ABORT：结束流程，不修改条目
+  └── CREATE_ENTRY：async_update_entry(entry, options=new_options)
+                    └── 持久化、触发 update listeners
+                        └── OptionsFlowWithReload 时安排 reload
+```
+
+这条路径与 ConfigFlow 的关键差异在最后一步：ConfigFlow 的 `CREATE_ENTRY` 会由 Core 构造并加入一个新的 `ConfigEntry`；OptionsFlow 的 `CREATE_ENTRY` 只更新已有条目的 `options`。如果表单返回的数据与原 `options` 相同，`async_update_entry()` 返回 `False`，不会触发更新监听器，也不会因为 `OptionsFlowWithReload` 安排无意义的 reload。
+
+源码中的 `OptionsFlowManager.async_finish_flow()` 还规定：只有 `result["type"] == CREATE_ENTRY` 且 `result["data"]` 不为 `None` 时才写入选项；因此取消或中止流程不会产生半成品配置。
+
+### 5.10.3 OptionsFlow 的实现方式
+
+最小实现通常包含两部分：在 ConfigFlow 中返回 OptionsFlow，在 OptionsFlow 的 `async_step_init` 中读取旧选项、显示表单并返回新选项。新代码可以直接使用 Core 注入的 `self.config_entry`：
+
+```python
+from typing import Any
+
+import voluptuous as vol
+
+from homeassistant.config_entries import (
+    ConfigEntry,
+    ConfigFlow,
+    ConfigFlowResult,
+    OptionsFlow,
+    OptionsFlowWithReload,
+)
+from homeassistant.core import callback
+
+from .const import DOMAIN
+
+
+class MyConfigFlow(ConfigFlow, domain=DOMAIN):
+    """创建 My Integration 的 ConfigEntry。"""
+
+    @staticmethod
+    @callback
+    def async_get_options_flow(config_entry: ConfigEntry) -> OptionsFlow:
+        """返回该条目的选项流。"""
+        # 不要在这里给 flow.config_entry 赋值；Manager 会在初始化后注入关联关系。
+        return MyOptionsFlow()
+
+
+class MyOptionsFlow(OptionsFlowWithReload):
+    """编辑不会改变设备身份的运行选项。"""
+
+    async def async_step_init(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """显示并保存选项。"""
+        if user_input is not None:
+            # data 会被 OptionsFlowManager 写入 ConfigEntry.options。
+            return self.async_create_entry(title="", data=user_input)
+
+        options = self.config_entry.options
+        return self.async_show_form(
+            step_id="init",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(
+                        "poll_interval",
+                        default=options.get("poll_interval", 30),
+                    ): vol.All(vol.Coerce(int), vol.Range(min=5)),
+                    vol.Optional(
+                        "enable_extra_entities",
+                        default=options.get("enable_extra_entities", True),
+                    ): bool,
+                }
+            ),
+        )
+```
+
+几点实现约定：
+
+1. 表单默认值应从 `self.config_entry.options` 读取；`options` 是只读映射，不能原地修改。需要跨多个 step 暂存时，复制到 flow 自己的普通 `dict`，最后一次性传给 `async_create_entry(data=...)`。
+2. `async_create_entry()` 中的 `data` 是“完整的新 options 映射”，不是自动合并的 patch。只提交表单中的一部分字段时，要显式合并旧值，例如 `self.config_entry.options | user_input`。
+3. `async_create_entry()` 的 `title` 对 OptionsFlow 的持久化没有 ConfigFlow 那样的含义，通常传空字符串即可；真正被 `OptionsFlowManager` 使用的是 `data`。
+4. 复杂的多页编辑可以像 ConfigFlow 一样定义 `async_step_xxx`、`async_show_menu`、外部步骤和进度步骤；起始步骤仍通常是 `async_step_init`。
+
+对于纯 schema 驱动的集成，可以复用 `homeassistant.helpers.schema_config_entry_flow`：定义 `SchemaConfigFlowHandler.options_flow`，Core helper 会生成 `SchemaOptionsFlowHandler`；设置 `options_flow_reloads = True` 时生成带自动 reload 的变体。这和手写 `OptionsFlow` 使用同一个 `OptionsFlowManager`，只是省去了重复的 step 代码。
+
+OptionsFlow 的文案放在集成的 `strings.json` / `translations/*.json` 的 `options` 节点下，而不是 `config` 节点；例如 `options.step.init.data.poll_interval` 对应上面表单的字段。step ID、字段键和错误键必须与 Python 返回的 flow result 保持一致。
+
+选项变更后的运行时处理有两种互斥的常见模式：
+
+- 继承普通 `OptionsFlow`，在 `async_setup_entry` 中注册 `entry.add_update_listener()`，由监听器调用 `async_reload()` 或更新运行对象。监听器应通过 `entry.async_on_unload(...)` 注册清理。
+- 继承 `OptionsFlowWithReload`，由 Core 在选项实际变化后自动 `async_schedule_reload(entry.entry_id)`。此模式不能同时使用 ConfigEntry update listener；源码会直接抛出 `ValueError`，避免重复 reload。
+
+### 5.10.4 OptionsFlow 与 ConfigFlow 的区别
+
+| 对比项 | ConfigFlow | OptionsFlow |
+|---|---|---|
+| 目标 | 首次建立一个集成配置，或处理发现/导入/重新认证/重新配置 | 修改已有条目的运行选项 |
+| 管理器 | `hass.config_entries.flow` | `hass.config_entries.options` |
+| `async_init()` 的 handler | 集成 `domain`，例如 `"hue"` | 已有 `ConfigEntry.entry_id` |
+| 关联对象 | 流程可能尚未有 ConfigEntry | 必须关联一个已存在的 ConfigEntry |
+| 常见 step | `user`、`bluetooth`、`dhcp`、`zeroconf`、`import`、`reauth`、`reconfigure` | 通常从 `init` 开始，也可拆成多个自定义 step |
+| 保存位置 | `CREATE_ENTRY` 的 `data` / `options` 参与创建新条目 | `CREATE_ENTRY` 的 `data` 覆盖原条目的 `options` |
+| 是否创建条目 | 是，Core 最终调用 `async_add()` | 否，调用 `async_update_entry(entry, options=...)` |
+| 身份去重 | 常用 `unique_id` 和 `_abort_if_unique_id_configured()` | 通常不改变 `unique_id`，也不创建新的设备身份 |
+| 失败/取消 | 可返回 `ABORT`，未创建时不产生条目 | 可返回 `ABORT`，原 `options` 保持不变 |
+| reload 行为 | 由创建/更新条目及集成 setup 生命周期决定 | 普通 OptionsFlow 依赖 update listener；`OptionsFlowWithReload` 自动安排 reload |
+
+两者共享 `FlowHandler` 的结果类型、schema 校验、翻译和多步骤机制，所以前端看起来相似；但它们的 handler key、持久化目标和完成动作不同，不能把 OptionsFlow 当作“再次运行一次 ConfigFlow”。
+
+### 5.10.5 选项流的常见误区
+
+- **把连接身份放进 options**：host、账号、token 等若决定连接对象，应放在 `data`，需要修改时使用 reconfigure/reauth flow。options 适合行为偏好，不适合作为条目身份。
+- **在 `__init__` 里访问 `self.config_entry`**：此时 Manager 还没有设置 `hass` 和 `handler`，源码会抛出 `ValueError`。把读取逻辑放到 `async_step_init` 或后续 step。
+- **直接改 `entry.options`**：ConfigEntry 的数据和 options 都由 Core 管理，直接赋值会触发属性保护。通过 `async_create_entry(data=...)`（OptionsFlow）或 `hass.config_entries.async_update_entry(..., options=...)`（其他运行时代码）更新。
+- **OptionsFlowWithReload 与 update listener 同时使用**：这会触发 Core 的保护性错误。二选一，并确保 reload 不会重复执行。
+- **只提交局部字段却覆盖旧选项**：OptionsFlowManager 不会自动做 patch merge；需要保留的旧键必须显式合并。
+- **误以为 manifest 里的 `config_flow: true` 自动启用 OptionsFlow**：manifest 只声明集成有 ConfigFlow。是否显示选项入口取决于 `ConfigFlow.async_get_options_flow()` 是否被覆写并返回有效的 OptionsFlow。
 
 ## 6. 实体(Entity)体系
 
