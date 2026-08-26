@@ -18,6 +18,12 @@ author: 'synodriver'
 - [3. 启动流程详解](#3-启动流程详解)
 - [4. 集成加载机制](#4-集成加载机制)
 - [5. 配置流(ConfigFlow)机制](#5-配置流configflow机制)
+  - [5.4 FlowManager 与专用 Manager](#54-flowmanager-与专用-manager)
+    - [5.4.1 FlowHandler 与 FlowManager 的职责边界](#541-flowhandler-与-flowmanager-的职责边界)
+    - [5.4.2 FlowManager 的公共调用流程](#542-flowmanager-的公共调用流程)
+    - [5.4.3 Config Entry 体系的三个专用 Manager](#543-config-entry-体系的三个专用-manager)
+    - [5.4.4 从前端 API 到 Manager 的完整路径](#544-从前端-api-到-manager-的完整路径)
+    - [5.4.5 其他复用 FlowManager 的流程](#545-其他复用-flowmanager-的流程)
   - [5.7 ConfigFlow step 方法职责与调用时机](#57-configflow-step-方法职责与调用时机)
   - [5.8 ConfigEntry 创建、更新与 `unique_id`](#58-configentry-创建更新与-unique_id)
   - [5.9 ConfigFlow 实例生命周期与 BLE 发现去重](#59-configflow-实例生命周期与-ble-发现去重)
@@ -715,23 +721,181 @@ class FlowHandler:
     def async_show_menu(self, *, step_id, menu_options, ...) → MENU
 ```
 
-### 5.4 FlowManager 核心流程
+### 5.4 FlowManager 与专用 Manager
+
+文章前面提到的 `FlowHandler` 和 `FlowManager` 是两条互补的继承体系：前者表示“一次流程中的业务步骤”，后者负责“同时编排和保存多次流程”。`ConfigEntries` 则是 ConfigEntry 的总管理器，它不是 `FlowManager` 的子类，而是在初始化时持有三个专用 flow manager：
+
+```python
+class ConfigEntries:
+    def __init__(self, hass, hass_config):
+        self.flow = ConfigEntriesFlowManager(hass, self, hass_config)
+        self.options = OptionsFlowManager(hass)
+        self.subentries = ConfigSubentryFlowManager(hass)
+```
+
+对应的两组继承关系如下：
 
 ```
-FlowManager.async_init(handler, *, context, data)
-  │
-  ├── async_create_flow(handler, context, data) → 创建 FlowHandler 实例
-  ├── 分配 flow_id (UUID)
-  ├── 注册到 _progress 索引
-  └── _async_handle_step(flow, flow.init_step, data)
-        │  ← init_step 默认为 "init"，但 ConfigFlow 中被覆盖为 context["source"]
-        │
-        ├── getattr(flow, f"async_step_{step_id}")(user_input)
-        │     ← 反射调用步骤方法
-        │
-        ├── 如果结果在 FLOW_NOT_COMPLETE_STEPS 中 → 设置 cur_step，流程继续
-        └── 否则 → async_finish_flow()，流程结束
+流程处理器（一次会话一个实例）
+FlowHandler
+  ├── ConfigEntryBaseFlow
+  │     ├── ConfigFlow
+  │     └── OptionsFlow
+  ├── ConfigSubentryFlow
+  ├── RepairsFlow
+  └── LoginFlow / MFA setup flow
+
+流程管理器（通常由 HA 长期持有，一个实例管理多次会话）
+FlowManager
+  ├── ConfigEntriesFlowManager
+  ├── OptionsFlowManager
+  ├── ConfigSubentryFlowManager
+  ├── RepairsFlowManager
+  ├── AuthManagerFlowManager
+  └── MfaFlowManager
 ```
+
+#### 5.4.1 FlowHandler 与 FlowManager 的职责边界
+
+| 对象 | 生命周期与数量 | 主要职责 | 不负责什么 |
+|---|---|---|---|
+| `FlowHandler` 及其子类 | 每启动一次 flow 创建一个实例 | 实现 `async_step_*`，执行业务校验，返回 `FORM`、`CREATE_ENTRY`、`ABORT` 等结果 | 不登记并发流程，不直接决定结果如何持久化 |
+| `FlowManager` | 通常是长期对象，同时持有多个 flow | 创建 handler、分配 `flow_id`、注入上下文、校验 schema、推进 step、跟踪进度、终止和清理流程 | 不实现具体集成的 host/token/设备校验 |
+| 专用 Manager | 每类流程一个长期对象 | 覆写 `async_create_flow()` 决定创建哪种 handler；覆写 `async_finish_flow()` 决定成功结果的副作用 | 不取代集成的 `async_step_*` |
+| `ConfigEntries` | `hass.config_entries` 上的长期总管理器 | 保存和索引 `ConfigEntry`，负责 setup/unload/reload/update/remove，并持有三个 flow manager | 不是 flow 状态机，也不继承 `FlowManager` |
+
+这个边界解释了为什么集成中的 `self.async_create_entry(...)` 只是构造一个 result：Handler 表达“流程成功且这些数据应被保存”，真正创建 ConfigEntry、更新 options 或增加 subentry 的动作由对应 Manager 在 `async_finish_flow()` 中解释。
+
+#### 5.4.2 FlowManager 的公共调用流程
+
+`homeassistant/data_entry_flow.py` 中的泛型 `FlowManager` 提供所有 flow 共用的状态机。它至少维护以下索引：
+
+| 内部字段 | 作用 |
+|---|---|
+| `_progress[flow_id]` | 按 `flow_id` 找到正在进行的 `FlowHandler` |
+| `_handler_progress_index[handler]` | 按 handler key 查找同类 flow，用于并发检查和去重 |
+| `_init_data_process_index[type]` | 按初始 discovery data 类型查找 flow，Bluetooth、SSDP、USB 等用它抑制或中止重复发现 |
+| `_preview` | 记录已完成 preview 初始化的 handler，避免重复 setup |
+
+公共的启动、推进与结束过程为：
+
+```
+manager.async_init(handler, context=..., data=...)
+  ├── manager.async_create_flow(handler, context, data)
+  │     └── 专用 Manager 返回具体 FlowHandler
+  ├── 注入 flow.hass / handler / flow_id / context / init_data
+  ├── _async_add_flow_progress(flow)
+  │     └── 写入 _progress、handler 和 init_data 类型索引
+  └── _async_handle_step(flow, flow.init_step, data)
+        ├── 检查 async_step_<step_id> 是否存在
+        ├── await async_step_<step_id>(data)
+        ├── 将 AbortFlow 异常规范化为 ABORT result
+        ├── 管理 preview/progress task 和 result 类型
+        ├── 未完成：保存 flow.cur_step，等待下一次输入
+        └── 已完成：调用专用 manager.async_finish_flow(flow, result)
+              ├── 专用副作用：创建条目/更新 options/增加 subentry/完成登录等
+              ├── 若 Manager 返回 FORM：保存新的 cur_step，流程继续
+              └── 否则 _async_remove_flow_progress(flow_id)
+                    ├── 从全部索引删除
+                    ├── 取消 progress task
+                    └── 调用 flow.async_remove() 做清理
+```
+
+第一次返回 `FORM`、`MENU`、`EXTERNAL_STEP` 或 `SHOW_PROGRESS` 后，前端使用同一个 `flow_id` 继续：
+
+```text
+manager.async_configure(flow_id, user_input)
+  ├── 从 _progress 取得 flow 和 flow.cur_step
+  ├── 如果有 data_schema，先用 voluptuous 校验 user_input
+  ├── MENU：转到 user_input["next_step_id"]
+  └── 其他类型：再次调用当前 async_step_<step_id>(user_input)
+```
+
+`async_get()`、`async_progress()`、`async_progress_by_handler()` 和 `async_progress_by_init_data_type()` 只查询进行中的 flow；`async_abort(flow_id)` 则从索引移除流程并执行同样的取消/清理钩子。基类默认使用随机 UUID hex 作为 `flow_id`，`ConfigEntriesFlowManager` 为了自身的初始化与关闭控制覆写了启动逻辑，当前源码中使用 ULID。
+
+#### 5.4.3 Config Entry 体系的三个专用 Manager
+
+三个对象都挂在 `hass.config_entries` 下，但 handler key、创建的 Handler 和完成语义不同：
+
+| Manager / 访问入口 | `async_init()` 的 handler key | 创建的 Handler | `async_finish_flow(CREATE_ENTRY)` 的动作 |
+|---|---|---|---|
+| `ConfigEntriesFlowManager` / `hass.config_entries.flow` | integration domain，例如 `"hue"` | 该 domain 注册的 `ConfigFlow` | 校验单实例和 `unique_id`，构造 `ConfigEntry`，调用 `ConfigEntries.async_add()` |
+| `OptionsFlowManager` / `hass.config_entries.options` | 已有 `ConfigEntry.entry_id` | domain 的 `ConfigFlow.async_get_options_flow(entry)` 返回的 `OptionsFlow` | `async_update_entry(entry, options=result["data"])`，必要时安排 reload |
+| `ConfigSubentryFlowManager` / `hass.config_entries.subentries` | `(entry_id, subentry_type)` | `ConfigFlow.async_get_supported_subentry_types(entry)` 注册的 `ConfigSubentryFlow` | 构造 `ConfigSubentry` 并调用 `async_add_subentry()` |
+
+`OptionsFlowManager` 和 `ConfigSubentryFlowManager` 都混入 `_ConfigSubFlowManager`，该 mixin 只提供“通过 entry ID 取得已有 ConfigEntry”的公共能力。它不是第四种流程管理器。
+
+`ConfigEntriesFlowManager` 的额外职责最多：
+
+1. `async_init()` 强制 `context["source"]` 存在；reauth/reconfigure 还必须带 `entry_id`。
+2. `async_create_flow()` 加载 domain 的 `config_flow.py`，从 `HANDLERS` 取得类并实例化，然后令 `init_step = context["source"]`。
+3. 启动前检查 single-config-entry 限制，跟踪 YAML import 初始化任务，并允许 HA 关闭时取消尚在初始化的 flow。
+4. 对 discovery flow 发送新增/移除通知，并使用进行中索引处理同 handler、同 `unique_id` 或默认 discovery ID 的冲突。
+5. 完成时构造 `ConfigEntry`；如果 result 携带 `next_flow`，还会确认目标 Config、Options 或 Subentry flow 真实存在。
+
+`OptionsFlowManager` 的完整保存路径见 [5.10.2](#5102-optionsflow-的执行时序)。`ConfigSubentryFlowManager` 的创建路径则是：
+
+```
+subentries.async_init(
+    (entry_id, subentry_type),
+    context={"source": "user"},
+)
+  ├── 找到父 ConfigEntry
+  ├── 加载父 entry.domain 的 ConfigFlow handler
+  ├── async_get_supported_subentry_types(entry)
+  ├── 实例化指定 subentry_type 的 ConfigSubentryFlow
+  ├── 公共 FlowManager 状态机推进 async_step_user()
+  └── CREATE_ENTRY
+        └── ConfigSubentryFlowManager.async_finish_flow()
+              └── ConfigEntries.async_add_subentry(parent_entry, new_subentry)
+```
+
+若 context source 是 `reconfigure`，还会携带 `subentry_id` 并进入 `async_step_reconfigure()`；Handler 通过 `async_update_and_abort()` 或 `async_update_reload_and_abort()` 更新原 subentry。后者不能与父 entry 的 update listener 同时使用，否则 Core 会拒绝重复的更新/reload 路径。
+
+#### 5.4.4 从前端 API 到 Manager 的完整路径
+
+Core 没有让前端直接调用 Handler。`homeassistant/helpers/data_entry_flow.py` 提供通用 HTTP view，`homeassistant/components/config/config_entries.py` 把三个专用 Manager 分别绑定到路由：
+
+| 用途 | 创建流程 POST | 继续流程 POST / 读取当前步骤 GET | handler 内容 |
+|---|---|---|---|
+| ConfigFlow | `/api/config/config_entries/flow` | `/api/config/config_entries/flow/{flow_id}` | domain；reconfigure 时另外传 `entry_id` |
+| OptionsFlow | `/api/config/config_entries/options/flow` | `/api/config/config_entries/options/flow/{flow_id}` | `entry_id` |
+| ConfigSubentryFlow | `/api/config/config_entries/subentries/flow` | `/api/config/config_entries/subentries/flow/{flow_id}` | `[entry_id, subentry_type]` |
+
+通用 view 到 Manager 的映射如下：
+
+```
+POST index {handler, ...}
+  → FlowManagerIndexView._post_impl()
+  → manager.async_init(handler, context=路由构造的上下文)
+  → 返回第一个 FlowResult
+
+POST resource/{flow_id} {user_input...}
+  → FlowManagerResourceView.post()
+  → manager.async_configure(flow_id, user_input)
+  → 返回下一个或最终 FlowResult
+
+GET resource/{flow_id}
+  → manager.async_configure(flow_id)
+  → 推进/轮询 external 或 progress step
+
+DELETE resource/{flow_id}
+  → manager.async_abort(flow_id)
+```
+
+因此“前端提交表单后是谁调用 `async_step_user`”的完整答案是：HTTP resource view 调用专用 Manager 的 `async_configure()`，基类 `FlowManager` 读取 `cur_step`、校验 schema，再由 `_async_handle_step()` 反射调用 Handler 的 `async_step_user()`。自动发现不经过创建流程的 HTTP POST，而是 Bluetooth/Zeroconf/SSDP 等后端代码直接调用 `hass.config_entries.flow.async_init(domain, context, discovery_info)`；流程进入等待用户确认后，前端才通过同一个 `flow_id` 接管后续步骤。
+
+#### 5.4.5 其他复用 FlowManager 的流程
+
+`FlowManager` 是通用数据录入状态机，不只服务于 ConfigEntry：
+
+| Manager | 持有位置/入口 | handler key | 完成语义 |
+|---|---|---|---|
+| `AuthManagerFlowManager` | `hass.auth.login_flow` | `(provider_type, provider_id)` | 把登录数据转换为 `Credentials`，必要时继续 MFA step |
+| `MfaFlowManager` | Auth integration 的 `hass.data` | MFA module ID | 编排 MFA setup flow，最终结果由模块处理 |
+| `RepairsFlowManager` | Repairs integration 的 `flow_manager` | issue domain，初始 data 带 `issue_id` | 创建集成专属 fix flow；非 ABORT 完成后删除已修复 issue |
+
+它们共享 `async_init → async_step_* → async_configure → async_finish_flow → 清理` 的骨架，但各自有不同的 handler key、结果类型和最终副作用。至于 `AuthManager`、`TimeoutManager`、设备注册表等名称中也带 Manager 的类，只是一般意义上的服务管理器，并不继承 `data_entry_flow.FlowManager`，不能套用本节的 flow 调用约定。
 
 ### 5.5 ConfigFlow 类详解
 
