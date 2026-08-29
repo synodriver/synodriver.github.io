@@ -27,6 +27,8 @@ author: 'synodriver'
   - [5.7 ConfigFlow step 方法职责与调用时机](#57-configflow-step-方法职责与调用时机)
   - [5.8 ConfigEntry 创建、更新与 `unique_id`](#58-configentry-创建更新与-unique_id)
   - [5.9 ConfigFlow 实例生命周期与 BLE 发现去重](#59-configflow-实例生命周期与-ble-发现去重)
+    - [5.9.1 多个蓝牙代理收到同一广播时如何去重](#591-多个蓝牙代理收到同一广播时如何去重)
+    - [5.9.2 需要 GATT 连接时如何选择网关](#592-需要-gatt-连接时如何选择网关)
   - [5.10 OptionsFlow — 选项流](#510-optionsflow--选项流)
     - [5.10.1 OptionsFlow 的数据模型与源码入口](#5101-optionsflow-的数据模型与源码入口)
     - [5.10.2 OptionsFlow 的执行时序](#5102-optionsflow-的执行时序)
@@ -1098,6 +1100,87 @@ async def async_step_bluetooth_confirm(self, user_input=None):
 ```
 
 BTHome、Acaia 等内置集成都遵循这个模式：`async_step_bluetooth()` 先用 BLE address 或格式化 MAC 设置 `unique_id`，检测是否已经配置，然后保存 discovery info，最后进入确认表单、加密密钥表单或直接创建 entry。
+
+### 5.9.1 多个蓝牙代理收到同一广播时如何去重
+
+这里要把“同一份广播被多个代理上报”和“同一台设备被重复配置”分开。HA 不会把代理 MAC 当成被扫描设备的身份：`BluetoothServiceInfoBleak.address` 是外设地址，`source` 才是本地适配器或 ESPHome 蓝牙代理的来源 ID。因此两个代理看到同一 MAC 时，是“同一 address 的两条可达路径”，不是两台外设。
+
+当前 Core 把这部分通用算法放在 `habluetooth==6.26.5` 依赖中；`homeassistant/components/bluetooth/manager.py` 的 `HomeAssistantBluetoothManager` 继承 `habluetooth.manager.BluetoothManager`，再接上 HA 的 matcher、callback 和 discovery flow。完整数据路径是：
+
+```text
+ESPHome proxy A ─┐
+                  ├─ BluetoothServiceInfoBleak(address=外设 MAC, source=代理 MAC)
+ESPHome proxy B ─┘
+                             ↓
+BluetoothManager.scanner_adv_received()
+  ├─ 每个 scanner 仍保留自己看到的 BLEDevice/AdvertisementData
+  ├─ _all_history[address]         # 全部路径中当前首选广播
+  ├─ _connectable_history[address] # 可连接路径中当前首选广播
+  └─ 只将接管成功且 payload 有变化的规范广播送入 HA discovery/callback
+                             ↓
+HomeAssistantBluetoothManager._discover_service_info()
+  ├─ IntegrationMatcher 按 address 记录已见字段
+  └─ DiscoveryKey(domain="bluetooth", key=address, version=1)
+                             ↓
+ConfigFlow.async_step_bluetooth()
+  └─ async_set_unique_id(稳定设备 ID) + _abort_if_unique_id_configured()
+                             ↓
+Device Registry
+  └─ connections={("bluetooth", address)}
+```
+
+`_all_history` 和 `_connectable_history` 都以外设 `address` 为 key，所以对上层暴露的是每个地址一份规范历史，而不是每个 `(address, source)` 各一份。但 manager 并没有丢掉其他路径：每个 scanner 的发现缓存仍然保留该 address，稍后 GATT 连接正是从这些候选中选网关。
+
+当新广播来自另一个 `source` 时，`_should_keep_previous_adv()` / `_prefer_previous_adv_from_different_source()` 决定是否更换当前广播 owner：
+
+- 对每个 `(address, source)` 的 RSSI 做 EWMA 平滑，当前系数为 `0.3`，避免一次瞬时尖峰导致换代理。
+- 新来源的平滑 RSSI 需比当前 owner 强超过 `16 dB` 才主动接管；刚被降级的来源想立即抢回 owner，还要额外跨过 `6 dB` deadband。
+- owner 超过已学习的广播间隔未出现时，再进入 stale handoff；被动广播设备和需要主动扫描的设备有不同的漫游保护，防止轮流丢包让 owner 在代理间往返抖动。
+- 非可连接 scanner 可以成为 `_all_history` 的最佳广播来源，却不会覆盖 `_connectable_history` 中独立保留的可连接路径。因此 Shelly 这类只能扫描的代理不会把 ESPHome/本地适配器的 GATT 路径“挤掉”。
+
+选出 owner 后，manager 先写入以 address 为 key 的 history。如果 manufacturer data、service data、service UUID 和 name 都与上次相同，会直接 `return`，不再调用 `_discover_service_info()`；所以两个代理先后上报相同 payload，通常只会向集成 callback/discovery 投递一次。RSSI、接收时间和 owner 仍可以在底层更新，但它们单独变化不会被当成新的设备数据。
+
+即使极端时序让两次 discovery 都走到 ConfigFlow，仍有两层身份保护：
+
+1. Bluetooth manager 传入的 `DiscoveryKey` 是蓝牙外设 address，用于关联发现与 ConfigEntry；集成的 `async_set_unique_id()` 会检查同 domain 下相同 ID 的进行中 flow，`_abort_if_unique_id_configured()` 再阻止创建第二个 ConfigEntry。
+2. 实体进入 Device Registry 时，BLE 集成通常提供 `connections={(CONNECTION_BLUETOOTH, address)}`。`async_get_or_create()` 会在该 ConfigEntry 所属设备中先按 identifiers/connections 查找，匹配就更新原记录，不会因 `source` 不同再新建一台设备。
+
+因而“只创建一个设备”不是一个 `set()` 就完成的，而是 **address 级广播仲裁 → payload 变化检测 → discovery/flow 去重 → ConfigEntry `unique_id` → Device Registry connection** 多层共同完成。同时要注意，通用蓝牙层只能把“相同 address”视为同一设备；若外设使用会轮换的 random private address，集成必须从 payload 中提取序列号等稳定 ID 作为 `unique_id`，HA 无法凭两个不同随机地址自动推断它们是同一台设备。
+
+### 5.9.2 需要 GATT 连接时如何选择网关
+
+GATT 网关不是在创建 ConfigEntry 时固化到配置里，也不一定沿用 `_all_history[address].source`。集成通常只保存外设 address，需要连接时调用 `async_ble_device_from_address(hass, address, connectable=True)` 取一个可连接 `BLEDevice`，然后使用 `bleak_retry_connector.establish_connection()`。例如 Xiaomi BLE 的 `_async_poll()` 在收到不可连接代理的广播时，会按 address 换成 `connectable=True` 的 `BLEDevice` 再调用库轮询。
+
+HA 启动 Bluetooth manager 时，`habluetooth.usage.install_multiple_bleak_catcher()` 会把 Bleak/bleak-retry-connector 的 client 替换为 `HaBleakClientWrapper`。因此按标准方式发起的连接，最终会在 `HaBleakClientWrapper.connect()` 内动态选路：
+
+```text
+integration: establish_connection(..., BLEDevice(address), ...)
+                         ↓
+HaBleakClientWrapper.connect()
+                         ↓
+BluetoothManager.async_scanner_devices_by_address(address, connectable=True)
+  ├─ local adapter:  BLEDevice + AdvertisementData + local scanner
+  ├─ ESPHome proxy A: BLEDevice + AdvertisementData + ESPHome scanner
+  └─ ESPHome proxy B: BLEDevice + AdvertisementData + ESPHome scanner
+                         ↓
+BluetoothScannerDevice.score_connection_path()
+                         ↓
+选第一个可用 backend：本地 Bleak backend 或某个代理的 connector.client
+```
+
+候选集首先排除 `connectable=False` 的 scanner，然后按 RSSI 排序，并以最强两条路径的 RSSI 差值作为处罚尺度计算 score。`BaseHaScanner._score_connection_paths()` 的当前评分因素为：
+
+| 因素 | 对选路的影响 |
+|---|---|
+| 该代理看到的 RSSI | 基础分，越强越优先 |
+| scanner 当前正在建立的其他连接数 | 每个 in-progress 连接扣分，避免将连接压在同一网关上 |
+| 该 scanner 连接这个 address 的历史失败数 | 失败越多扣分越多，下次 retry 可改走其他路径 |
+| GATT connection slots | `free == 0` 时该路径得到 `NO_RSSI_VALUE` 并在 backend 可用性检查中被跳过；只剩一个槽位也会小幅扣分 |
+| connector 实时可用性 | ESPHome 路径还要通过 `scanner.connector.can_connect()`，它会检查代理 API 在线状态和 `ble_connections_free` |
+
+评分后按优先级遍历候选。本地适配器必须能从 `BleakSlotManager` 分配到槽位；远程代理必须有 connector 且 `can_connect()` 为真。第一个通过的路径成为本次连接 backend；若是 ESPHome，便是 `bleak_esphome` 的 `ESPHomeClient` 通过该代理已建立的 HA API 连接要求 ESP32 发起 GATT 连接。
+
+因此答案不是简单的“永远选 RSSI 最强的网关”，而是 **每次 connect 时在所有可连接路径中动态重选，以 RSSI 为基础，再考虑负载、历史失败、槽位和网关实时在线状态**。广播 owner 选择为了稳定上层数据，GATT 路径选择为了成功建连与负载分散；这是两个不同问题，不应把 `service_info.source` 直接持久化成“设备绑定网关”。
 
 ### 5.10 OptionsFlow — 选项流
 
