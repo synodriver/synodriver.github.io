@@ -29,6 +29,7 @@ author: 'synodriver'
   - [5.9 ConfigFlow 实例生命周期与 BLE 发现去重](#59-configflow-实例生命周期与-ble-发现去重)
     - [5.9.1 多个蓝牙代理收到同一广播时如何去重](#591-多个蓝牙代理收到同一广播时如何去重)
     - [5.9.2 需要 GATT 连接时如何选择网关](#592-需要-gatt-连接时如何选择网关)
+    - [5.9.3 为什么一个 ESPHome 蓝牙代理的 GATT 连接数有限，而被动广播没有同样限制](#593-为什么一个-esphome-蓝牙代理的-gatt-连接数有限而被动广播没有同样限制)
   - [5.10 OptionsFlow — 选项流](#510-optionsflow--选项流)
     - [5.10.1 OptionsFlow 的数据模型与源码入口](#5101-optionsflow-的数据模型与源码入口)
     - [5.10.2 OptionsFlow 的执行时序](#5102-optionsflow-的执行时序)
@@ -1178,9 +1179,65 @@ BluetoothScannerDevice.score_connection_path()
 | GATT connection slots | `free == 0` 时该路径得到 `NO_RSSI_VALUE` 并在 backend 可用性检查中被跳过；只剩一个槽位也会小幅扣分 |
 | connector 实时可用性 | ESPHome 路径还要通过 `scanner.connector.can_connect()`，它会检查代理 API 在线状态和 `ble_connections_free` |
 
-评分后按优先级遍历候选。本地适配器必须能从 `BleakSlotManager` 分配到槽位；远程代理必须有 connector 且 `can_connect()` 为真。第一个通过的路径成为本次连接 backend；若是 ESPHome，便是 `bleak_esphome` 的 `ESPHomeClient` 通过该代理已建立的 HA API 连接要求 ESP32 发起 GATT 连接。
+评分后按优先级遍历候选。本地适配器必须能从 `BleakSlotManager` 分配到槽位；远程代理必须有 connector 且 `can_connect()` 为真。第一个通过的路径成为本次连接 backend；若是 ESPHome，便是 `bleak_esphome` 的 `ESPHomeClient` 通过该代理已建立的 HA Native API 连接要求 ESP32 发起 GATT 连接。
 
 因此答案不是简单的“永远选 RSSI 最强的网关”，而是 **每次 connect 时在所有可连接路径中动态重选，以 RSSI 为基础，再考虑负载、历史失败、槽位和网关实时在线状态**。广播 owner 选择为了稳定上层数据，GATT 路径选择为了成功建连与负载分散；这是两个不同问题，不应把 `service_info.source` 直接持久化成“设备绑定网关”。
+
+### 5.9.3 为什么一个 ESPHome 蓝牙代理的 GATT 连接数有限，而被动广播没有同样限制
+
+先给结论：这是 **底层蓝牙资源限制与 ESPHome 架构取舍共同造成的**，但 `connection_slots` 限制的是“同时已连接或正在建立的 GATT Client 会话数”，不是“代理能观察到的 BLE 设备数”。同一个代理的 GATT 槽位全部占满后，它仍然可以继续扫描并转发被动广播。
+
+两条数据路径使用的资源完全不同：
+
+```text
+被动广播：
+BLE scan result
+  -> ESPHome BLE hub
+  -> raw advertisement 批次（默认每批最多 16 条）
+  -> Native API
+  -> HA Bluetooth manager
+
+GATT：
+HA 发起 connect request
+  -> ESPHome BluetoothProxy 分配一个 connection slot
+  -> BluetoothConnection + GATT backend
+  -> 建连、服务发现、读写、notify、配对
+  -> Native API 返回结果
+```
+
+#### `connection_slots` 究竟限制什么
+
+在 `esphome/components/bluetooth_proxy/__init__.py` 中，ESP32 代理的 `connection_slots` 默认值是 3，范围为 1 到 `esp32_ble.IDF_MAX_CONNECTIONS`（当前为 9）。当 `active: true` 且用户没有手写 `connections` 列表时，代码会按照这个数目自动生成 GATT connection wrapper；`_connections_to_code()` 再为每个 wrapper 生成一个 GATT backend 和一个 `BluetoothConnection`，并定义 `BLUETOOTH_PROXY_MAX_CONNECTIONS`。因此这不是运行时可以无限扩容的 Python 容器，而是固件编译时就确定大小的连接池。
+
+在 C++ 侧，`BluetoothProxy` 使用固定长度的
+`std::array<BluetoothConnection *, BLUETOOTH_PROXY_MAX_CONNECTIONS>`。收到连接请求时，`get_connection_()` 先检查地址是否已经占用某个槽位，再寻找空闲槽位；如果没有空闲槽位，日志会出现 `No free connections available`，并向 HA 返回失败/断开响应。每个已分配的 `BluetoothConnection` 都要保存连接状态、服务发现和缓存、读写及通知处理、配对状态、超时和 API 应答等长期状态，所以一个设备对应一个槽位是有实际内存和状态机成本的。
+
+此外，槽位不是代理独占的“应用层配额”。ESP32 的 `esp32_ble.consume_connection_slots()` 会把 `bluetooth_proxy`、其他 BLE Client 等组件的需求累加，最终由 `validate_connection_slots()` 与 `max_connections` 和 ESP-IDF 的 `CONFIG_BT_ACL_CONNECTIONS` 上限（1 到 9）比较。BLE 控制器还要同时处理扫描、广播、HCI/ACL 链路、GATT 客户端、事件队列和 Wi-Fi 共存；连接数越多，内存占用、调度压力和连接建立时延越高。把默认值设为 3 是保守的资源预算，并不表示 BLE 协议只能连接三台设备；在 ESP32 上可以按芯片、固件中其他 BLE 组件和稳定性需求调大，但不能超过控制器和 ESP-IDF 允许的范围。
+
+RP2040 的上限则来自 ESPHome 使用的 BTstack 实现：当前 `rp2040_ble.MAX_CONNECTIONS` 为 3。开启多个 GATT backend 时，`btstack_memory.cpp` 通过 linker `--wrap` 为每个 `ESPHOME_BLE_GATT_CLIENT_COUNT` 分配固定的 `gatt_client_t` 池，并为 HCI connection 额外保留一个重连/拆链余量；源码还明确注明扫描本身不占用 HCI connection。没有 GATT backend 的其他平台会在配置校验阶段拒绝 `active: true`，只提供 advertisement-only 代理。
+
+#### 为什么被动广播不消耗这些槽位
+
+`bluetooth_proxy.cpp` 的 `on_raw_advertisement_()` 收到 BLE hub 的扫描结果后，只复制地址、RSSI、地址类型和广播 payload，放入 `response_.advertisements`，达到 `BLUETOOTH_PROXY_ADVERTISEMENT_BATCH_SIZE` 后批量发送。这个函数不会调用 `get_connection_()`，也不会创建 `BluetoothConnection`、GATT client 或 HCI ACL 链路；广播设备发完一帧就结束，代理不需要为它维持连接状态。因此多个广播设备可以共享同一条扫描和 API 转发路径，不会因为 GATT 槽位已满而立即触发 `No free connections available`。
+
+“不受 GATT 槽位限制”不等于“数量无限”。广播密度继续增加时，真正先遇到的通常是：
+
+- BLE 控制器和射频扫描吞吐量，空口碰撞会造成漏包；
+- ESPHome 主循环处理 raw advertisement 的能力和可用 RAM；
+- API/TCP/Wi-Fi 带宽，以及发送缓冲区满时的批次丢弃或延迟；
+- HA 端 scanner、history 和 discovery cache 的更新及清理压力。
+
+所以两种极限的表现不同：GATT 设备超过槽位时是明确的并发连接失败；被动广播设备过多时则更可能表现为漏报、延迟或批次拥塞，而不是创建设备的硬上限。广播本身仍会经过上一节介绍的 address 级 owner 选择和 payload 去重，代理数量增加不会让同一外设自动变成多个设备。
+
+#### 与 HA 网关选路的关系
+
+ESPHome 会通过 `connections_free` 告知 HA 每个代理的 `limit`、`free` 和已分配地址。HA 的 `HaBleakClientWrapper` 在每次 GATT `connect()` 时动态枚举可连接路径；`free == 0` 的代理会从候选中排除，其他代理再按 RSSI、正在建立的连接数、历史失败次数和 connector 在线状态评分。也就是说：
+
+1. 代理的 GATT 槽位是并发会话预算，决定它此刻能否成为连接网关；
+2. 代理的扫描通道与 GATT 槽位解耦，槽位耗尽后仍可继续接收和转发大量被动广播；
+3. HA 不需要把某个设备永久绑定到一个代理，而是在需要连接时避开已满或离线的网关并重新选路。
+
+这正是 ESPHome 将“扫描/广播转发”和“主动 GATT 连接”拆成两套资源模型的原因：前者适合以事件批次流式传输，后者必须受芯片协议栈、内存和连接状态机的可控并发数约束。
 
 ### 5.10 OptionsFlow — 选项流
 
