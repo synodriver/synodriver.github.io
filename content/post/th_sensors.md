@@ -100,6 +100,8 @@ tags: ["homeassistant", "ble", "bthome", "iot"]
 
 ![气压数据对比](/images/th_sensors-pic3.png)
 
+似乎SNZB-02M的气压分辨率是0.05kPa?
+
 > 综上所述，这轮还是*ESP32H2+SHT45 diy bthome*获胜
 
 ## 续航
