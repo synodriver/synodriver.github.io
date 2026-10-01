@@ -45,7 +45,8 @@ tags: ["homeassistant", "ble", "bthome", "iot"]
 
 - *SONOFF SNZB-02M*
 
-根据它的说明书，第一次使用要稳定30min，之后没有固定的更新间隔，依靠环境变化的剧烈程度来动态调节上报频率
+根据它的说明书，第一次使用要稳定30min，之后没有固定的更新间隔，依靠环境变化的剧烈程度来动态调节上报频率。
+在z2m里面可以通过修改上报选项卡修改上报间隔
 
 - *USTONE 环境传感器*
 
@@ -71,6 +72,8 @@ tags: ["homeassistant", "ble", "bthome", "iot"]
 
 根据第三方拆解，里面是SHT40，和博世的气压传感器，但根据记录，它似乎会定期上报全0数据，
 导致hass中瞬间跌落一下，这个如果要设置自动化的话需要注意
+
+![数据突然跌落](/images/th_sensors-pic4.png)
 
 *SONOFF SNZB-02M*
 
@@ -129,4 +132,10 @@ tags: ["homeassistant", "ble", "bthome", "iot"]
 
 > 综上所述，这轮是*SONOFF SNZB-02M*获胜
 
-## 未完待续
+## 修改SONOFF SNZB-02M上报频率再测
+
+![温度数据对比](/images/th_sensors-pic5.png)
+
+![湿度数据对比](/images/th_sensors-pic6.png)
+
+果然还是温度准，湿度测量上各家都有自己的想法，复现性很不好
