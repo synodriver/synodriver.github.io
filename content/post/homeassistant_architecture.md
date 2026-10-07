@@ -24,6 +24,7 @@ author: 'synodriver'
     - [5.4.3 Config Entry 体系的三个专用 Manager](#543-config-entry-体系的三个专用-manager)
     - [5.4.4 从前端 API 到 Manager 的完整路径](#544-从前端-api-到-manager-的完整路径)
     - [5.4.5 其他复用 FlowManager 的流程](#545-其他复用-flowmanager-的流程)
+  - [5.6.1 自动发现总链路：从 manifest matcher 到 ConfigEntry](#561-自动发现总链路从-manifest-matcher-到-configentry)
   - [5.7 ConfigFlow step 方法职责与调用时机](#57-configflow-step-方法职责与调用时机)
   - [5.8 ConfigEntry 创建、更新与 `unique_id`](#58-configentry-创建更新与-unique_id)
   - [5.9 ConfigFlow 实例生命周期与 BLE 发现去重](#59-configflow-实例生命周期与-ble-发现去重)
@@ -982,6 +983,55 @@ class ConfigFlow(ConfigEntryBaseFlow):
 3. 如果未覆盖: 默认实现调用 _async_step_discovery_without_unique_id() → async_step_user()
    如果已覆盖: 通常先 async_set_unique_id()，再返回表单或直接创建条目
 ```
+
+### 5.6.1 自动发现总链路：从 manifest matcher 到 ConfigEntry
+
+前面的示例只展示了 ConfigFlow 已经收到 `discovery_info` 之后发生的事情。真正的自动发现由各个“发现集成”负责监听外部数据，再把匹配结果转交给 ConfigFlow。它和后文 MQTT 的实体自动发现不是同一层：这里的目标是发现一个集成实例并创建 `ConfigEntry`，而 MQTT discovery 还可以在已有连接上动态创建实体。
+
+发现规则的入口是集成的 `manifest.json`。`homeassistant.loader` 在启动时读取内置集成和自定义集成的 `bluetooth`、`zeroconf`、`dhcp`、`ssdp`、`usb`、`homekit` 等声明，并把它们合并成各发现组件使用的 matcher 索引。例如，蓝牙 matcher 可以按 `local_name`、`service_uuid`、`service_data_uuid`、`manufacturer_id`、广播数据前缀以及 `connectable` 匹配；Zeroconf matcher 由服务类型和可选的实例名、TXT properties 组成；USB matcher 则比较 `vid`、`pid`、序列号、厂商和描述。这样，集成本身不需要为每个适配器编写扫描器，只需声明“什么数据属于我”，并实现对应的 `async_step_*`。这些规则的聚合入口是 `homeassistant/loader.py` 中的 `async_get_bluetooth()`、`async_get_zeroconf()`、`async_get_dhcp()`、`async_get_ssdp()` 和 `async_get_usb()`；公共 flow 调度位于 `homeassistant/helpers/discovery_flow.py`。
+
+所有发现源最终汇入同一个公共路径：
+
+```text
+外部事件/扫描结果
+  ↓
+发现组件把原始数据规范化为 ServiceInfo
+  ↓
+按 manifest matcher 找到一个或多个 integration domain
+  ↓
+helpers.discovery_flow.async_create_flow(
+    hass, domain,
+    context={"source": "bluetooth|zeroconf|dhcp|ssdp|usb|homekit|mqtt"},
+    data=service_info,
+    discovery_key=...
+)
+  ↓
+ConfigEntriesFlowManager.async_init()
+  ↓
+flow.init_step = context["source"]
+  ↓
+ConfigFlow.async_step_<source>(service_info)
+  ↓
+表单确认/认证，或 async_create_entry()
+  ↓
+async_finish_flow() 创建 ConfigEntry
+```
+
+`async_create_flow()` 不是立即无条件地创建流程。Home Assistant 尚未进入 `running` 状态时，`FlowDispatcher` 会按 `(domain, source)` 暂存发现项，收到 `EVENT_HOMEASSISTANT_STARTED` 后再以最多 20 个并发初始化流程；已经运行时则直接创建后台任务。实际初始化前，`_async_init_flow()` 会调用 `async_has_matching_discovery_flow()`，用 domain、发现来源和原始 `data` 抑制重复流程，避免 Zeroconf/SSDP 的重复通知导致设备被反复探测。发现组件提供 `discovery_key` 时，流程完成后 manager 会把它持久化到 ConfigEntry；之后条目被删除或发现重新出现时，组件可以据此重新触发发现。
+
+不同发现源的采集和匹配方式如下：
+
+| 发现源 | 源码中的监听/扫描方式 | 匹配与去重特征 | 传给 ConfigFlow 的数据 |
+|---|---|---|---|
+| Bluetooth | `HomeAssistantBluetoothManager` 接收本地适配器和远程代理的 BLE advertisement | `IntegrationMatcher` 按广播字段匹配；以外设 address 为发现 key，并在 matcher、discovery flow、`unique_id` 多层去重 | `BluetoothServiceInfoBleak`，进入 `async_step_bluetooth` |
+| Zeroconf/mDNS | `AsyncServiceBrowser` 浏览 manifest 声明的服务类型，并通过 `AsyncServiceInfo` 解析地址和 TXT properties | 服务类型先筛选，再按实例名和 properties 的 fnmatch 规则匹配；HomeKit 类型还会按型号转发到 `homekit` 来源 | `ZeroconfServiceInfo`，进入 `async_step_zeroconf` 或 `async_step_homekit` |
+| DHCP | 监听 DHCP 报文、网络主机扫描、device tracker 和已注册设备事件 | 将 IP、hostname、MAC 规范化；按 MAC 的 OUI、hostname 首字符建立索引，再检查完整 matcher；默认网络扫描间隔为 60 分钟 | `DhcpServiceInfo`，进入 `async_step_dhcp` |
+| SSDP | 为各网络接口创建 listener，启动时执行 multicast/broadcast 搜索，之后每 10 分钟扫描并接收 alive/byebye 通知 | 合并 SSDP headers 与设备 description XML，按 manifest 的 header 条件匹配；byebye 只撤销进行中的发现 flow | `SsdpServiceInfo`，进入 `async_step_ssdp` |
+| USB | 使用 `aiousbwatcher` 监听串口设备变化；不可用时退回轮询，Home Assistant started 后先做一次全量扫描 | 先筛选 USB 串口，再按 VID/PID、序列号、厂商和描述匹配；新增设备创建 flow，移除设备中止对应 flow | `UsbServiceInfo`，进入 `async_step_usb` |
+
+MQTT 的 manifest 配置流发现也复用这条公共路径：MQTT 集成先订阅集成声明的 topic，收到消息后以 `SOURCE_MQTT` 和 `MqttServiceInfo` 创建 flow，最终进入 `async_step_mqtt`；它的 topic 缓存、payload 去重和锁的细节见 [12.5](#125-manifest-的-mqtt-配置流发现)。
+
+因此，“自动发现”并不是某个全局扫描函数一次性扫描所有设备，而是多个长期运行的 watcher/scanner 共享同一套 flow 编排。发现组件负责协议细节、matcher 和设备消失处理；`helpers.discovery_flow` 负责启动时排队与重复抑制；`ConfigEntriesFlowManager` 负责实例化 ConfigFlow、推进 `async_step_<source>`、等待前端确认，并最终写入 ConfigEntry。蓝牙的代理仲裁、广播去重和 GATT 选路属于这条链路中更复杂的一支，详见后面的 [5.9](#59-configflow-实例生命周期与-ble-发现去重)。
 
 ### 5.7 ConfigFlow step 方法职责与调用时机
 

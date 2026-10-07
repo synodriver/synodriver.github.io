@@ -6,7 +6,7 @@ author: 'synodriver'
 tags: ["ble", "bluetooth", "bthome", "esphome", "micropython", "iot", "embedded"]
 ---
 
-# BTHome v2 协议详解：广播格式、加密机制与两个开源实现
+# BTHome v2 协议详解：广播格式、加密机制
 
 BTHome 是一套面向 BLE 广播的轻量传感器协议，核心目标很直接：**让电池设备不需要连接，也能把状态稳定地广播出去**。它适合温湿度、门磁、按钮、人体存在、开关状态这类低频、小数据量场景。
 
